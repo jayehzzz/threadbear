@@ -60,6 +60,18 @@ function tb(h: { home: string }, url: string, id: string | undefined, key: strin
 const refused = (e: { code?: number }) => e.code === -32060;
 const MODES: PermissionMode[] = ['ask', 'auto'];
 
+test('shared dictation vocabulary methods require full, unconfined authority', () => {
+  const h = makeHarness();
+  const gate = new CallerGate({ runner: h.runner });
+  for (const mode of ['ask', 'auto', 'plan', 'full'] as PermissionMode[]) {
+    const me = thread(h, mode);
+    for (const method of ['dictation.status', 'dictation.record', 'dictation.review', 'dictation.sync']) {
+      if (mode === 'full') assert.deepEqual(gate.check(me.id, method, {}), {});
+      else assert.throws(() => gate.check(me.id, method, {}), refused);
+    }
+  }
+});
+
 test('a key only works for its own thread, and is not the token', async () => {
   const { h, server, token, url } = await serve();
   const a = thread(h, 'auto', 'a');

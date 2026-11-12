@@ -356,6 +356,21 @@ File references are where to look.
   Claude pool when preparing a daily release, to write the plain-language release notes.
   The input includes subjects and bodies of merged commits, including pull requests.
   If that call fails, the signed release still goes out without notes.
+- **Dictation learning** (experiment, off by default): during the librarian's
+  existing reviews, pending name corrections and up to 32 new user-message
+  excerpts are sent on the same Small jobs pool. Private folders are
+  excluded. No extra AI timer is installed. Confirmed rules use FluidVoice's
+  opt-in local HTTP API at `127.0.0.1:47733` (health and dictionary endpoints
+  only); Threadbear does not enable it. Vocabulary/evidence and sync
+  provenance are kept in `dictation-learning.json`, per-write backups in
+  `dictation-backups/`, a readable `dictation-vocabulary.html`, and an active writer uses `dictation-sync.lock`, all
+  under the runner data folder. These files stay on the Mac and are written
+  with user-only permissions. Threadbear never edits FluidVoice preference
+  files, records audio, or changes its models. `tb dictation` lists the
+  provenance and supports confirm/reject/undo. The API is not transactional:
+  detected concurrent edits stop syncing and undo never restores a backup
+  over a changed dictionary. A final read/write race on the same word cannot
+  be excluded by this version of FluidVoice's API.
 - **Housekeeping** (`runner/src/housekeeping.ts`): trims logs, deletes
   week-old copies of pictures pasted into drafts (a sent message keeps its
   own copy) and deleted threads after 30 days in the trash. Archived

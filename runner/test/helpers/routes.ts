@@ -30,6 +30,7 @@ const END_TURN = 'mcp__threadbear__end_turn';
 // What a person sees of a thread, on any of the three: its card and its messages.
 export type Ask = { action: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: { title: string; url: string }[]; run?: { command: string; buttonId?: string; cwd?: string } };
 export type View = {
+  dictationNotes: string[];
   needs?: string;
   asks: Ask[];
   next: string[];
@@ -43,6 +44,8 @@ export type View = {
 };
 
 export type Play = {
+  /** A local runner system note, such as a dictation correction's provenance. */
+  note(text: string): void;
   /** The agent writes text. */
   say(text: string): void;
   /** The agent calls end_turn with these args, and the turn ends. */
@@ -101,7 +104,7 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
   const here = (): View => {
     const t = h.runner.get(id);
     const events = h.runner.events(id, {}).events as Record<string, any>[];
-    return { needs: t.needs, asks: (t.asks ?? []) as Ask[], next: lastNext(events), looseEnds: (t.looseEnds?.ends ?? []).map((e) => e.text), review: events.filter((e) => e.type === 'turn.completed').at(-1)?.review, plans: plansOf(events), messages: messagesOf(events) };
+    return { dictationNotes: events.filter(e => e.type === 'system.note' && /^(Learned|Undid) dictation correction:/.test(e.text)).map(e => e.text), needs: t.needs, asks: (t.asks ?? []) as Ask[], next: lastNext(events), looseEnds: (t.looseEnds?.ends ?? []).map((e) => e.text), review: events.filter((e) => e.type === 'turn.completed').at(-1)?.review, plans: plansOf(events), messages: messagesOf(events) };
   };
   const viaRelay = async (): Promise<View> => {
     // A turn's end is held back until that runner's row has said so for 4 s.
@@ -113,11 +116,11 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
     // sidebar's list, for the done card's own seq.
     const listed = relay.overlay(remote()).threads.find((t) => t.threadId === id) as { looseEnds?: { seq: number; ends: { text: string }[] } } | undefined;
     const ends = listed?.looseEnds && end && listed.looseEnds.seq === end.seq ? listed.looseEnds.ends.map((e) => e.text) : [];
-    return { needs: end?.needs, asks: (end?.asks ?? []) as Ask[], next: (end?.next ?? []) as string[], looseEnds: ends, review: end?.review, plans: plansOf(events), messages: messagesOf(events) };
+    return { dictationNotes: [], needs: end?.needs, asks: (end?.asks ?? []) as Ask[], next: (end?.next ?? []) as string[], looseEnds: ends, review: end?.review, plans: plansOf(events), messages: messagesOf(events) };
   };
   const viaPhone = async (): Promise<View> => {
     const r = (await call(b.ctx, mods.phone.thread!, { token: TOKEN, threadId: id })) as { thread: Record<string, any>; messages: { role: 'user' | 'assistant'; text: string }[] };
-    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: [], messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0 })) };
+    return { dictationNotes: [], needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: [], messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0 })) };
   };
   const views = { here: here(), relay: await viaRelay(), phone: await viaPhone() };
   await sync.stop();
@@ -149,6 +152,7 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
     let n = 0;
     let lastPlan = '';
     await play({
+      note: text => h.runner.note(thread.id, text),
       say: (text) => s.text(`m${++n}`, text),
       proposePlan: (text) => {
         lastPlan = `p${++n}`;

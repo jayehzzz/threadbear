@@ -48,6 +48,7 @@ import { SECRET_TIMEOUT_DEFAULT_MIN, SECRET_TIMEOUT_MAX_MIN } from './secrets.ts
 import { cutSafely, firstLineSafely } from './safe-cut.ts';
 import { pickRunner } from './moves.ts';
 import { FINDINGS_REFUSALS, FINDINGS_REFUSED, MAX_FINDINGS, findingsProblem, refusalsThisTurn } from './runner/lab-review.ts';
+import type { Correction, CorrectionInput } from './dictation-learning.ts';
 
 // What the tools drive: the Runner itself, or during a handover
 // (docs/protocol.md) a ThreadRouter (handover.ts) that reaches threads on
@@ -262,6 +263,7 @@ export function buildThreadbearTools(
     runAsks?: () => boolean;
     // The looseEnds experiment: end_turn's open is only offered while it's on.
     looseEnds?: () => boolean;
+    dictation?: (input: CorrectionInput) => Promise<Correction>;
   } = {},
 ) {
   const codex = opts.provider === 'codex';
@@ -1707,6 +1709,12 @@ export function buildThreadbearTools(
 
   return [
     endTurn(),
+    ...(opts.dictation ? [tool(
+      'record_dictation_correction',
+      'Proactively record a likely misheard name from this chat for the librarian. Use real user-message sequence numbers (tb events). Guesses stay pending. Only an explicit user correction can supply confirmationSeq; repetition or your own assumption cannot. Confirmed rules sync locally to FluidVoice. Do not rewrite unfamiliar names, quoted text, code or ordinary prose. No need to wait until the chat ends.',
+      { heard: z.string().max(80), replacement: z.string().max(80), sourceSeq: z.number().int().positive(), confirmationSeq: z.number().int().positive().optional() },
+      handle(async input => JSON.stringify(await opts.dictation!(input))),
+    )] : []),
     ...(appRestarts
       ? [
           tool(
@@ -2234,13 +2242,13 @@ export function serverInstructions(selfId: string, o: { one: boolean; bulletRepl
   );
 }
 
-export function threadbearMcpServer(control: ThreadControl, selfId: string, schedules?: ScheduleControl, projects?: ProjectControl, appRestarts?: AppRestartControl, bulletReplies: () => boolean = () => true, pocket?: () => PocketControl | undefined, oneReply: () => boolean = () => false, gateway?: () => string | undefined, gatewayHealth?: () => Promise<ConnectorService[] | undefined>, remote?: () => RemoteControl | undefined, runAsks?: () => boolean, looseEnds?: () => boolean): McpSdkServerConfigWithInstance {
+export function threadbearMcpServer(control: ThreadControl, selfId: string, schedules?: ScheduleControl, projects?: ProjectControl, appRestarts?: AppRestartControl, bulletReplies: () => boolean = () => true, pocket?: () => PocketControl | undefined, oneReply: () => boolean = () => false, gateway?: () => string | undefined, gatewayHealth?: () => Promise<ConnectorService[] | undefined>, remote?: () => RemoteControl | undefined, runAsks?: () => boolean, looseEnds?: () => boolean, dictation?: (input: CorrectionInput) => Promise<Correction>): McpSdkServerConfigWithInstance {
   const one = oneReply();
   const server = createSdkMcpServer({
     name: SERVER_NAME,
     version: RUNNER_VERSION,
     instructions: serverInstructions(selfId, { one, bulletReplies: bulletReplies(), pocket: Boolean(pocket?.()), projects: Boolean(projects) }),
-    tools: buildThreadbearTools(control, selfId, Date.now, schedules, projects, appRestarts, { bulletReplies, pocket, oneReply: () => one, gateway, gatewayHealth, remote, runAsks, looseEnds }),
+    tools: buildThreadbearTools(control, selfId, Date.now, schedules, projects, appRestarts, { bulletReplies, pocket, oneReply: () => one, gateway, gatewayHealth, remote, runAsks, looseEnds, dictation }),
   });
   server.tools = [...ALWAYS_ASK_TOOLS].map((name) => ({ name: name.split('__').at(-1)!, permission_policy: 'always_ask' as const }));
   return server;

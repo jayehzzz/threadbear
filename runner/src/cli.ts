@@ -138,6 +138,10 @@ const HELP = `tb: talk to the Threadbear runner
   tb librarian [--json]           what the librarian is doing, its queue and what it did
   tb librarian run [<threadId>]   a look at a thread now; with none, at every recent thread it hasn't seen
   tb librarian pause|resume
+  tb dictation [--json]          learned spellings, pending names and sync problems
+  tb dictation confirm|reject|undo ID
+  tb dictation sync              retry confirmed spellings against FluidVoice
+  tb dictation record --thread ID --text HEARD --to CORRECT --from SEQ [--at CONFIRM_SEQ]
   tb settings [--json]            what the Settings window shows
   tb models [--json]              the small-model pool and private folders
   tb models pool <pool|off>       which pool's logins answer small jobs (off: none, so no titles or librarian)
@@ -205,6 +209,7 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   schedules: ['json', 'text', 'title', 'at', 'cron', 'tz', 'cwd', 'account', 'pool', 'model', 'effort', 'ask', 'auto', 'full'],
   projects: ['json', 'archived'],
   librarian: ['json'],
+  dictation: ['json', 'thread', 'text', 'to', 'from', 'at'],
   settings: ['json'],
   models: ['json', 'remove', 'labels', 'field', 'system', 'cwd'],
   status: ['json'],
@@ -767,6 +772,16 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
         return 0;
       }
       throw new Error(`Unknown: tb projects ${action}. It's show, add, remove or parent.`);
+    }
+    case 'dictation': {
+      const [action, id] = args;
+      const result = !action ? await client.call('dictation.status', {})
+        : action === 'sync' ? await client.call('dictation.sync', {})
+        : action === 'record' ? await client.call('dictation.record', { threadId: f.thread, heard: f.text, replacement: f.to, sourceSeq: Number(f.from), ...(f.at ? { confirmationSeq: Number(f.at) } : {}) })
+        : ['confirm', 'reject', 'undo'].includes(action) && id ? await client.call('dictation.review', { id, action })
+        : (() => { throw new Error('Use tb dictation [sync | confirm ID | reject ID | undo ID | record --thread ID --text HEARD --to CORRECT --from SEQ].'); })();
+      console.log(JSON.stringify(result, null, 2));
+      return 0;
     }
     case 'librarian': {
       const [action, id] = args;

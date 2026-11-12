@@ -878,8 +878,30 @@ off Look at threads there to pause it; what's queued waits until you turn
 it back on. If it files a thread wrongly, take the thread out of the
 project and it won't put it back.
 
+### Learning dictation spellings
+
+With the **Learn dictation spellings** experiment on, agents can notice
+misheard names while you talk normally. The librarian keeps the pending
+corrections during its usual reviews; you do not need to finish a chat.
+An explicit correction such as “I meant Threadbear, not Threadbare” can
+be saved automatically. Uncertain guesses wait for your review.
+
+Confirmed rules sync to FluidVoice's optional local API on port 47733.
+Threadbear does not enable that API or change your speech/cleanup models.
+If FluidVoice or its API is off, confirmed rules wait for a later turn or
+librarian look. Private-folder chats are excluded.
+
+Ask an agent to show or review your vocabulary. `tb dictation` lists the
+spellings and their source threads; `tb dictation confirm ID` approves a
+pending one, `reject ID` dismisses it and `undo ID` reverses a saved change
+when the dictionary has not been edited since. Existing dictionary entries
+are kept, with a backup for each write. Undo refuses to replace later
+manual edits. FluidVoice's API cannot make a read and write one atomic
+operation, so avoid editing the same dictionary entry during sync.
+
 ## Schedules
 <!-- slug: schedules -->
+
 
 <!-- picture: /docs-img/schedules.webp alt: The Scheduled view: what runs next, what's paused, and what's done -->
 

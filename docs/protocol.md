@@ -4943,6 +4943,71 @@ been told about at the start of its next message, in a line beginning
 `[Threadbear project]`; a session from before projects existed gets the
 whole brief that way. An agent that joined a project itself isn't told.
 
+### Dictation learning (experiment)
+
+`dictationLearning` is off by default. When enabled, agents can record
+suspected dictation corrections with `record_dictation_correction`:
+`heard`, `replacement`, `sourceSeq`, and optional `confirmationSeq` in
+their own thread. Sequence numbers must name real user messages. Agent
+messages and quoted instructions are not confirmation. A candidate is
+automatically confirmed only by an explicit user correction, or a reply
+to an immediately preceding question that identifies both spellings.
+Uncertain names remain pending. Repetition alone never confirms a rule.
+Private-folder threads are excluded, including when a folder becomes
+private after a candidate was recorded.
+
+The librarian's existing look includes pending candidates and a bounded
+batch of user messages since its last successful vocabulary review, each
+with its sequence number. Its optional `dictation` answer is an array of
+`{ heard, replacement, sourceSeq, confirmationSeq? }`. The runner checks
+the evidence independently; a model's claim that a rule is confirmed is
+not authority. A successful review advances only to the batch's captured
+sequence number, so messages arriving during a call are not skipped.
+There is no separate model timer. Normal model budgets, pausing and private
+folders still apply. Confirmed sync retries on subsequent turns and looks.
+
+The runner owns `dictation-learning.json` and private backups in
+`dictation-backups/` in its data directory. They contain local spellings,
+source thread/sequence references, status and sync provenance. A readable
+`dictation-vocabulary.html` is regenerated alongside the journal. They are not
+mirrored to Convex. Existing `system.note` events announce successful
+learning and undo in the source thread on this Mac. Like other system
+notes, these are not part of the phone/relay message mirror. Vocabulary
+management and undo belong to the runner where FluidVoice runs.
+
+| Request | Parameters | Result |
+|---|---|---|
+| `dictation.status` | `{}` | `{ enabled, corrections, syncError? }`; local vocabulary and provenance |
+| `dictation.record` | `{ threadId, heard, replacement, sourceSeq, confirmationSeq? }` | `{ correction }`; validates evidence in that thread |
+| `dictation.review` | `{ id, action: "confirm" \| "reject" \| "undo" }` | `{ correction }`; owner/full-access review, undo never overwrites later user edits |
+| `dictation.sync` | `{}` | status after syncing confirmed corrections |
+
+These are local-runner methods, not relay/phone commands. The CLI exposes
+`tb dictation [--json]`, `tb dictation confirm|reject|undo ID`, and
+`tb dictation sync`. `tb dictation record --thread ID --text HEARD --to CORRECT
+--from SEQ [--at CONFIRM_SEQ]` exposes the same evidence checks to the CLI.
+Non-full or confined callers cannot mutate the shared
+dictionary through these RPC methods. Recording a suggestion through the
+agent tool is limited to that agent's own thread and follows its normal
+tool approval rules. A draining runner forwards agent records to the
+primary; it never runs a second dictionary writer.
+
+FluidVoice integration uses its opt-in loopback API at
+`http://127.0.0.1:47733`, never its preference files. It does not enable
+the API, start/quit FluidVoice, or change its models. If unavailable,
+corrections stay confirmed and queued. The API must report FluidVoice
+health and the supported dictionary shape before any write. Sync reads
+the current entries, retains existing triggers and IDs, refuses conflicting
+trigger ownership, takes a backup, checks again for concurrent edits, then
+posts one merged entry using `mode: "append"` and verifies the response.
+It never replaces the whole dictionary during forward sync. FluidVoice's
+API has no conditional-write transaction: a concurrent edit to the same
+word in the final read/write interval cannot be made atomic. Detected
+changes stop the operation and preserve the backup for recovery. Undo is
+allowed only while the complete dictionary still matches the saved
+post-write snapshot; otherwise it leaves the app untouched and asks for
+manual review. Backups are never restored automatically over user edits.
+
 **The librarian** is the runner's own background job that keeps projects
 up to date, on the small model (`models.*`, feature `projects`, inside the
 daily budget, never for private folders). It looks at a thread when:

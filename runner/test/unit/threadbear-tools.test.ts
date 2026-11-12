@@ -51,6 +51,20 @@ function toolResult(s: ReturnType<typeof makeHarness>['adapter']['last'], itemId
   s.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: true, text: 'ok', truncated: false, images: [] } });
 }
 
+test('the dictation tool is opt-in and forwards only evidence arguments to its bound thread callback', async () => {
+  const h = makeHarness();
+  const { thread } = start(h);
+  assert.equal(buildThreadbearTools(h.runner, thread.id).some(t => t.name === 'record_dictation_correction'), false);
+  const inputs: unknown[] = [];
+  const list = buildThreadbearTools(h.runner, thread.id, Date.now, undefined, undefined, undefined, {
+    dictation: async input => { inputs.push(input); return { ...input, id: 'c', threadId: thread.id, evidence: 'Open Threadbare', createdAt: '', status: 'pending' }; },
+  });
+  const t = list.find(t => t.name === 'record_dictation_correction')!;
+  const result = await t.handler({ heard: 'Threadbare', replacement: 'Threadbear', sourceSeq: 1 } as never, {});
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(inputs, [{ heard: 'Threadbare', replacement: 'Threadbear', sourceSeq: 1 }]);
+});
+
 // ------------------------------------------------------------ transcripts
 
 test('projectDirName matches how the CLI names folders', () => {

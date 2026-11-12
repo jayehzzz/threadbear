@@ -14,11 +14,13 @@ import { threeWays, type View } from '../helpers/routes.ts';
 import { SCENARIOS } from '../helpers/scenario-list.ts';
 
 type Route = 'relay' | 'phone';
-type Field = 'needs' | 'asks' | 'next' | 'looseEnds' | 'review' | 'plans' | 'messages' | 'pictures';
+type Field = 'needs' | 'asks' | 'next' | 'looseEnds' | 'review' | 'plans' | 'messages' | 'pictures' | 'dictationNotes';
 
 // Differences that are meant, each with why. A test below fails once one
 // of these stops being a difference, so the list can't outlive its reason.
 const KNOWN: { route: Route; field: Field; why: string }[] = [
+  { route: 'relay', field: 'dictationNotes', why: 'System notes and the FluidVoice dictionary belong to the runner on that Mac and are not mirrored as messages.' },
+  { route: 'phone', field: 'dictationNotes', why: 'FluidVoice vocabulary management stays on its Mac; the phone message mirror excludes system notes.' },
   { route: 'relay', field: 'pictures', why: "Pictures in messages stay on that runner; the Mac shows each one's chip in the words." },
   { route: 'phone', field: 'pictures', why: "phone:thread carries words only; the phone gets a message's pictures from phone:images." },
   { route: 'phone', field: 'plans', why: "phone:thread carries words only; the phone gets a message's plan flag from phone:messages (API 72) and draws its own plan card." },
@@ -35,7 +37,7 @@ function pick(v: View, field: Field): unknown {
       return field === 'needs' || field === 'review' ? (v[field] ?? null) : v[field];
   }
 }
-const FIELDS: Field[] = ['needs', 'asks', 'next', 'looseEnds', 'review', 'plans', 'messages', 'pictures'];
+const FIELDS: Field[] = ['needs', 'asks', 'next', 'looseEnds', 'review', 'plans', 'messages', 'pictures', 'dictationNotes'];
 const known = (route: Route, field: Field) => KNOWN.find((k) => k.route === route && k.field === field);
 
 for (const s of SCENARIOS) {

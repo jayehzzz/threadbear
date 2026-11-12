@@ -31,6 +31,7 @@ import { experimentOn } from './experiments.ts';
 import { MacScreen } from './mac-screen.ts';
 import { Projects, drainProjectMethods, projectMethods } from './projects.ts';
 import { Librarian, librarianMethods } from './librarian.ts';
+import { DictationLearning, type Correction, type CorrectionInput } from './dictation-learning.ts';
 import { ConnectorsMonitor, connectorsMethods } from './connectors.ts';
 import { TaskBoards, gatewayCaller, helperHeaders } from './notion-tasks.ts';
 import { createLogger } from './log.ts';
@@ -178,6 +179,18 @@ async function main(): Promise<void> {
   let updaterReady = false;
   // Set once this runner has handed over and is finishing its kept turns.
   let draining = false;
+  let dictation: DictationLearning | undefined;
+  const dictationRecord = (threadId: string) => !copyOfReal && experimentOn(cfg.home, 'dictationLearning') ? async (input: CorrectionInput): Promise<Correction> => {
+    if (draining) {
+      if (!primaryLink) throw new Error('Runner handover in progress. Try recording this correction next turn.');
+      const result = await primaryLink.call('dictation.record', { threadId, ...input }) as { correction: Correction };
+      return result.correction;
+    }
+    if (!dictation) throw new Error('Dictation learning has not started yet.');
+    const correction = dictation.record(threadId, input);
+    void dictation.sync();
+    return correction;
+  } : undefined;
   const scheduleControl = () => scheduleRouter(scheduler, () => primaryLink);
   // Projects belong to the primary: a draining runner's agent tools change
   // them there rather than write projects.json beside it, and a kept thread
@@ -258,14 +271,14 @@ async function main(): Promise<void> {
     claudePath: cfg.claudePath,
     registry,
     log,
-    mcpServersFor: (threadId) => ({ [SERVER_NAME]: threadbearMcpServer(router(), threadId, scheduleControl(), projectControl(), appRestarts, () => cfg.bulletReplies, pocketControl, () => cfg.oneReply, () => cfg.connectorsUrl, gatewayHealth, remoteControl, () => experimentOn(cfg.home, 'runAsks'), () => experimentOn(cfg.home, 'looseEnds')) }),
+    mcpServersFor: (threadId) => ({ [SERVER_NAME]: threadbearMcpServer(router(), threadId, scheduleControl(), projectControl(), appRestarts, () => cfg.bulletReplies, pocketControl, () => cfg.oneReply, () => cfg.connectorsUrl, gatewayHealth, remoteControl, () => experimentOn(cfg.home, 'runAsks'), () => experimentOn(cfg.home, 'looseEnds'), dictationRecord(threadId)) }),
     oneReply: () => cfg.oneReply,
     sandboxFor: (cwd) => sandboxFor(cfg.sandbox, cwd),
     alwaysAsk: ALWAYS_ASK_TOOLS,
     neverAsk: NEVER_ASK_TOOLS,
   });
   // The threadbear tools for an agent that isn't given them in-process.
-  const codexStyleTools = (threadId: string) => buildThreadbearTools(router(), threadId, Date.now, scheduleControl(), projectControl(), appRestarts, { provider: 'codex', bulletReplies: () => cfg.bulletReplies, oneReply: () => cfg.oneReply, pocket: pocketControl, gateway: () => cfg.connectorsUrl, gatewayHealth, remote: remoteControl, runAsks: () => experimentOn(cfg.home, 'runAsks'), looseEnds: () => experimentOn(cfg.home, 'looseEnds') });
+  const codexStyleTools = (threadId: string) => buildThreadbearTools(router(), threadId, Date.now, scheduleControl(), projectControl(), appRestarts, { provider: 'codex', bulletReplies: () => cfg.bulletReplies, oneReply: () => cfg.oneReply, pocket: pocketControl, gateway: () => cfg.connectorsUrl, gatewayHealth, remote: remoteControl, runAsks: () => experimentOn(cfg.home, 'runAsks'), looseEnds: () => experimentOn(cfg.home, 'looseEnds'), dictation: dictationRecord(threadId) });
   // One app-server per live Codex thread, each starting what E says is
   // current, with the same threadbear tools as dynamic tools.
   const codex = new CodexAdapter({
@@ -415,7 +428,21 @@ async function main(): Promise<void> {
   // Projects need the threads loaded (their counts, and the thread side of
   // membership); the librarian needs both.
   projects.start(runner);
-  const librarian = new Librarian({ host: runner, projects, models, clock: realClock, log, home: cfg.home, pocket: pocketControl });
+  if (!copyOfReal) {
+    dictation = new DictationLearning({ home: cfg.home, enabled: () => experimentOn(cfg.home, 'dictationLearning'), host: {
+      threads: () => runner.threadRecords(),
+      events: (id, afterSeq, limit) => runner.events(id, { afterSeq, limit }).events,
+      privateFolder: cwd => models.isPrivateFolder(cwd),
+      note: (id, text) => runner.note(id, text),
+    } });
+    try { dictation.start(); } catch (e) {
+      log.error('dictation learning could not start', { error: String(e) });
+      runner.startupNotice('warning', 'Dictation learning could not read its saved vocabulary. It is paused; the saved file was kept.');
+      dictation.stop(); dictation = undefined;
+    }
+    runner.onThreadActivity(a => { if (a.kind === 'turn.end') void dictation?.sync(); });
+  }
+  const librarian = new Librarian({ host: runner, projects, models, clock: realClock, log, home: cfg.home, pocket: pocketControl, dictation });
   if (!copyOfReal) librarian.start();
   // Background jobs that look stuck get their thread a message.
   const stuckJobs = new StuckJobs({ host: runner, clock: realClock, log, home: cfg.home });
@@ -730,6 +757,18 @@ async function main(): Promise<void> {
 
   runner.attachClis(updates);
   const methods = { ...restartMethods(restarter), ...scheduleMethods(scheduler), ...projectMethods(projects), ...drainProjectMethods(projects), ...librarianMethods(librarian), ...connectorsMethods(connectors), ...settingsMethods(settings), ...instructionsMethods(instructions), ...modelMethods(models), ...devicesMethods(sync), ...usageStatsMethods({ tally, history: usageHistory, clock: realClock }) };
+  methods['dictation.status'] = () => dictation?.status() ?? { enabled: false, corrections: [] };
+  methods['dictation.record'] = p => {
+    if (!dictation || typeof p.threadId !== 'string') throw new Error('Dictation learning is unavailable or threadId is missing.');
+    const correction = dictation.record(p.threadId, p as unknown as CorrectionInput);
+    void dictation.sync();
+    return { correction };
+  };
+  methods['dictation.review'] = async p => {
+    if (!dictation || typeof p.id !== 'string' || !['confirm', 'reject', 'undo'].includes(p.action as string)) throw new Error('Use a correction id and confirm, reject or undo.');
+    return { correction: await dictation.decide(p.id, p.action as 'confirm' | 'reject' | 'undo') };
+  };
+  methods['dictation.sync'] = async () => { await dictation?.sync(); return dictation?.status() ?? { enabled: false, corrections: [] }; };
   // runner.status carries the CLI statuses too (protocol, "runner.status").
   const restartStatus = methods['runner.status'];
   methods['runner.status'] = (p) => {
@@ -1086,6 +1125,7 @@ async function main(): Promise<void> {
     // a restart of its own has no deadline.
     const checksDone = scheduler.settled(/^SIG|supervisor/.test(signal) ? 15_000 : undefined);
     librarian.stop();
+    dictation?.stop();
     stuckJobs.stop();
     frozenClis.stop();
     macScreen?.stop();
@@ -1134,6 +1174,7 @@ async function main(): Promise<void> {
       stopHousekeeping();
       scheduler.stop();
       librarian.stop();
+      dictation?.stop();
       // stuckJobs goes on: background work can hold a thread here for hours,
       // and a wait that can never end should still be noticed. It only looks
       // at this runner's threads, so the primary's check doesn't cover them.

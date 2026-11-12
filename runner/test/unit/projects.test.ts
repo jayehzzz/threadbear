@@ -13,12 +13,13 @@ import { FakeClock } from '../../src/clock.ts';
 import { nullLogger, type Logger } from '../../src/log.ts';
 import { ErrorCode, RpcError } from '../../src/protocol.ts';
 import { commandFolders } from '../../src/tools.ts';
+import { DictationLearning, FluidVoiceClient } from '../../src/dictation-learning.ts';
 import type { GenerateParams, ModelResult } from '../../src/models/index.ts';
 
 // A harness whose runner has projects, with a fake home holding repos.
 // `check` answers the second opinion on a pick (a `strong` call), kept apart
 // from `asked`; left out, it agrees.
-function setup(opts: { pocket?: () => LibrarianPocket | undefined; models?: (p: GenerateParams) => Promise<ModelResult<string>> | ModelResult<string>; check?: (p: GenerateParams) => ModelResult<string>; log?: Logger; privateFolder?: (cwd: string) => boolean } = {}) {
+function setup(opts: { dictation?: boolean; pocket?: () => LibrarianPocket | undefined; models?: (p: GenerateParams) => Promise<ModelResult<string>> | ModelResult<string>; check?: (p: GenerateParams) => ModelResult<string>; log?: Logger; privateFolder?: (cwd: string) => boolean } = {}) {
   const root = tmpDir();
   const repo = (rel: string, files: Record<string, string> = {}) => {
     const dir = path.join(root, rel);
@@ -52,7 +53,17 @@ function setup(opts: { pocket?: () => LibrarianPocket | undefined; models?: (p: 
     : undefined;
   const h = makeHarness(home, {}, { projects, panelsRoot: root, actionShell: ['/bin/sh', '-c'], actionTimeoutMs: 5000 });
   projects.start(h.runner);
-  const librarian = new Librarian({ host: h.runner, projects, models, clock: h.clock, log: opts.log ?? nullLogger, home, userHome: root, pocket: opts.pocket });
+  let dictionary: unknown[] = [];
+  const vocabulary = opts.dictation ? new DictationLearning({ home, enabled: () => true, host: {
+    threads: () => h.runner.threadRecords(), events: (id, afterSeq, limit) => h.runner.events(id, { afterSeq, limit }).events,
+    privateFolder: cwd => opts.privateFolder?.(cwd) ?? false, note: (id, text) => h.runner.note(id, text),
+  }, client: new FluidVoiceClient(async (route, body) => {
+    if (route === '/v1/health') return { status: 'ok', version: '1.6.12' };
+    if (body) dictionary = (body as { entries: unknown[] }).entries;
+    return { count: dictionary.length, items: dictionary };
+  }) }) : undefined;
+  vocabulary?.start();
+  const librarian = new Librarian({ host: h.runner, projects, models, clock: h.clock, log: opts.log ?? nullLogger, home, userHome: root, pocket: opts.pocket, dictation: vocabulary });
   librarian.start();
   const create = (text = 'Work on the app', cwd = misc) => h.runner.create({ text, cwd, accountId: 'claude-3' });
   // Ends the thread's running turn as the CLI would.
@@ -65,8 +76,31 @@ function setup(opts: { pocket?: () => LibrarianPocket | undefined; models?: (p: 
     s.result('completed');
     await tick();
   };
-  return { h, root, misc, repo, projects, librarian, asked, checks, create, finish };
+  return { h, root, misc, repo, projects, librarian, asked, checks, create, finish, vocabulary };
 }
+
+test('the librarian carries pending vocabulary beyond its gist and checks a later user confirmation on an ordinary catch-up', async () => {
+  let answer: unknown = {};
+  const s = setup({ dictation: true, models: () => reply(answer) });
+  const { thread } = s.create('Open Fredbear');
+  await tick();
+  const sourceSeq = s.h.runner.events(thread.id).events.find(e => e.type === 'user.message')!.seq;
+  answer = { dictation: [{ heard: 'Fredbear', replacement: 'Threadbear', sourceSeq }] };
+  await s.finish(thread.id);
+  s.h.clock.advance(SETTLE_MS); await tick(8);
+  assert.equal(s.vocabulary!.status().corrections[0].status, 'pending');
+  assert.match(s.asked[0].prompt, /Dictation evidence/);
+  s.h.runner.send(thread.id, 'I meant Threadbear, not Fredbear.'); await tick();
+  const confirmationSeq = s.h.runner.events(thread.id).events.filter(e => e.type === 'user.message').at(-1)!.seq;
+  answer = { dictation: [{ heard: 'Fredbear', replacement: 'Threadbear', sourceSeq, confirmationSeq }] };
+  await s.finish(thread.id);
+  s.h.clock.advance(CATCH_UP_MS + SETTLE_MS); await tick(12);
+  assert.equal(s.vocabulary!.status().corrections[0].status, 'synced');
+  assert.equal(s.asked.length, 2, 'reuses the existing looks, no extra model call');
+  assert.match(s.asked[1].prompt, new RegExp(`"sourceSeq":${sourceSeq}`));
+  assert.ok(s.h.runner.events(thread.id).events.some(e => e.type === 'system.note' && e.text.includes('Learned dictation correction')));
+  s.librarian.stop(); s.vocabulary!.stop();
+});
 
 test("the librarian keeps why a thread is in each project, and takes it out of a wrong guess only when it says so", async () => {
   let answer: unknown = {};

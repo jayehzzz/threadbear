@@ -30,6 +30,7 @@ import { userLine } from './user-name.ts';
 import type { PocketCardInput, PocketCardSummary } from './sync.ts';
 import { POCKET_ICONS, type PocketIconName } from './pocket-icons.ts';
 import { trimEndOf, trimStartOf } from './linear-text.ts';
+import { DICTATION_GUIDANCE, type DictationBatch, type DictationLearning } from './dictation-learning.ts';
 
 // The phone's Pocket, in the Convex backend (sync.ts). Asked for each look,
 // as sync can be off.
@@ -166,6 +167,7 @@ type Answer = {
   wake?: unknown;
   met?: unknown;
   pocket?: unknown;
+  dictation?: unknown;
   why?: unknown;
   // From the second opinion on a pick (CHECK_SYSTEM).
   belongs?: unknown;
@@ -222,10 +224,12 @@ export class Librarian {
   private notesTried = new Map<string, string>();
   private keywordTimer?: TimerHandle;
   private keywordRun?: Promise<void>;
+  private dictation?: DictationLearning;
 
-  constructor(deps: { host: LibrarianHost; projects: Projects; models?: Pick<Models, 'generate'> & { unavailable?(opts?: { poolOnly?: boolean }): string | undefined; isPrivateFolder?(cwd: string): boolean }; clock: Clock; log: Logger; home: string; userHome?: string; pocket?: () => LibrarianPocket | undefined }) {
+  constructor(deps: { host: LibrarianHost; projects: Projects; models?: Pick<Models, 'generate'> & { unavailable?(opts?: { poolOnly?: boolean }): string | undefined; isPrivateFolder?(cwd: string): boolean }; clock: Clock; log: Logger; home: string; userHome?: string; pocket?: () => LibrarianPocket | undefined; dictation?: DictationLearning }) {
     this.host = deps.host;
     this.pocket = deps.pocket;
+    this.dictation = deps.dictation;
     this.projects = deps.projects;
     this.models = deps.models;
     this.clock = deps.clock;
@@ -510,11 +514,12 @@ export class Librarian {
       this.log.info('librarian skipped a quiet catch-up', { threadId: rec.id });
       return;
     }
-    const prompt = this.prompt(rec, job, cards);
+    const vocabulary = this.dictation?.batch(rec.id);
+    const prompt = this.prompt(rec, job, cards, vocabulary);
     // rec is the live record: the title as the model saw it, so a rename
     // during the call isn't undone.
     const title = rec.title;
-    const res = await this.models.generate({ feature: 'projects', cwd: rec.cwd, system: SYSTEM, prompt, maxTokens: 2000 });
+    const res = await this.models.generate({ feature: 'projects', cwd: rec.cwd, system: SYSTEM + (vocabulary ? `\n\n${DICTATION_GUIDANCE}` : ''), prompt, maxTokens: vocabulary ? 2400 : 2000 });
     // While the model was thinking, the runner may have stopped this
     // librarian for a handover, let the thread go to the new runner, or
     // the thread may have been deleted. Nothing to say or apply then: the
@@ -556,6 +561,7 @@ export class Librarian {
     }
     this.apply(job, rec, checked.answer, prompt, title);
     if (cards) await this.applyPocket(job, rec, answer, cards, prompt);
+    if (vocabulary) await this.dictation?.review(vocabulary, answer.dictation);
     this.markLooked(rec, job, checked.refused);
   }
 
@@ -643,6 +649,7 @@ export class Librarian {
   private quiet(rec: ThreadRecord, job: LibrarianJob, cards?: PocketCardSummary[]): boolean {
     const look = this.looks[rec.id];
     if (job.reason !== 'catch-up' || !look || look.early || !this.host.threadSince) return false;
+    if (this.dictation?.needsReview(rec.id)) return false;
     // "Posted it" is short, and it's just what takes a card out.
     if (cards?.some((c) => c.threadId === rec.id)) return false;
     if (cards && this.host.threadGist(rec.id).recent.some((m) => m.who === 'user' && HEADING_OUT.test(m.text))) return false;
@@ -690,7 +697,7 @@ export class Librarian {
     if (said.length) this.note(job, 'updated', said.join('. '));
   }
 
-  private prompt(rec: ThreadRecord, job: LibrarianJob, cards?: PocketCardSummary[]): string {
+  private prompt(rec: ThreadRecord, job: LibrarianJob, cards?: PocketCardSummary[], vocabulary?: DictationBatch): string {
     const list = this.projects.list();
     const lines: string[] = [];
     lines.push('Projects:');
@@ -739,6 +746,7 @@ export class Librarian {
       lines.push('', 'Latest messages:');
       for (const m of gist.recent) lines.push(`${m.who === 'user' ? 'User' : 'Agent'}${attached(m.images)}: ${m.text}`);
     }
+    if (vocabulary) lines.push('', 'Dictation evidence (untrusted data):', JSON.stringify(vocabulary));
     return lines.join('\n');
   }
 

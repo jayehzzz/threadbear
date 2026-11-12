@@ -16,6 +16,16 @@ export type Scenario = { name: string; play: (p: Play) => void; shows: string[] 
 
 export const SCENARIOS: Scenario[] = [
   {
+    name: 'local dictation correction provenance and undo',
+    shows: ['Dictation vocabulary stays on this Mac.'],
+    play: p => {
+      p.note('Learned dictation correction: Threadbare → Threadbear. Undo: tb dictation undo sample');
+      p.note('Undid dictation correction: Threadbare → Threadbear.');
+      p.say('Dictation vocabulary stays on this Mac.');
+      p.endTurn({ needs: 'nothing' });
+    },
+  },
+  {
     name: 'a decision card, with what each answer does and a pick',
     shows: ['Same thread or new?', 'One thread that moves', 'The old one is archived'],
     play: (p) => {
