@@ -987,6 +987,11 @@ reads their passwords or tokens. The account and model a thread runs on are
 small menus on the composer. Whatever you picked last is what the next
 thread starts on.
 
+Claude Code is found at `~/.local/bin/claude`, then on the runner's PATH,
+including npm and Homebrew installs. `claudePath` in `runner.json` (or
+`THREADBEAR_CLAUDE_PATH`) selects a specific install. If Claude is missing,
+the error bar applies to Claude turns; other providers can still run.
+
 To run **Antigravity** inside Threadbear, install Google's official
 [Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli), then
 turn on **ACP agents** in Settings > General > Experiments. Antigravity appears

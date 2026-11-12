@@ -339,6 +339,10 @@ File references are where to look.
 
 ## What it reads
 
+- Whether `~/.local/bin/claude` or a `claude` on the runner's PATH is an
+  executable file, following symlinks, to find native, npm and Homebrew
+  installs. Only absolute PATH entries are used. An explicit `claudePath`
+  or `THREADBEAR_CLAUDE_PATH` takes precedence (`runner/src/config.ts`).
 - From your Claude and Codex logins: which account each is (the email in
   `~/.claude.json`), a few settings, and the token counts in your session
   transcripts, so it can show how much room each login has

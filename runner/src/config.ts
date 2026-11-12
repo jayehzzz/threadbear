@@ -393,7 +393,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { readOnl
     host: '127.0.0.1',
     maxLive: Number.isFinite(maxLive) && maxLive >= 1 ? Math.floor(maxLive) : DEFAULT_MAX_LIVE,
     logFile: expandHome(env.THREADBEAR_LOG || path.join(os.homedir(), 'Library', 'Logs', 'threadbear-runner.log')),
-    claudePath: expandHome(env.THREADBEAR_CLAUDE_PATH || json.claudePath || '~/.local/bin/claude'),
+    claudePath: expandHome(env.THREADBEAR_CLAUDE_PATH || json.claudePath || findClaude(env.PATH ?? '')),
     idleMs,
     defaults: {
       cwd: expandHome(json.defaults?.cwd || DEFAULT_CWD),
@@ -486,6 +486,23 @@ function syncConfig(raw: RunnerJson['sync'], env: NodeJS.ProcessEnv): Config['sy
   if (raw?.pastedPictures === false) out.pastedPictures = false;
   if (raw?.full === true) out.full = true;
   return out;
+}
+
+// Keep the native install first, then try the runner's inherited PATH for
+// npm/Homebrew installs. Ignore relative entries: a thread's folder must not
+// supply the runner's CLI. Keep the symlink so CLI updates can replace it.
+function findClaude(pathEnv: string): string {
+  const native = path.join(os.homedir(), '.local', 'bin', 'claude');
+  const candidates = [native, ...pathEnv.split(path.delimiter).filter((dir) => path.isAbsolute(dir)).map((dir) => path.join(dir, 'claude'))];
+  for (const file of candidates) {
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+      if (fs.statSync(file).isFile()) return file;
+    } catch {
+      // Missing, broken link or not executable: try the next location.
+    }
+  }
+  return native;
 }
 
 function nonEmpty(v: unknown): string | undefined {
