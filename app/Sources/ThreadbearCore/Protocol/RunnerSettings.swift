@@ -35,7 +35,7 @@ public struct RunnerSettings: Sendable, Hashable, Decodable {
     }
 
     public struct Models: Sendable, Hashable, Decodable {
-        /// The pool whose Claude logins answer small jobs (titles, the
+        /// The pool whose supported logins answer small jobs (titles, the
         /// librarian); nil means none, so those are off.
         public var pool: String?
         /// Whether the runner sends `pool` at all. A much older one doesn't.

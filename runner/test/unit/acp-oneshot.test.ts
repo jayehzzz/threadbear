@@ -147,7 +147,7 @@ test('a mixed pool uses Claude when it has one', async () => {
   assert.deepEqual(seen, []);
 });
 
-test('Codex logins still answer nothing', async () => {
+test('Codex logins without a registered asker answer nothing', async () => {
   const { m } = models({ pools: { x: pool('x', [codex]) }, poolId: 'x', claudePath: '/c', askers: {} });
   const r = await m.summarize({ feature: 't', text: 'x' });
   assert.equal((r as { reason: string }).reason, 'no-pool');

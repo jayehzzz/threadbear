@@ -29,7 +29,7 @@ test('what Claude and Codex can each do', () => {
   assert.equal(PROVIDER_INFO.claude.autoMode, 'classifier');
   assert.equal(PROVIDER_INFO.codex.autoMode, 'asks');
   assert.equal(PROVIDER_INFO.claude.smallJobs, true);
-  assert.equal(PROVIDER_INFO.codex.smallJobs, false);
+  assert.equal(PROVIDER_INFO.codex.smallJobs, true);
   assert.equal(PROVIDER_INFO.claude.loginCommand, 'claude auth login');
   assert.equal(PROVIDER_INFO.codex.loginCommand, 'codex login');
 });

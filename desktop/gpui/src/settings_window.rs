@@ -785,16 +785,16 @@ impl SettingsWindow {
                     None => icons::provider_mark(provider),
                 });
                 let label = match &set {
-                    Some(id) => pools.iter().find(|p| &p.0 == id).map_or_else(|| format!("{id}, which has no Claude login"), |p| p.1.clone()),
+                    Some(id) => pools.iter().find(|p| &p.0 == id).map_or_else(|| format!("{id}, which has no supported login"), |p| p.1.clone()),
                     None => "None".to_owned(),
                 };
                 let mut choices: Vec<(String, bool, Value)> = pools.iter().map(|(id, title, _, _)| (title.clone(), set.as_deref() == Some(id.as_str()), json!({ "models": { "pool": id } }))).collect();
                 choices.push(("None".into(), set.is_none(), json!({ "models": { "pool": Value::Null } })));
-                let menu = self.menu("settings-small-jobs", label, face, "Which pool's Claude logins write titles and do the librarian's work", choices, cx);
+                let menu = self.menu("settings-small-jobs", label, face, "Which pool's logins write titles and do the librarian's work", choices, cx);
                 sections.push(section(
                     "settings-small-jobs-section",
                     "Small jobs",
-                    "Titles and the librarian use Haiku on one of this pool's Claude logins, the one with the most room, and count towards its usage. When every login is out of room they wait. None turns them off.",
+                    "Titles and the librarian use a login in this pool and count towards its usage. Claude uses Haiku and Opus; Codex uses GPT. When every login is out of room they wait. None turns them off.",
                     "change this, or which model and effort new threads start on. Your agent edits them in runner.json.",
                     vec![row("Run on", menu, cx)],
                     cx,
@@ -1065,6 +1065,11 @@ impl SettingsWindow {
             "labReview": settings.as_ref().map(|s| s.lab_review),
             "privateFolders": settings.as_ref().map(|s| s.private_folders.clone()),
             "smallJobsPool": settings.as_ref().and_then(|s| s.pool.clone()),
+            "smallJobPools": self.app.upgrade().map(|app| {
+                let app = app.read(cx);
+                let small = app.small_job_providers();
+                app.logins.pools.iter().filter(|pool| pool.account_ids.iter().any(|id| app.logins.account(id).is_some_and(|a| small.iter().any(|p| p == a.provider_id())))).map(|pool| pool.title.clone()).collect::<Vec<_>>()
+            }),
             // General's Web runtime row, as it reads.
             "webRuntime": crate::web_runtime::settings_words(cx),
             "runners": self.runners_dump(cx),

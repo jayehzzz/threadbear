@@ -83,6 +83,8 @@ export const CLIENT_REQUESTS = [
   'turn/steer',
   'turn/interrupt',
   'model/list',
+  'config/read',
+  'skills/list',
   'account/read',
   'account/rateLimits/read',
 ];
@@ -135,10 +137,10 @@ export const IGNORED_ITEMS: string[] = [...IGNORED_ITEM_TYPES];
 export const TYPE_FIELDS: Record<string, string[]> = {
   InitializeResponse: ['userAgent'],
   InitializeCapabilities: ['experimentalApi', 'optOutNotificationMethods'],
-  ThreadStartParams: ['cwd', 'model', 'approvalPolicy', 'approvalsReviewer', 'sandbox', 'config', 'dynamicTools'],
+  ThreadStartParams: ['cwd', 'model', 'approvalPolicy', 'approvalsReviewer', 'sandbox', 'config', 'dynamicTools', 'ephemeral', 'baseInstructions', 'developerInstructions', 'environments'],
   ThreadResumeParams: ['threadId', 'cwd', 'excludeTurns', 'config'],
   ThreadStartResponse: ['thread', 'model', 'reasoningEffort'],
-  TurnStartParams: ['threadId', 'clientUserMessageId', 'input', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'sandboxPolicy', 'model', 'effort', 'summary', 'collaborationMode'],
+  TurnStartParams: ['threadId', 'clientUserMessageId', 'input', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'sandboxPolicy', 'model', 'effort', 'summary', 'collaborationMode', 'outputSchema'],
   TurnSteerParams: ['threadId', 'expectedTurnId', 'clientUserMessageId', 'input'],
   TurnSteerResponse: ['turnId'],
   TurnInterruptParams: ['threadId', 'turnId'],
@@ -163,6 +165,12 @@ export const TYPE_FIELDS: Record<string, string[]> = {
   RateLimitWindow: ['usedPercent', 'windowDurationMins', 'resetsAt'],
   FileUpdateChange: ['path', 'kind', 'diff'],
   ThreadTokenUsageUpdatedNotification: ['threadId', 'tokenUsage'],
+  ThreadTokenUsage: ['total', 'last'],
+  ModelReroutedNotification: ['threadId', 'toModel'],
+  ConfigReadResponse: ['config'],
+  SkillsListResponse: ['data'],
+  SkillsListEntry: ['skills', 'errors'],
+  SkillMetadata: ['name'],
 };
 
 export type SurfaceCheck = { missing: string[]; added: string[] };

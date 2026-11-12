@@ -30,7 +30,7 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     autoMode: 'asks',
     sandbox: false,
     rewind: true,
-    smallJobs: false,
+    smallJobs: true,
     usageReadings: true,
   },
   // Over ACP (adapters/acp/): Auto behaves like Ask, and neither sandbox,

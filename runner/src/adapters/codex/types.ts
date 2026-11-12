@@ -73,6 +73,10 @@ export type ThreadStartParams = {
   sandbox: SandboxMode;
   config: Record<string, unknown>;
   dynamicTools?: DynamicToolSpec[];
+  ephemeral?: boolean;
+  baseInstructions?: string;
+  developerInstructions?: string;
+  environments?: unknown[];
 };
 export type ThreadResumeParams = Omit<ThreadStartParams, 'dynamicTools'> & { threadId: string; excludeTurns: true };
 export type ThreadStartResponse = {
@@ -104,6 +108,7 @@ export type TurnStartParams = {
   effort?: ReasoningEffort;
   summary: 'detailed';
   collaborationMode?: CollaborationMode;
+  outputSchema?: Record<string, unknown>;
 };
 export type TurnStartResponse = { turn: Turn };
 export type TurnSteerParams = { threadId: string; expectedTurnId: string; clientUserMessageId?: string; input: UserInputItem[] };

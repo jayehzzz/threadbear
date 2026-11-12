@@ -139,7 +139,7 @@ const HELP = `tb: talk to the Threadbear runner
   tb librarian pause|resume
   tb settings [--json]            what the Settings window shows
   tb models [--json]              the small-model pool and private folders
-  tb models pool <pool|off>       which pool's Claude logins answer small jobs (off: none, so no titles or librarian)
+  tb models pool <pool|off>       which pool's logins answer small jobs (off: none, so no titles or librarian)
   tb models try <job> "text" [--labels a,b] [--field name=description]... [--system S] [--cwd DIR]
                                   one call by hand: classify (--labels), extract (--field),
                                   summarize or generate. It spends like any other

@@ -32,9 +32,9 @@ extension AppModel {
     }
 
     /// Pools with a login that can take small jobs (titles, the librarian):
-    /// a Claude one, or an ACP agent's in a pool of its own. Settings › Models and the Librarian's page pick
+    /// Claude, Codex, or a supported ACP agent. Settings › Models and the Librarian's page pick
     /// from these.
-    var claudePools: [Pool] {
+    var smallJobPools: [Pool] {
         pools.filter { pool in
             pool.accountIds.contains { id in accounts.contains { $0.id == id && Providers.info($0.provider).smallJobs } }
         }

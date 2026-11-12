@@ -129,7 +129,7 @@ export type Config = {
   // Mike's runner tags a signed release of main once a day for everyone
   // else's copy (src/upstream.ts): runner.json `releases`.
   releases?: { publish: boolean; signingKey?: string; signingProvider?: string };
-  // The runner's own model calls (src/models/): the pool whose Claude
+  // The runner's own model calls (src/models/): the pool whose supported
   // logins answer them (null: none, so no small jobs) and folders whose
   // threads are never sent.
   models: { pool: string | null; privateFolders: string[] };

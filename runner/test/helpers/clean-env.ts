@@ -6,7 +6,9 @@
 // stopped setup (David, 8 Nov 2026). The installed runner, a LaunchAgent,
 // never has them, so the tests run as it does: without them. They go back
 // as they were when the test process exits.
-const SESSION_VAR = /^(CLAUDECODE$|CLAUDE_|ANTHROPIC_)/;
+// Tests start runners with their own keys. A key inherited from the live
+// thread would authenticate their tb subprocesses as a different thread.
+const SESSION_VAR = /^(CLAUDECODE$|CLAUDE_|ANTHROPIC_|THREADBEAR_THREAD_KEY$)/;
 
 const saved: Record<string, string> = {};
 for (const [name, value] of Object.entries(process.env)) {

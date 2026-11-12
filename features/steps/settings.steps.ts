@@ -3,7 +3,7 @@ import { Then, When } from '@cucumber/cucumber';
 import type { ThreadbearWorld } from '../support/world.ts';
 
 /** The Settings window while it's open, from either app's dump. */
-type SettingsInfo = { tab: string; keepAwake?: boolean | null; privateFolders?: string[] | null };
+type SettingsInfo = { tab: string; keepAwake?: boolean | null; privateFolders?: string[] | null; smallJobPools?: string[] | null };
 const shown = (d: unknown) => (d as { settingsWindow?: SettingsInfo | null }).settingsWindow;
 
 When('I open Settings', async function (this: ThreadbearWorld) {
@@ -42,4 +42,8 @@ Then('Settings lists the private folder {string}', async function (this: Threadb
 
 Then('Settings lists no private folders', async function (this: ThreadbearWorld) {
   await this.until('no private folders', (d) => shown(d)?.privateFolders?.length === 0);
+});
+
+Then('Settings offers the small jobs pool {string}', async function (this: ThreadbearWorld, pool: string) {
+  await this.until(`Small jobs offers ${pool}`, (d) => shown(d)?.smallJobPools?.includes(pool));
 });

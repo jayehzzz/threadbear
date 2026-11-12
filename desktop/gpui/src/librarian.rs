@@ -44,7 +44,7 @@ impl LibrarianState {
 }
 
 /// What the ⓘ beside the page's title says.
-const MORE: &str = "It files each thread in a project, writes down where the project's up to, and renames threads that have wandered off from their title. It takes a look after a thread's first message and when a turn ends, then catches up at most every 20 minutes while the thread keeps going. A catch-up after only a quick reply is skipped without asking the model. Each look is one short call to Haiku, not the model your threads use, on the Claude login with the most room in the Runs on pool, and counts towards its usage. It waits when they're all out of room, and threads in a private folder are never sent. A thread you take out of a project is never put back in it.";
+const MORE: &str = "It files each thread in a project, writes down where the project's up to, and renames threads that have wandered off from their title. It takes a look after a thread's first message and when a turn ends, then catches up at most every 20 minutes while the thread keeps going. A catch-up after only a quick reply is skipped without asking the model. Each look is a short model call on a login in the Runs on pool, and counts towards its usage. Claude uses Haiku and Opus; Codex uses GPT. It waits when they're all out of room, and threads in a private folder are never sent. A thread you take out of a project is never put back in it.";
 
 /// The projects a `projects.list` answer has that the librarian made and
 /// aren't archived (`LibrarianStats`' "Projects it made").
@@ -213,7 +213,7 @@ impl Threadbear {
                         .on_click(cx.listener(|this, _, _, cx| this.run_librarian(cx))),
                 ),
             );
-        let today_tip = "Today's looks, quiet catch-ups it skipped without asking the model, and tokens used on your Claude login";
+        let today_tip = "Today's looks, quiet catch-ups it skipped without asking the model, and tokens used on your selected login";
         v_flex()
             .gap(px(6.))
             .pl(px(LEADING))
@@ -358,7 +358,7 @@ impl Threadbear {
     }
 
     /// `LibrarianSettings`: whether it's looking at all, and which pool's
-    /// Claude logins it runs on (the runner's small-jobs setting, which
+    /// Supported logins it runs on (the runner's small-jobs setting, which
     /// titles share), with the rest in Settings.
     fn render_librarian_settings(&mut self, status: &Status, cx: &mut Context<Self>) -> AnyElement {
         let secondary = style::secondary_text(cx);
@@ -396,7 +396,7 @@ impl Threadbear {
             .into_any_element()
     }
 
-    /// Runs on: the pools with a Claude login (`claudePools`), the one set
+    /// Runs on: the pools with a supported login, the one set
     /// ticked; one that's set but can't take a look shown so it still says
     /// what's set. None until the runner's settings have come, or from a
     /// runner too old to have the setting.
@@ -413,11 +413,11 @@ impl Threadbear {
             .map(|pool| (pool.id.clone(), pool.title.clone(), pool.icon.clone().filter(|i| !i.is_empty()).unwrap_or_else(|| "square.stack".into())))
             .collect();
         let current = match &set {
-            Some(id) => pools.iter().find(|p| &p.0 == id).map_or_else(|| format!("{id}, which has no Claude login"), |p| p.1.clone()),
+            Some(id) => pools.iter().find(|p| &p.0 == id).map_or_else(|| format!("{id}, which has no supported login"), |p| p.1.clone()),
             None => "No pool".to_owned(),
         };
         let app = cx.entity().downgrade();
-        let tip = "Which pool's Claude logins it uses, the one with the most room. It waits when they're all out of room. Titles use the same pool (Settings › Models)";
+        let tip = "Which pool's logins it uses. It waits when they're all out of room. Titles use the same pool (Settings › Models)";
         let choices = pools.clone();
         let set_for_menu = set.clone();
         Some(

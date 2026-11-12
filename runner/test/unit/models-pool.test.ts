@@ -14,6 +14,7 @@ import { nullLogger } from '../../src/log.ts';
 import { Models } from '../../src/models/index.ts';
 import type { ModelSettings } from '../../src/models/index.ts';
 import { askCli, cliArgs, readReply } from '../../src/models/claude-pool.ts';
+import type { AskRequest } from '../../src/models/acp-oneshot.ts';
 import type { CliRequest, CliResponse } from '../../src/models/claude-pool.ts';
 import { ledgerPath } from '../../src/models/ledger.ts';
 import { SettingsService, settingsMethods } from '../../src/settings.ts';
@@ -144,7 +145,7 @@ test('pool: a login that fails some other way says so, and is not counted as run
 test('pool: null, a pool that is gone or one with no Claude login says no-pool, and unavailable() says so', async () => {
   for (const pool of [null, 'nope', 'codex-only']) {
     const s = setup({ pool, pools: [{ id: 'claude', title: 'Claude', accountIds: ['claude-main'] }, { id: 'codex-only', title: 'Codex', accountIds: ['codex-main'] }] });
-    assert.equal(s.models.unavailable(), 'Needs a Claude pool to run on', String(pool));
+    assert.equal(s.models.unavailable(), 'Needs a small-jobs pool to run on', String(pool));
     const r = await s.models.generate({ feature: 'titles', prompt: 'a' });
     assert.equal(r.ok ? 'sent' : r.reason, 'no-pool', String(pool));
     assert.equal(s.cli.length, 0);
@@ -296,4 +297,57 @@ test('cli: askCli sends the prompt on stdin, runs in the empty folder on the log
   const hung = await askCli({ claudePath, account, model: 'm', user: 'hang', cwd, timeoutMs: 300, registry });
   assert.equal(!hung.ok && hung.timedOut, true);
   assert.equal(removed.length, 2);
+});
+
+
+test('Codex pool: titles, librarian JSON, summaries and strong decisions use GPT and record its actual model', async () => {
+  const home = tmpDir();
+  const calls: AskRequest[] = [];
+  const accounts = [acct('codex-main', { provider: 'codex', room: 80 })];
+  accounts[0].defaultModel = 'gpt-6.1-sol';
+  accounts[0].models = [{ id: 'gpt-6-luna', title: 'Luna', model: 'gpt-6-luna' }];
+  const settings: ModelSettings = { pool: 'codex', privateFolders: ['/private/client'] };
+  const replies = ['A useful title', '{"project":"Threadbear"}', 'A short summary', 'Thursday'];
+  const models = new Models({
+    home, clock: new FakeClock(), log: nullLogger, settings: () => settings,
+    poolHost: { pool: (id) => id === 'codex' ? { pool: { id, title: 'Codex', accountIds: accounts.map(a => a.id) }, accounts } : undefined, ranDry: () => {} },
+    askers: { codex: async (req) => { calls.push(req); return { ok: true, text: replies.shift()!, model: req.model, inputTokens: 5, outputTokens: 2 }; } },
+  });
+  assert.equal(models.unavailable(), undefined);
+  const title = await models.generate({ feature: 'titles', prompt: 'Name this thread' });
+  assert.ok(title.ok && title.value === 'A useful title');
+  assert.ok(title.ok && title.model === 'gpt-6-luna on codex-main');
+  const librarian = await models.extract({ feature: 'librarian', text: 'Building Threadbear', fields: { project: 'the project' } });
+  assert.ok(librarian.ok && librarian.value.project === 'Threadbear');
+  await models.summarize({ feature: 'summary', text: 'Some text' });
+  await models.generate({ feature: 'wake', prompt: 'When?', strong: true });
+  assert.deepEqual(calls.map(c => c.model), ['gpt-6-luna', 'gpt-6-luna', 'gpt-6-luna', 'gpt-6.1-sol']);
+  assert.ok(calls[1].jsonSchema);
+  const lines = fs.readFileSync(ledgerPath(home), 'utf8').trim().split('\n').map(l => JSON.parse(l));
+  assert.deepEqual(lines.map(l => l.model), calls.map(c => c.model));
+  const privateCall = await models.generate({ feature: 'titles', prompt: 'secret', cwd: '/private/client/app' });
+  assert.equal(!privateCall.ok && privateCall.reason, 'private');
+  assert.equal(calls.length, 4);
+});
+
+
+test('Codex pool: a limited login retries within its pool and a missing Luna catalogue uses the login default', async () => {
+  const home = tmpDir();
+  const calls: string[] = [];
+  const accounts = [acct('codex-1', { provider: 'codex', room: 90 }), acct('codex-2', { provider: 'codex', room: 70 })];
+  accounts.forEach(a => { a.defaultModel = 'gpt-default'; });
+  const dry: string[] = [];
+  const models = new Models({ home, clock: new FakeClock(), log: nullLogger,
+    settings: () => ({ pool: 'codex', privateFolders: [] }),
+    poolHost: { pool: () => ({ pool: { id: 'codex', title: 'Codex', accountIds: accounts.map(a => a.id) }, accounts }), ranDry: id => { dry.push(id); } },
+    askers: { codex: async req => {
+      calls.push(req.account.id);
+      assert.equal(req.model, 'gpt-default');
+      return calls.length === 1 ? { ok: false, timedOut: false, limit: true, message: 'Usage limit' } : { ok: true, text: 'done', model: 'gpt-actual' };
+    } },
+  });
+  const result = await models.summarize({ feature: 'summary', text: 'short text' });
+  assert.ok(result.ok && result.model === 'gpt-actual on codex-2');
+  assert.deepEqual(calls, ['codex-1', 'codex-2']);
+  assert.deepEqual(dry, ['codex-1']);
 });

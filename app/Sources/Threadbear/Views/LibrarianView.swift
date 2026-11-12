@@ -75,7 +75,7 @@ private struct LibrarianState: View {
                 .font(.system(size: TypeScale.sidebarMeta))
                 .foregroundStyle(SidebarMetrics.faint)
                 .monospacedDigit()
-                .tip("Today's looks, quiet catch-ups it skipped without asking the model, and tokens used on your Claude login")
+                .tip("Today's looks, quiet catch-ups it skipped without asking the model, and tokens used on your selected login")
             HStack(spacing: zoomed(8)) {
                 Button(status.paused ? "Resume" : "Pause") { app.setLibrarianPaused(!status.paused) }
                     .disabled(app.isBusy(BusyKey.pauseLibrarian))

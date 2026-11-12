@@ -2089,7 +2089,7 @@ built parsers and gates with no launch of the app, which is the trap.)
   Experiments, and the runner's version. A change shows at once, and one
   the runner turns down puts back what it had (unless something newer came)
   with its reason under the form.
-- Models: Small jobs' pool, with None and a set pool that has no Claude
+- Models: Small jobs' pool, with None and a set pool that has no supported
   login, and the private folders, with a minus on each and Add Folder….
 - Not here yet: the ding (GPUI has no sound to play it with), the activity
   log (the GPUI app keeps none) and Quitting's question (it doesn't ask),
@@ -2749,3 +2749,13 @@ built parsers and gates with no launch of the app, which is the trap.)
 - Remaining: the rest of the daily driver.
 - Verification: `TB_APP=swift cucumber-js` on Tinker Desk, 24 of 24 scenarios;
   `TB_APP=gpui cucumber-js` on `cloud` under Xvfb, 17 of 24 at this point.
+
+### 2026-11-12 Codex for Small jobs (`settings.models`)
+
+The Small jobs picker and the librarian's Runs on picker accept the Codex
+pool when the runner advertises its support. Both apps describe the selected
+provider instead of saying every job uses Claude. Older runners keep their
+previous capabilities. The new pool-availability scenario passed on the Swift
+Mac app. Real calls through the dev runner's Codex pool generated a title and
+extracted a project with a nullable owner. GPUI source is updated; its build
+was not run on Jayden's Mac, which has no Rust toolchain or check host.

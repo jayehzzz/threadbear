@@ -73,7 +73,7 @@ pub struct RunnerSettings {
     pub keep_awake: Option<bool>,
     pub bring_in: BringIn,
     pub bring_in_supported: bool,
-    /// The pool whose Claude logins answer small jobs (titles, the
+    /// The pool whose supported logins answer small jobs (titles, the
     /// librarian); None means none, so those are off.
     pub pool: Option<String>,
     /// Whether the runner sends `models.pool` at all.

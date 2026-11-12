@@ -276,7 +276,10 @@ File references are where to look.
   `THREADBEAR_CLI_UPDATES=off` stops all of this.
 - **Small model calls** (`runner/src/models/`): thread titles, filing
   threads into projects (the librarian, every 5 minutes) and similar jobs
-  send short excerpts of your threads to `claude -p` on your own logins.
+  send short excerpts of your threads through the selected Small jobs pool
+  on your own Claude or Codex login. Claude uses `claude -p`; Codex uses
+  a short-lived `codex app-server` with an ephemeral thread, agent tools,
+  hooks and MCP servers disabled. The default pool remains Claude.
   It also asks for a few search words for each thread, and threads from
   before that get them in batches of 15 (title, first message and last
   reply), every 2 minutes until each has some, once.

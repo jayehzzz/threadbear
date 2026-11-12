@@ -225,3 +225,7 @@ What a first list of the cuts missed and the trial found: the `-ThreadbearPocket
 launch argument, the positional parameter shifting the tools test, and the
 App Store review notes. Expect a few like that in any feature: after the
 listed cuts, `git grep -i <feature>` across the repo finds the rest.
+
+Small jobs use `runner/src/models/`; `codex-oneshot.ts` adds ephemeral GPT calls
+through the official Codex CLI. To remove Codex small jobs, remove its asker
+from `main.ts` and set Codex's `smallJobs` capability to false in `providers.ts`.

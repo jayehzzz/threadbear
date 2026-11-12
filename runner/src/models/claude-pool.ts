@@ -29,7 +29,7 @@ export type CliRequest = {
 };
 
 export type CliResponse =
-  | { ok: true; text: string; inputTokens?: number; outputTokens?: number; notionalUsd?: number }
+  | { ok: true; text: string; model?: string; inputTokens?: number; outputTokens?: number; notionalUsd?: number }
   // limit: the login said it's out of room, so another one may answer.
   | { ok: false; timedOut: boolean; limit: boolean; message: string };
 

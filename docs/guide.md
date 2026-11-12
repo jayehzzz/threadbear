@@ -844,17 +844,16 @@ It looks after a thread's first message and when a turn ends, then catches
 up at most every 20 minutes while the thread keeps going. A catch-up after
 only a quick reply is skipped without asking anything.
 
-Each look is one short call to Haiku, Claude's small, cheap model, rather
-than the model your threads run on. When it wants to file a thread in a
-project the thread hasn't touched the folders of, one more short call, to
-Opus, checks the thread is really working on that project and doesn't just
-share a subject with it. They run on one of your own Claude
-logins: the one the pool would pick next in the pool chosen under Runs on (the
-same pool that writes thread titles, also in Settings › Models), and they
-count towards that login's usage like any other call. When every login in
-the pool is out of room it waits, and with only Codex logins it doesn't
-run at all. Threads in a private folder (Settings › Models) are never sent
-to it.
+Each look is one short call on the pool selected under Runs on (also in
+Settings > Models). A Claude pool uses Haiku; a Codex pool uses GPT-6-Luna
+when available, otherwise the login's default GPT model. When it wants to
+file a thread in a project the thread hasn't touched the folders of, one
+more short call checks that it is really working on that project: Opus on
+a Claude pool, or the login's default GPT model on Codex. These calls use
+the same pool that writes thread titles and count towards its logins' usage.
+When every login in the pool is out of room it waits. Choose None under
+Settings > Models to turn Small jobs off. Threads in a private folder
+(Settings > Models) are never sent to it.
 
 The Librarian view lists what it did and what it will look at next. Hover
 a row to see why it filed a thread where it did. Turn
@@ -1028,9 +1027,10 @@ to continue, with the conversation carried across. It pins the thread to
 that Codex login. Anything you've typed in the message field stays there.
 The switch happens only when you click.
 
-Titles, the librarian and Wake when… run on a Claude login, so with only
-Codex they don't happen: threads keep the first line of their first message
-as their title.
+Titles, the librarian and Wake when… use the pool selected in Settings >
+Models > Small jobs > Run on. Pick Codex there to use your Codex subscription
+and GPT models for these jobs. This is separate from a thread's own model;
+new installs still default Small jobs to the Claude pool.
 
 Logins are grouped into pools, one for Claude and one for Codex to begin
 with (Settings > Pools). A new thread in a pool starts on the login with room whose

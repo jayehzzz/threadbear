@@ -45,6 +45,7 @@ import { CodexAdapter } from './adapters/codex/adapter.ts';
 import { AcpAdapter } from './adapters/acp/adapter.ts';
 import { ACP_AGENTS, ACP_PROVIDERS, type AcpProvider } from './adapters/acp/agents.ts';
 import { acpAsker } from './models/acp-oneshot.ts';
+import { codexAsker } from './models/codex-oneshot.ts';
 import { PROVIDER_INFO } from './providers.ts';
 import { resolveCodexBinary } from './adapters/codex/appserver.ts';
 import { checkSurface, testedVersion } from './adapters/codex/surface.ts';
@@ -281,7 +282,7 @@ async function main(): Promise<void> {
       }),
     ]),
   );
-  // The runner's own small-model calls, on the settings' Claude pool.
+  // The runner's own small-model calls, on the pool selected in settings.
   const models = new Models({
     home: cfg.home,
     clock: realClock,
@@ -289,7 +290,10 @@ async function main(): Promise<void> {
     settings: () => cfg.models,
     claudePath: cfg.claudePath,
     registry,
-    askers: Object.fromEntries(ACP_PROVIDERS.filter((p) => PROVIDER_INFO[p].smallJobs).map((p) => [p, acpAsker({ agent: ACP_AGENTS[p], binary: acpBinary(p), on: acpOn, registry, log })])),
+    askers: {
+      codex: codexAsker({ binary: () => updates.codexBinary(), args: cfg.codexArgs, registry, log }),
+      ...Object.fromEntries(ACP_PROVIDERS.filter((p) => PROVIDER_INFO[p].smallJobs).map((p) => [p, acpAsker({ agent: ACP_AGENTS[p], binary: acpBinary(p), on: acpOn, registry, log })])),
+    },
     poolHost: { pool: (id) => runner.smallModelPool(id), ranDry: (id) => runner.noteRanDry(id) },
   });
   const projects = new Projects({ home: cfg.home, clock: realClock, log });

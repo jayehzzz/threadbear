@@ -546,7 +546,7 @@ type ProjectIcon = {
 // What the librarian (see Projects) is doing, has done and will do next.
 type LibrarianStatus = {
   state: "idle" | "working" | "paused" | "off"
-  reason?: string       // state "off": why ("Needs a Claude pool to run
+  reason?: string       // state "off": why ("Needs a small-jobs pool to run
                         // on", "Every login in Claude is out of room",
                         // "Model calls are off")
   paused: boolean       // Mike paused it; looks wait in the queue
@@ -1763,9 +1763,13 @@ The runner makes small model calls of its own (classify, extract,
 summarise, generate) for features like titles, the librarian and "wake
 when" (`src/models/`). Features ask for a job, not a model: `ROUTES` says
 which model answers it, Haiku for everything but `decide`, which is Opus.
-Every call runs on the official `claude` CLI on one of the Claude logins
-in the pool `models.pool` names: the same CLI and logins as threads, so
-it needs no key and costs nothing beyond the login's usage.
+Calls run on the official Claude or Codex CLI on a login in the pool
+`models.pool` names, using the same subscription as threads, with no API key.
+Claude uses Haiku for small jobs and Opus for decisions. A Codex pool uses
+GPT-6-Luna when its catalogue lists it, otherwise the login's default model;
+strong decisions use the login's default model. The actual model is recorded
+in the result and usage ledger. Picking a pool is opt-in; the default stays
+`claude`. Mixed pools keep using Claude when they contain a Claude login.
 
 There used to be OpenRouter as well, with a key, a daily budget and a
 spend to show. It went on 29 Oct 2026: every feature is Haiku or Opus,
@@ -1774,11 +1778,11 @@ older runner's `openRouterKey`, `dailyBudgetUsd`, `spentTodayUsd` and
 `spentMonthUsd` in `Settings.models` are ignored by clients, and
 `secrets/openrouter-key`, if there is one, is no longer read.
 
-- **Consent.** A call sends thread text to Anthropic on Mike's own login,
-  as the thread itself does.
+- **Consent.** A call sends thread text to the selected pool's provider on
+  the selected login, as the thread itself does.
 - **The pool.** `models.pool` in `runner.json` is a pool id, `"claude"`
   when it isn't set, or `null` for none, which turns titles and the
-  librarian off. Only its Claude logins are used. A call runs on the one
+  librarian off. Its supported logins are used. A call runs on the one
   it ran on last while that's OK to run on (see Pools), else the one with
   the most room. The CLI runs as `claude -p` at low effort in an empty
   folder (`models/cli` in the data dir), with no tools, MCP servers,
@@ -1789,6 +1793,16 @@ older runner's `openRouterKey`, `dailyBudgetUsd`, `spentTodayUsd` and
   it's out of room counts as run dry, as it does for a turn, and the next
   one is tried. At most 2 calls run at once, and each times out after 60
   seconds.
+- **Codex calls.** A short-lived `codex app-server` runs in `models/cli`,
+  with an ephemeral thread, the job's base instructions, low effort, and
+  `outputSchema` for structured results. Startup overrides disable notification commands, hooks, plugins, apps,
+  memory, goals, browsing, shell and other agent tools. Bundled skills and
+  automatic skill instructions are disabled; discovered skill names are
+  disabled on this ephemeral thread only. The
+  effective config's MCP servers are individually disabled before the thread
+  starts; user instructions and project documents are cleared. Every server
+  request is refused. Prompts travel over stdin, never in process arguments.
+  A timeout or failure closes the process; usage limits try the next login.
 - **Private folders.** `models.privateFolders` in `runner.json` lists
   folders whose threads are never sent anywhere, for client work and the
   like. A call for a thread in one of them, or anywhere under one,
@@ -1805,7 +1819,7 @@ older runner's `openRouterKey`, `dailyBudgetUsd`, `spentTodayUsd` and
   names them too. Later, the librarian renames a thread whose title no
   longer says what it's about (see Projects).
 - **Failures.** A call never throws: it says why it didn't answer
-  (`no-pool`: no pool, or none of its logins is a Claude one; `no-room`:
+  (`no-pool`: no pool, or none of its logins supports small jobs; `no-room`:
   every login is out of room; `off`: this runner makes no model calls;
   private folder, timed out, error), and the feature falls back to what
   it did before there was a model to ask.
@@ -4845,8 +4859,8 @@ and also when a move or an ask leaves it out. That isn't remembered as a
 no the way Mike's is: a later look can put it back. Looks are listed in
 `LibrarianStatus.recent`.
 
-Looks (and icon picks) run on the Claude pool, like every small job.
-Without a pool with a Claude login (`models.pool` null, or a pool with
+Looks (and icon picks) run on the selected small-jobs pool.
+Without a pool with a supported login (`models.pool` null, or a pool with
 none), or while every login in it is out of room, the queue waits
 (`state: "off"`) and tries again later.
 
