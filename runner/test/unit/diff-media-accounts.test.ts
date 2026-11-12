@@ -135,6 +135,14 @@ test('account discovery reads only the login email', () => {
     { id: 'claude-10', provider: 'claude', title: 'claude-10', configDir: path.join(accts, 'claude-10') },
   ]);
   assert.ok(!JSON.stringify(found).includes('SHOULD-NOT-APPEAR'));
+  // A .claude.json written by a signed-out CLI has no oauthAccount, so that
+  // folder is not offered as a working Claude login until signed in.
+  fs.writeFileSync(path.join(root, 'claude.json'), JSON.stringify({ installMethod: 'homebrew', firstStartTime: '2026-11-12T00:00:00Z' }));
+  fs.writeFileSync(path.join(accts, 'claude-2', '.claude.json'), JSON.stringify({ installMethod: 'native' }));
+  assert.deepEqual(
+    discoverAccounts({ claudeMainDir: main, claudeMainJson: path.join(root, 'claude.json'), tokenStatsAccountsDir: accts }).map((a) => a.id),
+    ['claude-10'],
+  );
 });
 
 test("without Token Stats, logins come from the data dir's accounts folder", () => {

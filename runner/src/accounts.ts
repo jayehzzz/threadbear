@@ -20,6 +20,24 @@ export function readLoginEmail(claudeJsonPath: string): string | undefined {
   }
 }
 
+// A .claude.json written by a signed-out CLI is valid JSON with no
+// oauthAccount. A folder with no .claude.json yet still counts, so an
+// account folder created before its first login (or in tests) is listed.
+export function isClaudeSignedOut(claudeJsonPaths: string[]): boolean {
+  let sawJson = false;
+  for (const file of claudeJsonPaths) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { oauthAccount?: unknown };
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      sawJson = true;
+      if (parsed.oauthAccount && typeof parsed.oauthAccount === 'object') return false;
+    } catch {
+      // Missing or unreadable: check the next path.
+    }
+  }
+  return sawJson;
+}
+
 // The model an account's own settings.json names ("claude-fable-5-1[1m]"),
 // which the CLI uses for a session that names none. Only that one key is
 // read. Absent, blank or not a string: the CLI's own default.
@@ -94,7 +112,8 @@ export type DiscoveryConfig = Pick<Config, 'claudeMainDir' | 'claudeMainJson' | 
 // come first, so the first account is Claude's.
 export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
   const out: Account[] = [];
-  if (isDirectory(cfg.claudeMainDir)) {
+  const mainJsons = [cfg.claudeMainJson, path.join(cfg.claudeMainDir, '.claude.json')];
+  if (isDirectory(cfg.claudeMainDir) && !isClaudeSignedOut(mainJsons)) {
     out.push(claudeAccount('claude-main', cfg.claudeMainDir, readLoginEmail(cfg.claudeMainJson) ?? readLoginEmail(path.join(cfg.claudeMainDir, '.claude.json'))));
   }
   // Token Stats' folder (Mike's app), then the data dir's own accounts
@@ -117,7 +136,8 @@ export function discoverAccounts(cfg: DiscoveryConfig): Account[] {
       .sort((a, b) => Number(a[1]) - Number(b[1]))
       .map((m) => ({ id: m[0], dir: dirOf.get(m[0])! }));
   for (const { id, dir } of numbered('claude')) {
-    if (isDirectory(dir)) out.push(claudeAccount(id, dir, readLoginEmail(path.join(dir, '.claude.json'))));
+    const json = path.join(dir, '.claude.json');
+    if (isDirectory(dir) && !isClaudeSignedOut([json])) out.push(claudeAccount(id, dir, readLoginEmail(json)));
   }
   const codex = cfg.codexMainDir ? [{ id: 'codex-main', dir: cfg.codexMainDir }] : [];
   for (const { id, dir } of [...codex, ...numbered('codex')]) {

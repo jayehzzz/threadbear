@@ -3070,8 +3070,9 @@ the thread if a sub-agent stalls, so an ask can't stay hidden for good.
   message, the reply, the files and the diff (up to 40,000 characters),
   each in a fence one backtick longer than any run in it, so nothing in
   them can close it, and marked as data to review, not instructions.
-  Its login is the other provider's (`pickInPool` over the pools with no
-  folders), else a fresh session of the same provider. For a folder a
+  Its login is another provider's (`pickInPool` over the pools with no
+  folders, checking Claude, Codex and any enabled ACP providers), else a
+  fresh session of the same provider. For a folder a
   pool is kept for, only that pool's logins are used, and a kept pool's
   logins never review anything outside it. The first thread gets a
   `system.note` saying who reviews and whether it's another lab, then

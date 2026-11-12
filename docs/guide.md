@@ -1112,9 +1112,10 @@ turn it off under Settings at the foot of the panel.
 ### Review by another lab
 
 When a thread changes code (five lines or more, not counting docs) and
-finishes with nothing for you to do, Threadbear has your other provider try
-to break the change: Codex reviews a Claude thread's change, and Claude a
-Codex one's. The review runs in a thread of its own in the same folder, with
+finishes with nothing for you to do, Threadbear has another provider try
+to break the change: Codex reviews a Claude or Antigravity thread's change,
+and Claude (or Antigravity, when Claude isn't signed in) reviews a Codex
+one's. The review runs in a thread of its own in the same folder, with
 the same permissions as the thread it reviews, and is told not to edit
 anything. Your thread says who is reviewing and waits. The reviewer gives a
 verdict: a list of concrete findings, or nothing that holds up. Then your

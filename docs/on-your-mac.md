@@ -343,12 +343,13 @@ File references are where to look.
   executable file, following symlinks, to find native, npm and Homebrew
   installs. Only absolute PATH entries are used. An explicit `claudePath`
   or `THREADBEAR_CLAUDE_PATH` takes precedence (`runner/src/config.ts`).
-- From your Claude and Codex logins: which account each is (the email in
-  `~/.claude.json`), a few settings, and the token counts in your session
-  transcripts, so it can show how much room each login has
-  (`runner/src/accounts.ts`, `runner/src/token-tally.ts`;
-  `THREADBEAR_TOKEN_TALLY=off` stops the counting). It never reads or
-  copies login tokens or the Keychain.
+- From your Claude and Codex logins: which account each is (whether
+  `oauthAccount` is present and the email in `~/.claude.json`), a few
+  settings, and the token counts in your session transcripts, so it can
+  show how much room each login has (`runner/src/accounts.ts`,
+  `runner/src/token-tally.ts`; `THREADBEAR_TOKEN_TALLY=off` stops the
+  counting). A `.claude.json` with no `oauthAccount` (a signed-out CLI) is
+  skipped. It never reads or copies login tokens or the Keychain.
 - With the `acpAgents` experiment on: whether `~/.opencode/bin/opencode`, an
   `opencode` or `cursor-agent` on your PATH, `~/.local/bin/cursor-agent` and
   `~/.local/bin/agent`, `~/.local/bin/agy` and `agy` on PATH exist and where they really lead, and whether

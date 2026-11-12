@@ -779,3 +779,29 @@ test('labReview: a review thread is only asked for a verdict while the reviewed 
   finishReview(h, id, { needs: 'nothing', findings: [] });
   assert.equal(h.runner.reviewOwes(reviewId), undefined, 'done with: reopened later, it is asked nothing');
 });
+
+test('labReview: without Claude, Codex and Antigravity review each other independently without changing the default account', () => {
+  const home = tmpDir();
+  const antigravity = new FakeAdapter('antigravity', { ...CODEX_FLAGS });
+  const accounts = new FakeAccounts([
+    { id: 'codex-main', provider: 'codex', title: 'Codex · jay@example.com', configDir: '/tmp/codex' },
+    { id: 'antigravity-main', provider: 'antigravity', title: 'Antigravity', configDir: '/tmp/agy' },
+  ]);
+  const h = makeHarness(home, { labReview: true, defaults: { cwd: home, accountId: 'codex-main' } }, { accounts });
+  h.runner.adapters.antigravity = antigravity;
+  const { thread: codexThread } = h.runner.create({ text: 'Fix the CLI lookup', accountId: 'codex-main' });
+  turn(h, codexThread.id, { diffs: [codeDiff()] });
+  const agyReviewId = h.runner.get(codexThread.id).waitingOn![0].threadId;
+  const agyReview = h.runner.get(agyReviewId);
+  assert.equal(agyReview.provider, 'antigravity');
+  assert.equal(agyReview.accountId, 'antigravity-main');
+  assert.ok(h.events(codexThread.id).some((e) => e.type === 'system.note' && /^Another lab is reviewing this change before it's done: Antigravity/.test(e.text)));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'runner.json'), 'utf8')).defaults?.accountId, 'codex-main', 'review thread does not overwrite the user default account');
+
+  const { thread: agyThread } = h.runner.create({ text: 'Fix the ACP schema', accountId: 'antigravity-main' });
+  const agySession = antigravity.sessions.find((s) => s.opts.threadId === agyThread.id)!;
+  turn(h, agyThread.id, { session: agySession, diffs: [codeDiff()] });
+  const codexReviewId = h.runner.get(agyThread.id).waitingOn![0].threadId;
+  assert.equal(h.runner.get(codexReviewId).provider, 'codex');
+  assert.equal(h.runner.get(codexReviewId).accountId, 'codex-main');
+});

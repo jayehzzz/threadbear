@@ -254,8 +254,9 @@ export const newThreadsPart = {
     const st: ThreadState = { rec, rt: newRuntime(this.clock.now()) };
     this.threads.set(id, st);
     // What Mike picked last is what the next thread starts on, so a
-    // schedule's own login or pool (a 9:00 standup's) doesn't move it.
-    if (params.origin === 'schedule') {
+    // schedule's own login or pool (a 9:00 standup's) or an automatic
+    // cross-lab review doesn't move it.
+    if (params.origin === 'schedule' || params.startedBy?.label === 'Review') {
       /* keep the last pick */
     } else if (!poolId) this.rememberAccount(accountId);
     else if (params.poolId !== undefined) this.rememberPool(poolId);

@@ -267,7 +267,11 @@ export const labReviewPart = {
     // Logins kept for certain folders never review anything else.
     const keptIds = new Set(pools.filter((p) => p.folders?.length).flatMap((p) => p.accountIds));
     const others = kept ? [kept] : pools.filter((p) => !p.folders?.length);
-    const other: Provider = rec.provider === 'codex' ? 'claude' : 'codex';
+    const otherProviders = (
+      rec.provider === 'codex'
+        ? (['claude', 'antigravity', 'cursor', 'opencode'] as const)
+        : (['codex', 'claude', 'antigravity', 'cursor', 'opencode'] as const)
+    ).filter((p): p is Provider => p !== rec.provider);
     const now = this.clock.now();
     const pick = (provider: Provider): Account | undefined => {
       for (const pool of others) {
@@ -280,10 +284,11 @@ export const labReviewPart = {
       return accounts.find((a) => a.provider === provider && !keptIds.has(a.id) && !pools.some((p) => poolAccounts(p, accounts).includes(a)));
     };
     const fits = (provider: Provider) => !o.confined || providerInfo(provider).sandbox;
-    const lab = fits(other) ? pick(other) : undefined;
+    const lab = otherProviders.filter(fits).map(pick).find((a): a is Account => Boolean(a));
     if (lab) return { account: lab, independent: true };
     const same = fits(rec.provider) ? pick(rec.provider) : undefined;
-    return same ? { account: same, independent: false, ...(!fits(other) && pick(other) ? { boxed: true } : {}) } : undefined;
+    const unboxedOther = otherProviders.some((p) => !fits(p) && Boolean(pick(p)));
+    return same ? { account: same, independent: false, ...(unboxedOther ? { boxed: true } : {}) } : undefined;
   },
 };
 
