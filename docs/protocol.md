@@ -136,9 +136,9 @@ upgrade with an `Authorization` header that's wrong is turned away with HTTP
 ## Types
 
 ```ts
-// cursor and opencode: ACP agents, only from a runner with the acpAgents
+// cursor, opencode and antigravity: ACP agents, only with the acpAgents
 // experiment on (see "ACP agents")
-type Provider = "claude" | "codex" | "cursor" | "opencode"
+type Provider = "claude" | "codex" | "cursor" | "opencode" | "antigravity"
 
 // What a provider is called and can do, from `hello`. A client asks this
 // rather than comparing provider names, so a provider it has never heard of
@@ -1218,10 +1218,14 @@ still `-32602`.)
 An experiment (`acpAgents`, runner/src/adapters/acp/), off by default. Agents
 that speak the [Agent Client Protocol](https://agentclientprotocol.com) run as
 one process per live thread, over stdio. With it off no account, pool or
-`hello.providers` row of theirs appears. `runner.json`'s `cursorPath` and
-`opencodePath` set a binary by hand; otherwise each is found where it installs.
+`hello.providers` row of theirs appears. `runner.json`'s `cursorPath`,
+`opencodePath` and `antigravityPath` set a binary by hand; otherwise each is
+found where it installs. Antigravity uses the official `agy acp` CLI
+(`~/.local/bin/agy`, then PATH), with `--process-per-session` for HTTP MCP.
 
-- **One login each**, per machine, ids `opencode-main` and `cursor-main`. No
+- **One login each**, per machine, ids `opencode-main`, `cursor-main` and
+  `antigravity-main`. Antigravity is offered once installed, and its own
+  authentication error asks for `agy acp --login` if needed. No
   usage readings, so a pool can't move a thread by room.
 - **Which program.** The process must say it's that agent in `initialize`, or
   the thread doesn't start. `agent` is a generic name: a file only counts as
@@ -1248,6 +1252,21 @@ one process per live thread, over stdio. With it off no account, pool or
 - **Cursor** can't be told to always ask (its allow-list and a folder's
   `.cursor/cli.json` can approve things), so Ask, Auto and Plan first run in its
   read-only `ask` and `plan` modes; a thread that can't be put in one doesn't start.
+- **Antigravity** uses its own `~/.gemini/threadbear-acp` profile, with
+  `--cli_dir_name .` and `--include-default-customizations=false`. Before every
+  process, Threadbear writes `settings.json` there with `toolPermission: strict`
+  and `agentMode: ""`: strict overrides saved allow rules and automatic modes.
+  All thread modes use the agent's `default` mode except Plan first (`plan`);
+  Full access is approved by the runner, never `--dangerously-skip-permissions`.
+  The CLI shares its Google sign-in through its own keyring; Threadbear never
+  opens credentials or changes the terminal CLI's settings. Tested with 1.5.6.
+  Its ACP MCP echoes omit result bodies, so calls and results are recorded at
+  Threadbear's HTTP MCP boundary, and the echoes are suppressed. This keeps
+  `end_turn` and the Done/Needs you cards working without duplicate tool rows.
+  MCP declarations omit per-field descriptions and dictionary schema keywords
+  to keep the complete toolbox available; the original Zod schemas still
+  validate every tool call at the HTTP boundary.
+  Models come from ACP's model selector; thinking level uses the CLI's default.
 - **Plan first** uses the agent's plan mode, and the last reply of a turn is
   proposed as the plan.
 - **The threadbear tools** reach the agent as an MCP server over HTTP on
@@ -1264,6 +1283,7 @@ one process per live thread, over stdio. With it off no account, pool or
   version feed to compare with: `clis.list` has a row for each, and
   `clis.update` runs the agent's own updater when asked. `clis.setPolicy` does
   nothing for them, and `THREADBEAR_CLI_UPDATES=off` turns updating off.
+  Antigravity's Update runs `agy update`; the CLI may also update itself.
 - **Not offered:** the sandbox (a confined thread is refused), rewind, steering
   (a message sent during a turn runs next).
 

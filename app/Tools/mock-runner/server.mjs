@@ -150,6 +150,8 @@ let accounts = [
     }),
   },
 ];
+// An optional third provider for the model-picker behaviour spec.
+if (process.env.TB_MOCK_ANTIGRAVITY) accounts.push({ id: 'antigravity-main', provider: 'antigravity', title: 'Antigravity', configDir: '~/.gemini/threadbear-acp', models: [{ id: 'gemini-flash', model: 'gemini-flash', title: 'Gemini Flash' }] });
 // usage.stats (docs/protocol.md, "Usage history"), made up but steady: the
 // same seed every time, so screenshots only change when the code does.
 // Each login works the hours of a day (busier in the afternoon, quiet at
@@ -246,6 +248,7 @@ let pools = [
   { id: 'evenings', title: 'Evenings', accountIds: ['claude-4'], icon: 'moon' },
 ];
 const poolOf = (id) => pools.find((pool) => pool.id === id);
+if (process.env.TB_MOCK_ANTIGRAVITY) pools.push({ id: 'antigravity', title: 'Antigravity', accountIds: ['antigravity-main'], builtIn: true });
 // The room a login has: the tighter of its 5-hour and weekly windows; none
 // when it's blocked. Unknown usage counts as room.
 function roomOf(account) {
@@ -561,7 +564,7 @@ async function dispatch(client, method, p) {
       }
       return {
         runnerVersion, protocol: 1, accounts: publicAccounts(),
-        defaults: oldRunner ? { ...defaults, poolId: undefined } : defaults, ...(oldRunner ? {} : { providers: [PROVIDER_INFO.claude, PROVIDER_INFO.codex], clis, updates, pools, experiments: ['moveToRunner', ...(process.env.TB_MOCK_DECISIONS ? ['projectDecisions'] : [])] }),
+        defaults: oldRunner ? { ...defaults, poolId: undefined } : defaults, ...(oldRunner ? {} : { providers: [PROVIDER_INFO.claude, PROVIDER_INFO.codex, ...(process.env.TB_MOCK_ANTIGRAVITY ? [PROVIDER_INFO.antigravity] : [])], clis, updates, pools, experiments: ['moveToRunner', ...(process.env.TB_MOCK_DECISIONS ? ['projectDecisions'] : [])] }),
       };
     // Moving a thread to another runner (docs/protocol.md): a guess from
     // "that runner", and a move that only marks the row, for the app's

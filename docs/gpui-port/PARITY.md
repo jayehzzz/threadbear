@@ -116,6 +116,7 @@ Scenarios passing: Swift: 207 of 220, Mac: 208 of 220, Windows: 192 of 220, Linu
 | `composer.dropanywhere` Drop anywhere on thread | pass | pass | pass | pass |
 | `composer.runner` Runner chip | pass | pass | pass | pass |
 | `composer.modelpicker` Model picker | pass | pass | pass | pass |
+| `composer.antigravity` Antigravity agents | pass | pending | pending | pending |
 | `composer.permission` Permission chip | pass | pass | pass | pass |
 | `composer.contextring` Context ring | pass | partly | partly | partly |
 | `composer.send` Send and Stop | pass | pass | pass | pass |

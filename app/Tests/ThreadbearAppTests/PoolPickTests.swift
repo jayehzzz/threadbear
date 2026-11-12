@@ -9,7 +9,7 @@ import XCTest
 @MainActor
 final class PoolPickTests: XCTestCase {
     private let keys = [AppModel.lastModelKey, AppModel.lastEffortKey, AppModel.lastAccountKey, "lastModel.codex", "lastEffort.codex",
-                        "lastAccountId.byProvider", "lastAccountId.codex.byProvider", AppModel.lastPoolKey, AppModel.lastPoolProvidersKey]
+                        "lastAccountId.byProvider", "lastAccountId.codex.byProvider", "lastModel.antigravity", "lastEffort.antigravity", AppModel.lastPoolKey, AppModel.lastPoolProvidersKey]
 
     override func setUp() {
         super.setUp()
@@ -84,6 +84,13 @@ final class PoolPickTests: XCTestCase {
     }
 
     // MARK: New threads
+
+    func testAntigravityModelIsRememberedAcrossLaunches() {
+        let app = app()
+        app.remember(model: "gemini-flash", provider: "antigravity")
+        XCTAssertEqual(AppModel().lastModels["antigravity"], "gemini-flash")
+        XCTAssertNotEqual(AppModel().lastModels["claude"], "gemini-flash")
+    }
 
     func testNewThreadStartsOnTheFolderPoolElseTheLastPicked() {
         let app = app()

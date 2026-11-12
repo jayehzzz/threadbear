@@ -176,7 +176,8 @@ async function main(): Promise<void> {
   // Keeps both CLIs current (E). Its hooks call back into the runner and
   // the Restarter, made below; nothing calls them before start().
   const acpOn = () => experimentOn(cfg.home, 'acpAgents');
-  const acpBinary = (p: AcpProvider) => () => ACP_AGENTS[p].findBinary({ explicit: p === 'cursor' ? cfg.cursorPath : cfg.opencodePath, home: os.homedir(), pathEnv: process.env.PATH ?? '' });
+  const acpPaths: Partial<Record<AcpProvider, string>> = { cursor: cfg.cursorPath, opencode: cfg.opencodePath, antigravity: cfg.antigravityPath };
+  const acpBinary = (p: AcpProvider) => () => ACP_AGENTS[p].findBinary({ explicit: acpPaths[p], home: os.homedir(), pathEnv: process.env.PATH ?? '' });
   const updates = new CliUpdates({
     cfg,
     log,

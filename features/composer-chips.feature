@@ -25,6 +25,14 @@ Feature: The chips under the message box
     When I pick "Opus 5.5" from the "model" menu
     Then the model chip says "Claude · Opus 5.5"
 
+  @composer.antigravity @gpui-pending
+  Scenario: Antigravity has its own pool and model in the composer
+    When I start a new thread
+    Then the "model" menu has a row "# [ ] Antigravity"
+    When I pick "Gemini Flash" from the "model" menu
+    Then the model chip says "Antigravity · Gemini Flash"
+    And the "model" menu has a row "# [x] Antigravity"
+
   @composer.modelpicker
   Scenario: Picking an effort level changes the chip
     When I pick "High" from the "model" menu

@@ -68,7 +68,8 @@ function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, 
     on: () => o.on !== false,
     registry: new ProcessRegistry(path.join(root, 'run'), nullLogger),
     log: nullLogger,
-    env: { PATH: process.env.PATH, FAKE_ACP_LOG: logFile, ...o.env },
+    home: root,
+    env: { PATH: process.env.PATH, HOME: root, FAKE_ACP_LOG: logFile, ...o.env },
     timings: { closeWaitMs: 300 },
   });
   const start = (): AcpSession => {
@@ -103,6 +104,34 @@ async function turn(r: ReturnType<typeof rig>, s: AcpSession, text: string, id =
 }
 
 // ---- Asking
+
+for (const mode of ['ask', 'auto', 'plan'] as PermissionMode[]) {
+  test(`Antigravity ${mode}: edits and commands use Threadbear's approvals`, async () => {
+    const r = rig({ mode, deny: true, agent: ACP_AGENTS.antigravity, env: { FAKE_ACP_NAME: 'Antigravity ACP Server' } });
+    const s = r.start();
+    const file = path.join(r.cwd, 'denied.txt');
+    await turn(r, s, `write ${file} hello`);
+    await turn(r, s, 'exec touch forbidden');
+    assert.equal(r.cards.length, 2);
+    assert.equal(fs.existsSync(file), false);
+    assert.ok(!r.log().some((l) => l.ran));
+    assert.ok(r.outputs.some((o) => o.kind === 'event' && o.event.type === 'assistant.text'));
+  });
+}
+
+test('Antigravity Full access still asks the runner, and leaving Full blocks the next edit', async () => {
+  const r = rig({ mode: 'full', deny: true, agent: ACP_AGENTS.antigravity, env: { FAKE_ACP_NAME: 'Antigravity ACP Server' } });
+  const s = r.start();
+  const file = path.join(r.cwd, 'allowed.txt');
+  await turn(r, s, `write ${file} allowed`);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'allowed');
+  assert.equal(r.cards.length, 0);
+  assert.ok(r.log().some((l) => l.answered), 'the agent did not bypass the runner');
+  await s.setPermissionMode('ask');
+  await turn(r, s, `write ${file} forbidden`);
+  assert.equal(r.cards.length, 1);
+  assert.equal(fs.readFileSync(file, 'utf8'), 'allowed');
+});
 
 test('Ask: a write waits for the card and runs only once allowed', async () => {
   const r = rig({ mode: 'ask' });
@@ -426,6 +455,7 @@ test("Cursor isn't offered when the only `agent` is another program's", () => {
 function mcp(o: { mode?: PermissionMode; answer?: ToolApprovalAnswer['decision'] } = {}) {
   const calls: string[] = [];
   const cards: ToolApprovalRequest[] = [];
+  const events: { id: string; phase: string; name?: string; result?: unknown }[] = [];
   const tool = (name: string, readOnly = false) => ({
     name,
     description: name,
@@ -447,8 +477,10 @@ function mcp(o: { mode?: PermissionMode; answer?: ToolApprovalAnswer['decision']
     mode: () => o.mode ?? 'full',
     rules: () => [],
     addRules: () => undefined,
+    onToolCall: (id, name) => events.push({ id, phase: 'call', name }),
+    onToolResult: (id, result) => events.push({ id, phase: 'result', result }),
   });
-  return { server, calls, cards };
+  return { server, calls, cards, events };
 }
 
 async function post(url: string, body: unknown, headers: Record<string, string>): Promise<{ status: number; json?: any }> {
@@ -465,6 +497,24 @@ async function post(url: string, body: unknown, headers: Record<string, string>)
 }
 
 const callBody = (name: string) => ({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: {} } });
+
+test('MCP capture records the actual result, including validation and permission failures', async () => {
+  const m = mcp({ mode: 'ask', answer: 'deny' });
+  const url = await m.server.listen();
+  const auth = { authorization: `Bearer ${m.server.token}` };
+  try {
+    const read = await post(url, callBody('list_threads'), auth);
+    const denied = await post(url, callBody('create_thread'), auth);
+    const invalid = await post(url, { ...callBody('create_thread'), params: { name: 'create_thread', arguments: { what: 42 } } }, auth);
+    assert.deepEqual(m.events.map((e) => e.phase), ['call', 'result', 'call', 'result', 'call', 'result']);
+    assert.deepEqual(m.events[1].result, read.json.result);
+    assert.deepEqual(m.events[3].result, denied.json.result);
+    assert.deepEqual(m.events[5].result, invalid.json.result);
+    assert.ok(m.events[0].id === m.events[1].id && m.events[2].id === m.events[3].id);
+    assert.deepEqual(m.calls, ['list_threads']);
+    assert.equal(m.cards[0].toolUseId, m.events[2].id);
+  } finally { m.server.close(); }
+});
 
 test('MCP: delete_thread asks even in Full', async () => {
   const m = mcp({ mode: 'full', answer: 'deny' });

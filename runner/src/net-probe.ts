@@ -21,6 +21,7 @@ const HOSTS: Record<Provider, string> = {
   cursor: 'api2.cursor.sh',
   // Its free models; a login's own provider may be elsewhere.
   opencode: 'opencode.ai',
+  antigravity: 'daily-cloudcode-pa.googleapis.com',
 };
 
 // How long a probe may take in all, whatever arrives meanwhile: a proxy

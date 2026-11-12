@@ -37,6 +37,10 @@ const configOptions = () => [
 ];
 
 function asksFor(cwd) {
+  if (AGENT === 'Antigravity ACP Server') {
+    try { return JSON.parse(fs.readFileSync(path.join(env.HOME, '.gemini', 'threadbear-acp', 'settings.json'), 'utf8')).toolPermission === 'strict'; }
+    catch { return false; }
+  }
   if (env.OPENCODE_DISABLE_PROJECT_CONFIG !== '1') {
     try {
       if (JSON.parse(fs.readFileSync(path.join(cwd, 'opencode.json'), 'utf8')).permission) return false; // the folder's config wins

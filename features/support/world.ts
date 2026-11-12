@@ -83,6 +83,8 @@ After({ tags: '@sidebar.skeleton' }, () => {
 });
 
 Before(async function (this: ThreadbearWorld, { pickle }) {
+  if (pickle.tags.some((t) => t.name === '@composer.antigravity')) process.env.TB_MOCK_ANTIGRAVITY = '1';
+  else delete process.env.TB_MOCK_ANTIGRAVITY;
   // A scenario about paging needs a thread longer than one page of events.
   const long = pickle.tags.some((t) => t.name === '@long-thread');
   if (long) process.env.TB_MOCK_FIXTURES = longThreadFolder();

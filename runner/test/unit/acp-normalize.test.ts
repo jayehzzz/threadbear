@@ -98,6 +98,18 @@ test('the threadbear tools read as they do on the other providers', () => {
   assert.equal(call.kind, 'mcp');
 });
 
+test('Antigravity MCP names are canonical, and captured HTTP calls suppress ACP echoes', () => {
+  assert.equal(canonicalToolName('mcp_threadbear_end_turn'), 'mcp__threadbear__end_turn');
+  const n = new AcpNormalizer(ctx, { clientMcpEvents: true });
+  const frame = { sessionUpdate: 'tool_call', toolCallId: 'native', name: 'mcp_threadbear_end_turn', status: 'in_progress', rawInput: { needs: 'nothing' } };
+  assert.deepEqual(n.handle(frame), [], 'HTTP boundary supplies this call and its result');
+  assert.deepEqual(n.handle({ sessionUpdate: 'tool_call_update', toolCallId: 'native', status: 'completed' }), []);
+  const call = n.noteCall({ toolCallId: 'http', name: 'mcp__threadbear__end_turn', rawInput: { needs: 'nothing' } });
+  assert.equal(call.events.length, 1);
+  const result = n.handle({ sessionUpdate: 'tool_call_update', toolCallId: 'http', status: 'completed', content: [{ type: 'content', content: { type: 'text', text: 'Noted: this thread is done.' } }] });
+  assert.equal((result[0] as { event: { text: string } }).event.text, 'Noted: this thread is done.');
+});
+
 test('the plan, and what it does not know about', () => {
   const n = new AcpNormalizer(ctx);
   const plan = n.handle({ sessionUpdate: 'plan', entries: [{ content: 'a', status: 'completed', priority: 'high' }, { content: 'b', status: 'weird' }] });

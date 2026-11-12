@@ -4,10 +4,10 @@
 
 export const PROTOCOL_VERSION = 1;
 
-// cursor and opencode run over ACP (adapters/acp/), behind the acpAgents
+// cursor, opencode and antigravity run over ACP (adapters/acp/), behind the acpAgents
 // experiment: activeProviders (providers.ts) is the list a runner offers.
-export type Provider = 'claude' | 'codex' | 'cursor' | 'opencode';
-export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'cursor', 'opencode'];
+export type Provider = 'claude' | 'codex' | 'cursor' | 'opencode' | 'antigravity';
+export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'cursor', 'opencode', 'antigravity'];
 
 // What a provider is called and can do (providers.ts holds the table). `id`
 // is a plain string as a client can be sent one it has never heard of.

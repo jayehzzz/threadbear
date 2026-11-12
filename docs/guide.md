@@ -987,6 +987,20 @@ reads their passwords or tokens. The account and model a thread runs on are
 small menus on the composer. Whatever you picked last is what the next
 thread starts on.
 
+To run **Antigravity** inside Threadbear, install Google's official
+[Antigravity CLI](https://antigravity.google/docs/getting-started?tab=cli), then
+turn on **ACP agents** in Settings > General > Experiments. Antigravity appears
+in the model picker with its own pool and the models your Google account offers.
+If it asks for a sign-in, run `agy acp --login` in a terminal, then send your
+message again. An existing Antigravity Google sign-in is reused by the CLI.
+Ask before edits gives you Threadbear's approval cards, Full access runs without
+them, Auto behaves like Ask, and Plan first proposes a plan. Your conversations
+resume when you return. Threadbear keeps a separate Antigravity settings profile
+so your terminal settings stay yours. Thinking level uses Antigravity's default;
+usage limits, sandboxed threads and going back to an earlier message aren't
+available for these threads yet. Updates > Antigravity CLI > Update runs its
+official updater.
+
 Once a thread has run a turn, a small ring beside the send button shows
 how full its context is: how much of the model's window the conversation
 takes up. It turns orange when it's nearly full, as Claude and Codex

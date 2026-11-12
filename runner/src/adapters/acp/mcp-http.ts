@@ -20,7 +20,14 @@ const MAX_BODY = 16 * 1024 * 1024;
 // Latest MCP revision this speaks: the client's own is echoed when given.
 const MCP_VERSION = '2025-06-18';
 
-export type AcpMcpDeps = ToolGateDeps & { log: Logger; label: string };
+type McpToolResult = { content?: unknown[]; isError?: boolean };
+export type AcpMcpDeps = ToolGateDeps & {
+  log: Logger;
+  label: string;
+  onToolCall?: (id: string, name: string, args: Record<string, unknown>) => void;
+  onToolResult?: (id: string, result: McpToolResult) => void;
+  schema?: (schema: unknown) => unknown;
+};
 
 type JsonRpcRequest = { jsonrpc?: string; id?: number | string | null; method?: unknown; params?: unknown };
 
@@ -158,7 +165,7 @@ export class AcpMcpServer {
           tools: [...this.byName.values()].map((t) => ({
             name: t.name,
             description: t.description,
-            inputSchema: jsonSchema(t),
+            inputSchema: this.deps.schema ? this.deps.schema(jsonSchema(t)) : jsonSchema(t),
             ...(t.annotations ? { annotations: t.annotations } : {}),
           })),
         };
@@ -169,21 +176,34 @@ export class AcpMcpServer {
     }
   }
 
-  private text(t: string, isError: boolean): unknown {
+  private text(t: string, isError: boolean): McpToolResult {
     return { content: [{ type: 'text', text: t }], ...(isError ? { isError: true } : {}) };
   }
 
-  private async call(params: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
+  private async call(params: Record<string, unknown>, signal: AbortSignal): Promise<McpToolResult> {
     const name = typeof params.name === 'string' ? params.name : '';
     const known = this.byName.get(name);
     if (!known) return this.text(`Threadbear has no tool called ${name || '(unnamed)'}. The threadbear tools it has are: ${[...this.byName.keys()].join(', ') || 'none'}.`, true);
     const raw = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? (params.arguments as Record<string, unknown>) : {};
+    const itemId = crypto.randomUUID();
+    this.deps.onToolCall?.(itemId, name, raw);
+    let result: McpToolResult;
+    try {
+      result = await this.runTool(known, name, raw, signal, itemId);
+    } catch (e) {
+      result = this.text((e as Error)?.message ?? String(e), true);
+    }
+    this.deps.onToolResult?.(itemId, result);
+    return result;
+  }
+
+  private async runTool(known: ToolDefinition, name: string, raw: Record<string, unknown>, signal: AbortSignal, itemId: string): Promise<McpToolResult> {
     const tool = known.formFor?.(raw) ?? known;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const parsed = z.object(tool.inputSchema as any).safeParse(raw);
     if (!parsed.success) return this.text(`Those arguments don't fit ${name}: ${z.prettifyError(parsed.error)}`, true);
     const args = parsed.data as Record<string, unknown>;
-    const gate = await gateThreadbearTool(this.deps, { fullName: `mcp__${NAMESPACE}__${name}`, readOnlyHint: tool.annotations?.readOnlyHint, args, signal });
+    const gate = await gateThreadbearTool(this.deps, { fullName: `mcp__${NAMESPACE}__${name}`, readOnlyHint: tool.annotations?.readOnlyHint, args, signal, ...(this.deps.onToolCall ? { toolUseId: itemId } : {}) });
     if (!gate.allowed) return this.text(gate.message, true);
     try {
       const result = await tool.handler(args, { signal });

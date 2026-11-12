@@ -54,6 +54,7 @@ export type AcpAdapterDeps = {
   timings?: Partial<AcpTimings>;
   env?: NodeJS.ProcessEnv;
   now?: () => number;
+  home?: string; // user's home, replaced by a temp folder in tests
 };
 
 // "Always allow" for a file edit: the thread's edits, while they aren't to
@@ -96,6 +97,7 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   private env(account: Account, threadEnv?: Record<string, string>): Record<string, string | undefined> {
+    this.deps.agent.prepare?.(this.deps.home ?? os.homedir());
     const env = cliEnv(account, this.deps.env ?? process.env);
     delete env.CLAUDE_CONFIG_DIR;
     delete env.CLAUDE_AGENT_SDK_CLIENT_APP;
@@ -182,7 +184,7 @@ export class AcpSession implements AgentSession {
     this.rules = new Set(opts.allowRules ?? []);
     this.exitPromise = new Promise((r) => (this.resolveExit = r));
     this.ctx = fileContext(opts.cwd, opts.mediaDir, opts.blobsDir);
-    this.normalizer = new AcpNormalizer(this.ctx);
+    this.normalizer = new AcpNormalizer(this.ctx, { clientMcpEvents: deps.agent.clientMcpEvents });
     this.proc = new AcpProcess({ binary, args: deps.agent.args, env, cwd: opts.cwd, registry: deps.registry, log: deps.log, label: opts.threadId, timings: deps.timings });
     this.proc.onNotification = (method, params) => this.notification(method, params);
     this.proc.onRequest = (id, method, params) => this.request(id, method, params);
@@ -224,6 +226,16 @@ export class AcpSession implements AgentSession {
         mode: () => this.mode,
         rules: () => this.rules,
         addRules: (rules) => this.addRules(rules),
+        schema: deps.agent.mcpSchema,
+        ...(deps.agent.clientMcpEvents ? {
+          onToolCall: (id: string, name: string, args: Record<string, unknown>) => {
+            this.emit(this.normalizer.flush());
+            this.emit(this.normalizer.noteCall({ toolCallId: id, name: `mcp__threadbear__${name}`, rawInput: args }).events);
+          },
+          onToolResult: (id: string, result: { content?: unknown[]; isError?: boolean }) => {
+            this.emit(this.normalizer.handle({ sessionUpdate: 'tool_call_update', toolCallId: id, status: result.isError ? 'failed' : 'completed', content: (result.content ?? []).map((content) => ({ type: 'content', content })) }));
+          },
+        } : {}),
       });
       const url = await this.mcp.listen();
       mcpServers = [{ type: 'http', name: 'threadbear', url, headers: [{ name: 'Authorization', value: `Bearer ${this.mcp.token}` }] }];

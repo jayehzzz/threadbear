@@ -113,7 +113,7 @@ const firstLine = (s: string): string => firstLineSafely(s, 200, '…');
 // The threadbear tools reach the agent as an MCP server; called
 // `threadbear_end_turn` there, and mcp__threadbear__end_turn everywhere else.
 export function canonicalToolName(name: string): string {
-  const m = /^threadbear[_:.-]+(.+)$/.exec(name);
+  const m = /^(?:mcp_+)?threadbear[_:.-]+(.+)$/.exec(name);
   return m ? `mcp__threadbear__${m[1]}` : name;
 }
 
@@ -124,9 +124,12 @@ export class AcpNormalizer {
   private thought?: { messageId?: string; itemId: string; text: string };
   private lastAssistant = '';
   costUsd?: number;
+  private clientMcpEvents: boolean;
+  private ignored = new Set<string>();
 
-  constructor(ctx: NormalizerContext) {
+  constructor(ctx: NormalizerContext, o: { clientMcpEvents?: boolean } = {}) {
     this.ctx = ctx;
+    this.clientMcpEvents = o.clientMcpEvents === true;
   }
 
   // The last reply's words, for a Plan first thread's plan card.
@@ -138,6 +141,16 @@ export class AcpNormalizer {
 
   handle(update: unknown): AdapterOutput[] {
     if (!isPlainObject(update)) return [];
+    // Antigravity supplies no MCP result body in ACP. Calls made through
+    // our MCP server are recorded there; don't duplicate its ACP echoes.
+    if (this.clientMcpEvents && typeof update.toolCallId === 'string') {
+      const own = typeof update.name === 'string' && canonicalToolName(update.name).startsWith('mcp__threadbear__');
+      if (own || this.ignored.has(update.toolCallId)) {
+        this.ignored.add(update.toolCallId);
+        if (this.ignored.size > 500) this.ignored.delete(this.ignored.values().next().value!);
+        return [];
+      }
+    }
     const out: AdapterOutput[] = [];
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':

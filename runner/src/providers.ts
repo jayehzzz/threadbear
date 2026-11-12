@@ -61,9 +61,21 @@ export const PROVIDER_INFO: Record<Provider, ProviderInfo> = {
     smallJobs: true,
     usageReadings: false,
   },
+  antigravity: {
+    id: 'antigravity',
+    name: 'Antigravity',
+    cliName: 'Antigravity CLI',
+    loginCommand: 'agy acp --login',
+    effort: 'none',
+    autoMode: 'asks',
+    sandbox: false,
+    rewind: false,
+    smallJobs: false,
+    usageReadings: false,
+  },
 };
 
-const ACP: readonly Provider[] = ['cursor', 'opencode'];
+const ACP: readonly Provider[] = ['cursor', 'opencode', 'antigravity'];
 
 // The providers this runner offers: the ACP agents only with the experiment
 // on, so with it off nothing of theirs turns up anywhere.

@@ -6,8 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import type { Account, PermissionMode, Provider } from '../../protocol.ts';
 import type { InitializeResult } from './connection.ts';
+import { atomicWriteFileSync } from '../../fsutil.ts';
 
-export type AcpProvider = Extract<Provider, 'cursor' | 'opencode'>;
+export type AcpProvider = Extract<Provider, 'cursor' | 'opencode' | 'antigravity'>;
 
 export type AcpAgent = {
   provider: AcpProvider;
@@ -20,6 +21,15 @@ export type AcpAgent = {
   // explicit: runner.json's path for it. Undefined when not installed.
   findBinary(o: { explicit?: string; home: string; pathEnv: string }): string | undefined;
   args: string[];
+  // Set up an isolated CLI profile before starting a process, without
+  // changing the user's terminal settings or opening credentials.
+  prepare?(home: string): void;
+  // Some agents echo MCP calls but omit the results' content. Capture
+  // those tools at our HTTP boundary instead, for cards and their replies.
+  clientMcpEvents?: boolean;
+  // The schema dialect the agent accepts for MCP declarations. Validation
+  // always uses the original Zod schema on our side.
+  mcpSchema?: (schema: unknown) => unknown;
   // Runs the agent's own updater, when Update is pressed.
   updateArgs: string[];
   // Set on every process it starts. What stops a thread running tools
@@ -89,7 +99,51 @@ export function opencodeEnv(o: { noTools?: boolean } = {}): Record<string, strin
   };
 }
 
+// Antigravity silently omitted end_turn from a full toolbox with its
+// verbose nested schema. Keep declarations compact and within Gemini's
+// schema dialect; the original Zod schema still validates every call.
+// Keep field names intact: a property can itself be called propertyNames.
+export function antigravitySchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(antigravitySchema);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).flatMap(([key, v]) => {
+    if (key === 'propertyNames' || key === 'additionalProperties' || key === 'description') return [];
+    if (key === 'properties' && v && typeof v === 'object' && !Array.isArray(v)) {
+      return [[key, Object.fromEntries(Object.entries(v).map(([name, schema]) => [name, antigravitySchema(schema)]))]];
+    }
+    return [[key, antigravitySchema(v)]];
+  }));
+}
+
 export const ACP_AGENTS: Record<AcpProvider, AcpAgent> = {
+  antigravity: {
+    provider: 'antigravity',
+    accountId: 'antigravity-main',
+    title: 'Antigravity',
+    configDir: (home) => path.join(home, '.gemini', 'threadbear-acp'),
+    // OAuth is shared through the CLI's keyring. Let the agent itself say
+    // whether login is needed, rather than inspecting its credentials.
+    loggedIn: () => true,
+    findBinary({ explicit, home, pathEnv }) {
+      if (explicit) return path.isAbsolute(explicit) && isExecutableFile(explicit) ? explicit : undefined;
+      const own = path.join(home, '.local', 'bin', 'agy');
+      return isExecutableFile(own) ? own : onPath('agy', pathEnv);
+    },
+    // --process-per-session is required for the HTTP MCP server supplied
+    // by the client. CLI settings live at the root of this separate profile.
+    args: ['acp', '--app-data-dir', 'threadbear-acp', '--cli_dir_name', '.', '--process-per-session', '--disable-telemetry', '--include-default-customizations=false'],
+    prepare(home) {
+      // Strict overrides saved grants and auto/accept-edits modes. The
+      // runner alone decides which requests to allow, even in Full access.
+      atomicWriteFileSync(path.join(home, '.gemini', 'threadbear-acp', 'settings.json'), JSON.stringify({ toolPermission: 'strict', agentMode: '' }) + '\n', 0o600);
+    },
+    updateArgs: ['update'],
+    clientMcpEvents: true,
+    mcpSchema: antigravitySchema,
+    env: () => ({}),
+    identifies: (init) => /^Antigravity ACP Server$/i.test(init.agentInfo?.name ?? ''),
+    modeFor: (mode) => mode === 'plan' ? 'plan' : 'default',
+  },
   opencode: {
     provider: 'opencode',
     accountId: 'opencode-main',
