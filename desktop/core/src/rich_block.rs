@@ -253,6 +253,206 @@ pub fn picture_size(kind: RichKind, natural: (f32, f32), room: f32, max_body: f3
     }
 }
 
+/// Drawn blocks' pictures kept in memory, by what they take up rather than
+/// how many there are (RichBlocks.pictureBytes): past the budget the least
+/// recently used go, and are read back from disk when drawn again. A count
+/// let 120 tall, noisy pages hold gigabytes (the Swift app's cross-lab
+/// review, 6 Nov; Daybreak 92 found the GPUI app's count, 11 Nov 2026).
+pub struct PictureBudget<V> {
+    budget: usize,
+    used: usize,
+    /// Oldest first, with the parts each one holds.
+    entries: std::collections::VecDeque<(String, V, Vec<u64>)>,
+    /// Each part (a picture, by its id) once, however many blocks hold it,
+    /// with how many do and what it takes up: blocks drawn alike share
+    /// their pictures, so they're counted once (Codex's fifth look at
+    /// Daybreak 92).
+    parts: std::collections::HashMap<u64, (usize, usize)>,
+    /// For parts given only as a cost (`keep`): ids of their own, from the
+    /// top down, apart from pictures' hashes.
+    next_own: u64,
+}
+
+impl<V: Clone> PictureBudget<V> {
+    /// The Swift app's 160 MiB.
+    pub const BYTES: usize = 160 * 1024 * 1024;
+
+    pub fn new(budget: usize) -> PictureBudget<V> {
+        PictureBudget { budget, used: 0, entries: std::collections::VecDeque::new(), parts: std::collections::HashMap::new(), next_own: u64::MAX }
+    }
+
+    /// Keeps `value` as the newest, and gives back what had to go to fit it
+    /// (the caller frees their decoded copies). The newest is always kept,
+    /// even alone over the budget, as it's what's being drawn.
+    pub fn keep(&mut self, key: String, value: V, cost: usize) -> Vec<V> {
+        self.keep_with(key, value, cost, |_| false)
+    }
+
+    /// `keep`, never letting go of the blocks `pinned` says are being drawn,
+    /// by key: it goes over the budget for them rather than take a picture
+    /// off the screen (they're FrameBudget's, which holds half of it), and
+    /// `trim_with` brings it back once they're not.
+    pub fn keep_with(&mut self, key: String, value: V, cost: usize, pinned: impl Fn(&str) -> bool) -> Vec<V> {
+        let own = self.next_own;
+        self.next_own -= 1;
+        self.keep_parts_with(key, value, &[(own, cost)], pinned)
+    }
+
+    /// `keep_with` for a value made of parts (pictures, by id, and what
+    /// each takes up), a part counted once while any block holds it.
+    pub fn keep_parts_with(&mut self, key: String, value: V, parts: &[(u64, usize)], pinned: impl Fn(&str) -> bool) -> Vec<V> {
+        let mut gone = Vec::new();
+        // Held before the old one under this key lets them go, so a part
+        // both have isn't counted out and in again.
+        for &(id, cost) in parts {
+            let part = self.parts.entry(id).or_insert((0, cost));
+            if part.0 == 0 {
+                self.used += cost;
+            }
+            part.0 += 1;
+        }
+        if let Some(at) = self.entries.iter().position(|(k, ..)| *k == key) {
+            gone.push(self.take(at));
+        }
+        self.entries.push_back((key, value, parts.iter().map(|&(id, _)| id).collect()));
+        gone.extend(self.trim_with(pinned));
+        gone
+    }
+
+    /// Entry `at` out, its parts let go of.
+    fn take(&mut self, at: usize) -> V {
+        let (_, value, ids) = self.entries.remove(at).expect("there");
+        for id in ids {
+            if let Some(part) = self.parts.get_mut(&id) {
+                part.0 -= 1;
+                if part.0 == 0 {
+                    self.used -= part.1;
+                    self.parts.remove(&id);
+                }
+            }
+        }
+        value
+    }
+
+    /// Back within the budget, oldest first, never the newest nor a pinned
+    /// one; gives back what went.
+    pub fn trim_with(&mut self, pinned: impl Fn(&str) -> bool) -> Vec<V> {
+        let mut gone = Vec::new();
+        let mut at = 0;
+        while self.used > self.budget && at + 1 < self.entries.len() {
+            if pinned(&self.entries[at].0) {
+                at += 1;
+                continue;
+            }
+            gone.push(self.take(at));
+        }
+        gone
+    }
+
+    /// The pictures kept for `key`, now the most recently used.
+    pub fn get(&mut self, key: &str) -> Option<V> {
+        let at = self.entries.iter().position(|(k, ..)| k == key)?;
+        let entry = self.entries.remove(at).expect("there");
+        let value = entry.1.clone();
+        self.entries.push_back(entry);
+        Some(value)
+    }
+
+    /// Takes `key`'s pictures out, giving them back to be freed.
+    pub fn remove(&mut self, key: &str) -> Option<V> {
+        let at = self.entries.iter().position(|(k, ..)| k == key)?;
+        Some(self.take(at))
+    }
+
+    pub fn used(&self) -> usize {
+        self.used
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, value, _)| value)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The pictures handed to boxes in the frame being drawn. A reply's boxes
+/// are all laid out at once, so one reply with more than the budget's worth
+/// gets pictures in its first boxes and its source in the rest, and nothing
+/// handed out is let go until the frame's over: an image element still
+/// holding one would load it again, outside the budget (Codex's second look
+/// at Daybreak 92).
+#[derive(Default)]
+pub struct FrameBudget {
+    /// The blocks drawn, by key, and their pictures, by image id.
+    keys: std::collections::HashSet<String>,
+    ids: std::collections::HashSet<u64>,
+    cost: usize,
+}
+
+impl FrameBudget {
+    /// Whether pictures `ids` costing `cost` may be drawn this frame: always
+    /// the first, and those already handed out.
+    /// What one frame may draw: half the pictures' budget, so pictures the
+    /// frame holds and a newly drawn one fit in it together.
+    pub const BYTES: usize = PictureBudget::<()>::BYTES / 2;
+
+    pub fn hand_out(&mut self, key: &str, ids: [u64; 2], cost: usize, budget: usize) -> bool {
+        // The same pictures again (another block drawn alike shares them):
+        // nothing more in memory.
+        if !ids.iter().all(|id| self.ids.contains(id)) {
+            if self.cost > 0 && self.cost.saturating_add(cost) > budget {
+                return false;
+            }
+            self.cost = self.cost.saturating_add(cost);
+            self.ids.extend(ids);
+        }
+        self.keys.insert(key.to_owned());
+        true
+    }
+
+    /// Whether block `key` is drawn this frame.
+    pub fn pins(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// Whether picture `id` is drawn this frame.
+    pub fn holds(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// The frame's over.
+    pub fn end(&mut self) {
+        self.keys.clear();
+        self.ids.clear();
+        self.cost = 0;
+    }
+}
+
+/// What a PNG takes up in memory once drawn: its bytes, which the image
+/// keeps, and its pixels decoded at four bytes each, read from its header.
+/// Bytes that aren't a PNG count as four times their length.
+pub fn png_cost(bytes: &[u8]) -> usize {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    let decoded = if bytes.len() >= 24 && bytes.starts_with(SIGNATURE) && &bytes[12..16] == b"IHDR" {
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) as usize;
+        width.saturating_mul(height).saturating_mul(4)
+    } else {
+        bytes.len().saturating_mul(4)
+    };
+    bytes.len().saturating_add(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +534,104 @@ mod tests {
         assert_eq!(picture_size(RichKind::Mermaid, (1352., 400.), 700., 560., 12.), (676., 200.));
         // A page fills the width.
         assert_eq!(picture_size(RichKind::Html, (720., 1000.), 640., 560., 12.), (640., 889.));
+    }
+
+    fn png(width: u32, height: u32, extra: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes.resize(bytes.len() + extra, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_frame_hands_out_no_more_than_the_budget() {
+        let mut frame = FrameBudget::default();
+        assert!(frame.hand_out("a", [1, 2], 500, 100), "the first always");
+        assert!(!frame.hand_out("b", [3, 4], 1, 100), "nothing more past it");
+        assert!(frame.hand_out("c", [1, 2], 500, 100), "the same pictures again");
+        // One picture shared, the other not: it costs, and isn't drawn.
+        assert!(!frame.hand_out("d", [1, 9], 500, 100));
+        assert!(frame.holds(1) && !frame.holds(3) && !frame.holds(9));
+        assert!(frame.pins("a") && frame.pins("c") && !frame.pins("b") && !frame.pins("d"));
+        frame.end();
+        assert!(frame.is_empty() && !frame.pins("a"));
+        assert!(frame.hand_out("b", [3, 4], 60, 100));
+        assert!(frame.hand_out("e", [5, 6], 40, 100));
+        assert!(!frame.hand_out("f", [7, 8], 1, 100));
+    }
+
+    #[test]
+    fn a_pngs_cost_is_its_bytes_and_its_pixels() {
+        let tall = png(1440, 3200, 1000);
+        assert_eq!(png_cost(&tall), tall.len() + 1440 * 3200 * 4);
+        assert_eq!(png_cost(b"not a png"), 9 * 5);
+        assert_eq!(png_cost(&png(u32::MAX, u32::MAX, 0)), usize::MAX, "a header can't overflow it");
+    }
+
+    /// Daybreak 92: 121 distinct tall, noisy pages (two 1440 by 3200 looks
+    /// of about 18 MB each) kept in memory at once, about 4 GiB by count.
+    #[test]
+    fn pictures_are_kept_by_what_they_take_up_not_how_many() {
+        let budget = PictureBudget::<u32>::BYTES;
+        let mut kept = PictureBudget::new(budget);
+        let pair = 2 * (18_435_306 + 1440 * 3200 * 4);
+        let mut gone = 0;
+        for n in 0..121u32 {
+            gone += kept.keep(format!("block-{n}"), n, pair).len();
+            assert!(kept.used() <= budget, "over the budget after {n}");
+        }
+        assert_eq!(kept.len(), budget / pair);
+        assert_eq!(gone, 121 - kept.len());
+        // The newest are what's kept, and one used again stays.
+        assert_eq!(kept.get("block-120"), Some(120));
+        assert_eq!(kept.get("block-0"), None);
+    }
+
+    #[test]
+    fn the_least_recently_used_go_first_and_the_newest_always_stays() {
+        let mut kept = PictureBudget::new(100);
+        assert!(kept.keep("a".into(), 'a', 40).is_empty());
+        assert!(kept.keep("b".into(), 'b', 40).is_empty());
+        assert_eq!(kept.get("a"), Some('a'));
+        assert_eq!(kept.keep("c".into(), 'c', 40), ['b'], "b was used longest ago");
+        assert_eq!(kept.keep("c".into(), 'C', 10), ['c'], "the same key again replaces it");
+        assert_eq!(kept.used(), 50);
+        assert_eq!(kept.keep("huge".into(), 'h', 500), ['a', 'C']);
+        assert_eq!((kept.len(), kept.get("huge")), (1, Some('h')));
+        assert_eq!(kept.remove("huge"), Some('h'));
+        assert_eq!((kept.len(), kept.used(), kept.remove("huge")), (0, 0, None));
+        // What's being drawn stays, over the budget if it must.
+        assert!(kept.keep("a".into(), 'a', 60).is_empty());
+        assert!(kept.keep("b".into(), 'b', 30).is_empty());
+        assert_eq!(kept.keep_with("c".into(), 'c', 60, |k| k == "a"), ['b']);
+        assert_eq!(kept.keep_with("d".into(), 'd', 60, |k| k == "a" || k == "c"), Vec::<char>::new());
+        assert_eq!(kept.used(), 180);
+        // Once they're not drawn, back within it.
+        assert_eq!(kept.trim_with(|_| false), ['a', 'c'], "under the budget once a and c go");
+        assert_eq!(kept.used(), 60);
+    }
+
+    /// Blocks drawn alike share their pictures, counted once: six of the
+    /// same and one other fit where seven distinct ones wouldn't.
+    #[test]
+    fn shared_pictures_are_counted_once() {
+        let mut kept = PictureBudget::new(100);
+        for n in 0..6 {
+            assert!(kept.keep_parts_with(format!("a{n}"), n, &[(1, 30), (2, 5)], |_| false).is_empty());
+        }
+        assert!(kept.keep_parts_with("b".into(), 9, &[(3, 30), (4, 5)], |_| false).is_empty());
+        assert_eq!((kept.len(), kept.used()), (7, 70));
+        assert!(kept.trim_with(|_| false).is_empty());
+        // The part goes only with the last block holding it.
+        for n in 0..5 {
+            kept.remove(&format!("a{n}"));
+        }
+        assert_eq!(kept.used(), 70);
+        kept.remove("a5");
+        assert_eq!(kept.used(), 35);
+        // The same key again with the same parts doesn't count them twice.
+        kept.keep_parts_with("b".into(), 10, &[(3, 30), (4, 5)], |_| false);
+        assert_eq!((kept.len(), kept.used()), (1, 35));
     }
 }

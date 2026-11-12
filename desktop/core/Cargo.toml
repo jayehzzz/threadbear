@@ -32,7 +32,21 @@ qrcodegen = "=1.8.0"
 # (hang_sample.rs, `tidy`). Already in the build through std's backtrace
 # crate, at this version.
 rustc-demangle = "=0.1.28"
+# The Swift app's settings, brought across once (swift_import.rs): the XML
+# property list `defaults export` writes, and its data values. Both already
+# in the build, at these versions (roxmltree through usvg, base64 through
+# alacritty_terminal and usvg).
+roxmltree = "=0.21.2"
+base64 = "=0.22.1"
 # Selected words in a reply as HTML for the clipboard (selection_copy.rs):
 # the kit hands the selection over as Markdown. The version gpui-kit parses
 # with, already in the build.
 markdown = "=1.0.0"
+# canonicalize without Windows' `\\?\` prefix; on Mac and Linux it is just
+# std::fs::canonicalize. Already in the Windows build through gpui, at this version.
+dunce = "1.0.5"
+
+# renamex_np and renameat2 for swapping an update in at once, and O_NOFOLLOW
+# for private_file's appends.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"

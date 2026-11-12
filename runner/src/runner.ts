@@ -54,7 +54,7 @@ import type {
 } from './protocol.ts';
 import { agentsStillWorking, ErrorCode, LIMITS, PROTOCOL_VERSION, RpcError, sentByAgent } from './protocol.ts';
 import { activeProviders, cliName, providerInfo, providerName, providersForHello } from './providers.ts';
-import type { ArchivedBy, ArchiveVerdict, LibrarianStatus, Project, Schedule } from './protocol.ts';
+import type { ArchivedBy, ArchiveVerdict, LibrarianStatus, LooseEnd, Project, Schedule } from './protocol.ts';
 import { Projects } from './projects.ts';
 import type { Settings } from './settings.ts';
 import type {
@@ -158,6 +158,7 @@ import { hibernationPart, type HibernationPart } from './runner/hibernation.ts';
 import { newThreadsPart, type NewThreadsPart } from './runner/new-threads.ts';
 import { LAB_REVIEW_ROUNDS, applyAnswers, fixedSinceLastRound, labReviewPart, ledgerCard, openFindings, parseVerdict, type LabReviewPart } from './runner/lab-review.ts';
 import { looseEndsPart, type LooseEndsPart } from './runner/loose-ends.ts';
+import { quietInboxPart, type QuietInboxPart } from './runner/quiet-inbox.ts';
 import { CONFINED_NO_SANDBOX, sandboxFor } from './sandbox.ts';
 import { COPIED_REFUSAL, neutraliseCopied, realCopy } from './real-copy.ts';
 
@@ -372,6 +373,9 @@ type Runtime = {
   // Where the live session's transcript was carried from, if it moved
   // folder; used only if resuming the copy fails.
   carried?: ThreadRecord['handoff'];
+  // The provider the live CLI runs, which a move to another provider
+  // changes on the record before this CLI has gone.
+  sessionProvider?: Provider;
   deleted?: boolean; // anything the old CLI still reports is dropped
   turn?: Turn;
   // When the live CLI last said anything, and whether it looks frozen
@@ -470,6 +474,8 @@ type Runtime = {
   looseEndsAt?: number;
   // A loose-ends check is running: opening the thread doesn't start another.
   looseEndsBusy?: boolean;
+  // That check's look at git, while it's going (LooseEndsPart.checkLooseEnds).
+  looseEndsGather?: Promise<LooseEnd[]>;
 };
 
 export type ThreadState = { rec: ThreadRecord; rt: Runtime };
@@ -625,7 +631,7 @@ export const UNTIL_RESTART = '9999-12-31T00:00:00.000Z';
 export const NO_WAKE_TIME = UNTIL_RESTART;
 
 // Parts of the Runner that live in runner/ (see each file's top).
-export interface Runner extends LooseEndsPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart, ContextUsagePart, MovesPart {}
+export interface Runner extends LooseEndsPart, QuietInboxPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart, ContextUsagePart, MovesPart {}
 export class Runner {
   // While main.ts is still starting up: waking a thread for its waits
   // (reconcileWaits) would start a CLI whose tools aren't ready, so they
@@ -693,6 +699,8 @@ export class Runner {
   refusing?: string;
   startedAt = 0;
   startupNotices: { level: 'info' | 'warning' | 'error'; message: string }[] = [];
+  // settleUnvouched has run: a handover's adopt can come before start.
+  unvouchedSettled = false;
   // Accounts whose CLI has been asked for its models (or is being asked).
   probed = new Set<string>();
   rescanTimer?: TimerHandle;
@@ -777,10 +785,20 @@ export class Runner {
   start(opts: { skip?: ReadonlySet<string> } = {}): void {
     this.startedAt = this.clock.now();
     const { records, broken } = this.store.loadAll();
+    // Which worktrees the always-trust doesn't reach, before anything below
+    // can read a patch or start a CLI (runner/moves.ts): every thread on
+    // disk, a draining runner's included, and before a record that can't be
+    // read is rebuilt without its worktree.
+    this.settleUnvouched(records, broken);
     for (const id of broken) {
       if (opts.skip?.has(id)) continue;
-      const rec = this.rebuild(id);
-      if (rec) records.push(rec);
+      // One at a time too: a log that can't be rebuilt from stays as it is.
+      try {
+        const rec = this.rebuild(id);
+        if (rec) records.push(rec);
+      } catch (e) {
+        this.log.error("couldn't rebuild a thread's record", { threadId: id, error: String(e) });
+      }
     }
     // A dev runner on a copy of the real data dir: its threads name real
     // sessions and folders, so none of them may run (real-copy.ts).
@@ -794,9 +812,17 @@ export class Runner {
       rec.lastSeq = this.store.log(rec.id).lastSeq;
       const st: ThreadState = { rec, rt: newRuntime(Date.parse(rec.lastActivityAt) || 0) };
       this.threads.set(rec.id, st);
-      if (rec.asked === undefined && !rec.archivedAt) this.backfillAsked(rec);
-      this.recoverReviews(st);
-      if (this.recover(st)) stopped++;
+      // One thread's record that trips something here (a field another
+      // runner wrote wrong: a moved thread's `presses: {}` stopped every
+      // start, security review 11 Nov 2026) costs that thread its
+      // recovery, not the runner.
+      try {
+        if (rec.asked === undefined && !rec.archivedAt) this.backfillAsked(rec);
+        this.recoverReviews(st);
+        if (this.recover(st)) stopped++;
+      } catch (e) {
+        this.recoveryFailed(st, e);
+      }
     }
     // carryOnStopped (main.ts, once listening) carries most of them on and
     // says so; this notice is for a runner that never gets that far.
@@ -806,13 +832,25 @@ export class Runner {
     // restart waited still gets carried on.
     // A wake-when still being worked out lost its answer with the old
     // runner, so it comes back too.
-    for (const st of this.threads.values()) if (this.wakesOnStart(st.rec)) this.wake(st, 'restart');
+    for (const st of this.threads.values()) {
+      try {
+        if (this.wakesOnStart(st.rec)) this.wake(st, 'restart');
+      } catch (e) {
+        this.recoveryFailed(st, e);
+      }
+    }
     // Before anything reads a thread's patches. Every thread on disk,
     // including ones a draining runner still has.
     this.seedPatchTrust(records.map((r) => r.cwd));
     this.flush();
     void this.settleLostCleanups();
-    for (const st of this.threads.values()) if (st.rec.queue.some(q => q.reviewId) && this.bucket(st.rec) === 'inbox') this.kickQueue(st);
+    for (const st of this.threads.values()) {
+      try {
+        if (st.rec.queue.some(q => q.reviewId) && this.bucket(st.rec) === 'inbox') this.kickQueue(st);
+      } catch (e) {
+        this.recoveryFailed(st, e);
+      }
+    }
     this.armSnoozeTimer();
     // Waits for room are in thread.json, so they outlive a restart.
     this.armRoomTimer();
@@ -901,6 +939,9 @@ export class Runner {
   }
 
   sendAccounts(): void {
+    // A login added, or a usage reading that shows room again, can carry
+    // on a thread waiting for room in its pool.
+    this.armRoomTimer();
     const accounts = this.safeAccounts();
     // The built-in pools follow the login list.
     const pools = this.pools(accounts);
@@ -924,7 +965,10 @@ export class Runner {
   rebuild(id: string): ThreadRecord | undefined {
     const log = this.store.log(id);
     if (log.lastSeq === 0) return undefined;
-    const events = log.read(1, log.lastSeq);
+    // Only events that are events: the log may be another runner's (a
+    // move), and a line of `null` or a number threw here at every start.
+    const events = log.read(1, log.lastSeq).filter((e) => typeof e === 'object' && e !== null && typeof (e as { type?: unknown }).type === 'string');
+    if (!events.length) return undefined;
     const first = events[0];
     const last = events[events.length - 1];
     const firstMsg = events.find((e) => e.type === 'user.message');
@@ -936,7 +980,7 @@ export class Runner {
     const accountId = this.defaultAccountId();
     const rec: ThreadRecord = {
       id,
-      title: firstMsg && firstMsg.type === 'user.message' ? titleFrom(firstMsg.text) : 'Untitled',
+      title: firstMsg && firstMsg.type === 'user.message' && typeof firstMsg.text === 'string' ? titleFrom(firstMsg.text) : 'Untitled',
       cwd: this.cfg.defaults.cwd,
       accountId,
       // The account's own, so a Codex default never starts the Claude CLI
@@ -945,10 +989,10 @@ export class Runner {
       // Unknown, so the safer one.
       permissionMode: 'ask',
       status: open ? 'running' : 'idle',
-      createdAt: first.ts,
-      updatedAt: last.ts,
-      lastActivityAt: last.ts,
-      preview: lastText && lastText.type === 'assistant.text' ? oneLine(lastText.text, LIMITS.previewChars) : '',
+      createdAt: typeof first.ts === 'string' ? first.ts : this.isoNow(),
+      updatedAt: typeof last.ts === 'string' ? last.ts : this.isoNow(),
+      lastActivityAt: typeof last.ts === 'string' ? last.ts : this.isoNow(),
+      preview: lastText && lastText.type === 'assistant.text' && typeof lastText.text === 'string' ? oneLine(lastText.text, LIMITS.previewChars) : '',
       lastSeq: log.lastSeq,
       lastSeenSeq: log.lastSeq,
       nativeSessionId: crypto.randomUUID(),
@@ -1329,7 +1373,8 @@ export class Runner {
 
   // What a sub-agent has done so far, from the CLI's transcript of it.
   subagent(threadId: string, subagentId: string): { subagent?: Subagent; events: PersistedEvent[] } {
-    const { rec } = this.mustGet(threadId);
+    const st = this.mustGet(threadId);
+    const { rec } = st;
     const known = rec.subagents?.find((a) => a.id === subagentId);
     const cwd = known?.cwd ?? rec.cwd;
     const account = this.accounts.get(known?.accountId ?? rec.accountId);
@@ -1344,7 +1389,14 @@ export class Runner {
       throw new RpcError(ErrorCode.subagentNotFound, `Couldn't read sub-agent ${subagentId}'s transcript: ${String(e)}`);
     }
     const now = this.isoNow();
-    const events = read.map((e, i) => ({ seq: i + 1, ts: e.ts ?? now, threadId, ...e.body }) as PersistedEvent);
+    const events = read.events.map((e, i) => ({ seq: i + 1, ts: e.ts ?? now, threadId, ...e.body }) as PersistedEvent);
+    // The transcript is the one place that has its effort, and has its model
+    // for a sub-agent the live stream didn't report one for (a resumed CLI).
+    if (known && ((read.model && known.model !== read.model) || (read.effort && known.effort !== read.effort))) {
+      if (read.model) known.model = read.model;
+      if (read.effort) known.effort = read.effort;
+      this.markDirty(st);
+    }
     return known ? { subagent: publicSubagent(known), events } : { events };
   }
 
@@ -1864,6 +1916,10 @@ export class Runner {
     rt.resumed = resume;
     rt.cliVersion = undefined;
     rt.versionMove = false;
+    // This CLI is the fresh one anything asked for; a release asked of the
+    // last one doesn't carry over to it (thread 8a971407).
+    rt.releaseWhenIdle = false;
+    rt.sessionProvider = rec.provider;
     rt.started = false;
     rt.startVersion = this.cliList()?.find((c) => c.provider === rec.provider)?.installedVersion;
     // Read now, not from the patch list's cache: a pull just before this
@@ -2115,7 +2171,9 @@ export class Runner {
         // Claude starts a turn of its own to read a finished task's result;
         // Codex doesn't (wakesAfterTasks: false), so there it would only
         // look busy for WAKE_GRACE_MS for nothing.
-        const wakes = this.adapters[rec.provider]?.wakesAfterTasks !== false;
+        // The live CLI's provider: a thread switched to Codex during the
+        // turn still has its Claude CLI here, which wakes.
+        const wakes = this.adapters[rt.sessionProvider ?? rec.provider]?.wakesAfterTasks !== false;
         const ended = endedTasks.length > 0 && wakes;
         rt.tasks = o.tasks;
         if (wakes) rt.finished.push(...endedTasks);
@@ -2221,8 +2279,8 @@ export class Runner {
       rt.wakeTimer = undefined;
       rt.finished = [];
       this.markDirty(st);
-      // A version move was waiting for the grace to end.
-      if (rt.versionMove && !rt.turn) this.scheduleIdle(st);
+      // A version move or a fresh CLI was waiting for the grace to end.
+      if ((rt.versionMove || rt.releaseWhenIdle) && !rt.turn) this.scheduleIdle(st);
     }, WAKE_GRACE_MS);
   }
 
@@ -2415,6 +2473,12 @@ export class Runner {
       }
       this.markDirty(st);
     }
+    // Finished for good, with nothing for Mike: a helper thread with nothing
+    // left open archives itself, and one only waiting on threads it started
+    // hibernates until they're done (experiment quietInbox,
+    // runner/quiet-inbox.ts). Not one a schedule had out of the archive: the
+    // lines above have dealt with it.
+    if (finished && !review && !rec.labReviewOwed && !rt.turn && !rec.archivedAt && !this.stopping) void this.settleQuietly(st, Boolean(said?.next?.length));
     if (archive && !rt.turn && !rec.archivedAt && !this.stopping) {
       this.emit(st, { type: 'system.note', text: 'Archived, as the agent was asked to once it had finished.' });
       this.update({ threadId: rec.id, archived: true, archivedBy: 'agent' });
@@ -2725,6 +2789,10 @@ export class Runner {
     // carries on by itself (the limit box's menu). false also ends a wait
     // under way; true starts one if the thread is stuck at its limit now.
     carryOnAtReset?: boolean;
+    // With accountId, on a thread whose last turn stopped at its login's
+    // limit: carry on there now, rather than wait for a message (the limit
+    // box's Continue now on).
+    carryOn?: boolean;
     // A move Mike made (the app, tb) or allowed on a card: a thread shut in
     // a sandbox may leave it. Without it, a move or login change that would
     // take it out is refused (ThreadRecord.confined).
@@ -2735,6 +2803,12 @@ export class Runner {
     // Checked before anything changes, so a refused rename changes nothing else either.
     if (params.title !== undefined && params.titleBy === 'agent' && rec.titleByMike && params.title.trim() !== rec.title) {
       throw new RpcError(ErrorCode.badParams, `The user named this thread "${rec.title}" themselves, so it keeps that title. Only rename it if they ask you to.`);
+    }
+    // Continue now on can't start a turn while a restart refuses them, and
+    // a carry-on put off till after it would be lost to "Carry on by itself:
+    // No" or a second click (Codex's review): say so, and change nothing.
+    if (params.carryOn && params.accountId !== undefined && (this.refusing || this.draining)) {
+      throw new RpcError(ErrorCode.busy, 'Threadbear is restarting, so it can\'t carry on just now. Try again in a moment.');
     }
     let release = false;
     let stop = false;
@@ -2797,9 +2871,10 @@ export class Runner {
       const session = rt.session;
       if (session && !rt.closing) {
         const fallback = () => {
-          // Couldn't move the live session: a fresh CLI resumes there.
+          // Couldn't move the live session: a fresh CLI resumes there,
+          // once any background work is done (scheduleIdle).
           rt.releaseWhenIdle = true;
-          if (!rt.turn) this.releaseSession(st);
+          if (!rt.turn) this.scheduleIdle(st);
         };
         if (session.setCwd) session.setCwd(rec.cwd).catch(fallback);
         else fallback();
@@ -2944,7 +3019,12 @@ export class Runner {
         if (verdict) rec.archiveVerdict = verdict;
         else delete rec.archiveVerdict;
         stop = true;
-      } else delete rec.archivedAt;
+      } else {
+        // Brought back out by hand: it stays out, however its next turn ends
+        // (runner/quiet-inbox.ts).
+        if (rec.archivedAt) rec.keptOut = true;
+        delete rec.archivedAt;
+      }
     }
     if (archiving) {
       this.reconcileWaits();
@@ -2965,9 +3045,14 @@ export class Runner {
       if (rt.turn) this.interrupt(rec.id);
       else this.releaseSession(st);
     } else if (release) {
+      // Another login or folder: the CLI goes now, or once its background
+      // work is done (scheduleIdle). The next message gets the fresh one
+      // either way.
       rt.releaseWhenIdle = true;
-      if (!rt.turn) this.releaseSession(st);
+      if (!rt.turn) this.scheduleIdle(st);
     }
+    // Its first turn on the new login releases the old CLI (deliver).
+    if (params.carryOn && accountChanged && !stop && !rt.turn && !rec.queue.length && this.bucket(rec) === 'inbox' && rec.limitHitTurn !== undefined) this.carryOn(st, CARRY_ON_MOVED);
     // Archived here, archived in the CLI's own app too (Codex Desktop's
     // list), once the session has let go of it: a turn is interrupted
     // first, then released, so that can take a moment. Resuming unarchives.
@@ -3244,6 +3329,7 @@ export class Runner {
     if (u.parentId) a.parentId = u.parentId;
     if (u.description) a.description = u.description;
     if (u.agentType) a.agentType = u.agentType;
+    if (u.model) a.model = u.model;
     if (u.background) a.background = true;
     if (u.toolUses !== undefined) a.toolUses = u.toolUses;
     if (u.summary) a.summary = u.summary;
@@ -3308,7 +3394,16 @@ export class Runner {
         // A retry with nothing new: the app already has this summary.
         if (retry) continue;
       }
-      this.notify({ method: 'thread.updated', params: { thread: this.summary(st) } });
+      // One thread whose summary can't be made (a record another runner
+      // wrote wrong) doesn't stop the others' saves and news.
+      let thread: ThreadSummary;
+      try {
+        thread = this.summary(st);
+      } catch (e) {
+        this.log.error("couldn't make a thread's summary", { threadId: id, error: String(e) });
+        continue;
+      }
+      this.notify({ method: 'thread.updated', params: { thread } });
     }
     if (failed && !this.stopping) this.saveRetryTimer = this.clock.setTimeout(() => this.flush(), SAVE_RETRY_MS);
   }
@@ -3556,10 +3651,18 @@ export class Runner {
     return lines.length ? this.pressNewsText(lines) : undefined;
   }
 
+  // A thread whose recovery threw at start or on a handover: said, and
+  // left as it is, mid-turn or not, rather than taking the runner down.
+  recoveryFailed(st: ThreadState, e: unknown): void {
+    this.log.error("couldn't recover a thread at start", { threadId: st.rec.id, error: String(e) });
+    this.startupNotice('warning', `"${st.rec.title}" couldn't be picked up where it left off (${e instanceof Error ? e.message : String(e)}). The other threads started as usual.`);
+  }
+
   // A completed turn keeps what it told; any other end (a failure, Stop, a
   // restart part way) tells it again with the next message.
   settlePresses(rec: ThreadRecord, completed: boolean): void {
-    for (const p of rec.presses ?? []) {
+    if (!Array.isArray(rec.presses)) return;
+    for (const p of rec.presses) {
       if (!p.told?.inFlight) continue;
       if (completed) delete p.told.inFlight;
       else delete p.told;
@@ -3704,7 +3807,7 @@ export class Runner {
 
 // The Runner's other methods live in parts under runner/, one area each;
 // they go onto its prototype here, as the class's own methods would be.
-for (const part of [looseEndsPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart, contextUsagePart, movesPart]) {
+for (const part of [looseEndsPart, quietInboxPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart, contextUsagePart, movesPart]) {
   for (const [key, d] of Object.entries(Object.getOwnPropertyDescriptors(part))) {
     Object.defineProperty(Runner.prototype, key, { ...d, enumerable: false });
   }

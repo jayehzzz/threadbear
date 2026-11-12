@@ -169,7 +169,7 @@ impl FolderView {
 }
 
 fn core_folders_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    if threadbear_core::reducer::text::is_windows_path(path) { path.rsplit(['/', '\\']).next().unwrap_or(path) } else { path.rsplit('/').next().unwrap_or(path) }
 }
 
 /// Keeping a folder up to date while it shows: a watch on its folders here,
@@ -249,7 +249,8 @@ fn document_image() -> Arc<Image> {
 /// side or 256 MB decoded, whatever the file says.
 fn make_thumbnail(path: &str) -> Option<Arc<Image>> {
     use image::imageops::FilterType;
-    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let bytes = threadbear_core::open_policy::local_read(std::path::Path::new(path), 24 * 1024 * 1024).ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
@@ -836,8 +837,10 @@ impl FolderRow {
             .child(div().flex_1().min_w_0().text_ellipsis_middle().whitespace_nowrap().overflow_hidden().text_size(px(style::size::LABEL)).text_color(name_color).child(entry.name.clone()));
         let date = entry.modified_ms.map(date_words).unwrap_or_else(|| "--".to_owned());
         let size = entry.size.map(size_words).unwrap_or_else(|| "--".to_owned());
-        div()
-            .id(("folder-row", index))
+        // Dragged out, it's the file or folder itself, on this Mac only
+        // (file_drag.rs, `pasteboardWriterForItemAt`).
+        let drag = Some(entry.path.clone()).filter(|_| !thread.is_remote());
+        crate::file_drag::FileDragExt::file_drag(div().id(("folder-row", index)), drag)
             .w_full()
             .h(px(ROW_HEIGHT))
             .flex()
@@ -901,8 +904,8 @@ impl FolderTile {
         let (click_key, menu_key) = (key.to_owned(), key.to_owned());
         let (click_thread, menu_thread) = (thread.clone(), thread.clone());
         let click_preview = preview.clone();
-        div()
-            .id(("folder-tile", index))
+        let drag = Some(entry.path.clone()).filter(|_| !thread.is_remote());
+        crate::file_drag::FileDragExt::file_drag(div().id(("folder-tile", index)), drag)
             .flex_none()
             .w(px(width))
             .h(px(rules::TILE_HEIGHT))
@@ -1083,6 +1086,10 @@ impl SidePane {
         let name = core_folders_name(&path).to_owned();
         self.leave_folder(key, path.clone(), name, true, memory, thread, preview, cx);
         if let Some(selecting) = selecting {
+            // A Windows parent/breadcrumb uses forward slashes, while the
+            // folder we came out of may still have its runner's backslashes.
+            // Rows use the destination listing's spelling too.
+            let selecting = join(&path, core_folders_name(&selecting));
             if let Some(view) = self.folders.views.get_mut(&view_key(&thread.id, &path)) {
                 view.selection = Selection::of(vec![selecting]);
             } else if let Some(p) = self.previews.get_mut(&thread.id) {

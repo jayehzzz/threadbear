@@ -13,6 +13,7 @@ import type { RemoteThreads } from '../../src/thread-index.ts';
 import { needsFromTool } from '../../src/needs.ts';
 import { CodexTools, type ToolDefinition } from '../../src/adapters/codex/tools.ts';
 import { toolTitle } from '../../src/tools.ts';
+import { ThreadRouter } from '../../src/handover.ts';
 
 function start(h: ReturnType<typeof makeHarness>, text = 'Fix the tests', extra: Record<string, unknown> = {}) {
   const { thread } = h.runner.create({ text, accountId: 'claude-3', ...extra });
@@ -1914,4 +1915,111 @@ test('one reply: a later end_turn taken in the older form ends the reply that co
   s.result('completed');
   await tick();
   assert.ok(!h.events(thread.id).some((e) => e.type === 'assistant.text' && e.itemId === 'm3' && e.final === true), '"Done." is not the reply');
+});
+
+// A turn kept on a draining runner matches a short id against a list that
+// partly comes from the new runner. That list failing was taken for an
+// empty one, so send_message said "No thread with id df5c7153" for a
+// thread the whole id then reached (12 Nov).
+test("a short id is found on the other runner of a handover once it answers, and not called missing while it doesn't", async () => {
+  const h = makeHarness();
+  const { thread: me } = start(h, 'Bring in a PR');
+  const there = { ...h.runner.get(start(h, 'Plan the port').thread.id) };
+  const farId = 'df5c7153-f093-476a-9402-e78d3ba158de';
+  const far = { ...there, id: farId, title: 'Plan the GPUI port' };
+  let fails = 0;
+  // Lists that come back without it: a thread a draining runner left that
+  // isn't taken in yet is in neither runner's list.
+  let missing = 0;
+  // Lists that never come back: a link that stays open and doesn't answer.
+  let hangs = 0;
+  const sent: unknown[] = [];
+  const elsewhere = {
+    owns: (id: string) => id === farId,
+    find: async (id: string) => (id === farId ? far : undefined),
+    list: async () => {
+      if (hangs > 0) {
+        hangs--;
+        return new Promise<never>(() => {});
+      }
+      if (fails > 0) {
+        fails--;
+        throw new RpcError(ErrorCode.busy, "The new runner isn't answering yet; try again in a moment.");
+      }
+      if (missing > 0) {
+        missing--;
+        return [];
+      }
+      return [far];
+    },
+    search: async () => [],
+    call: async (method: string, params: Record<string, unknown>) => {
+      sent.push({ method, params });
+      if (method === 'threads.send') return { turnId: 't1' };
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+  const router = new ThreadRouter(h.runner, () => elsewhere);
+  let slept = 0;
+  const list = buildThreadbearTools(router, me.id, () => Date.parse('2026-10-26T12:00:00Z'), undefined, undefined, undefined, { sleep: async () => void slept++ });
+  const send = async (threadId: string) => {
+    const r = (await list.find((x) => x.name === 'send_message')!.handler({ threadId, text: 'Merged.' } as never, {})) as { content: { text: string }[]; isError?: boolean };
+    return { text: r.content.map((c) => c.text).join('\n'), error: Boolean(r.isError) };
+  };
+
+  // It answers on the third try.
+  fails = 2;
+  const ok = await send('df5c7153');
+  assert.equal(ok.error, false, ok.text);
+  assert.equal(slept, 2);
+  assert.deepEqual(sent.map((s) => (s as { method: string }).method), ['threads.send']);
+
+  // It answers, without the thread at first.
+  slept = 0;
+  missing = 1;
+  const late = await send('df5c7153');
+  assert.equal(late.error, false, late.text);
+  assert.equal(slept, 1);
+
+  // One try that never answers is given up on, and the next one finds it.
+  slept = 0;
+  hangs = 1;
+  const hung = await send('df5c7153');
+  assert.equal(hung.error, false, hung.text);
+  assert.equal(slept, 1);
+  assert.equal(sent.length, 3);
+
+  // It never answers: said as that, after three tries, not as a missing
+  // thread, and nothing is sent.
+  slept = 0;
+  fails = 100;
+  const down = await send('df5c7153');
+  assert.equal(down.error, true);
+  assert.equal(slept, 2);
+  assert.doesNotMatch(down.text, /No thread with id/);
+  assert.match(down.text, /Couldn't look df5c7153 up just now .*use the whole id/);
+  assert.equal(sent.length, 3);
+
+  // A thread that really isn't anywhere is still "No thread".
+  fails = 0;
+  assert.match((await send('0000dead')).text, /No thread with id 0000dead/);
+
+  // list_threads still shows this runner's own meanwhile.
+  fails = 100;
+  const listed = (await list.find((x) => x.name === 'list_threads')!.handler({} as never, {})) as { content: { text: string }[] };
+  assert.match(listed.content[0].text, /Bring in a PR/);
+});
+
+// On a draining runner other Macs' threads come through the new runner
+// too; one that never answers mustn't hold a short id's lookup forever.
+test("a short id here is found when the list of other Macs' threads never comes back", async () => {
+  const h = makeHarness();
+  const { thread: me } = start(h, 'Asker');
+  const other = start(h, 'Answerer').thread;
+  const router = new ThreadRouter(h.runner, () => undefined);
+  const stuck = { list: () => new Promise<never>(() => {}), call: async () => { throw new Error('unused'); } };
+  const list = buildThreadbearTools(router, me.id, () => Date.parse('2026-10-26T12:00:00Z'), undefined, undefined, undefined, { remote: () => stuck, sleep: async () => undefined });
+  const r = (await list.find((x) => x.name === 'read_thread')!.handler({ threadId: other.id.slice(0, 8) } as never, {})) as { content: { text: string }[]; isError?: boolean };
+  assert.equal(Boolean(r.isError), false, r.content[0].text);
+  assert.match(r.content[0].text, /Answerer/);
 });

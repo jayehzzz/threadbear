@@ -17,7 +17,7 @@ use crate::app::Threadbear;
 use crate::style::{self, px};
 use crate::call;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Enter, InputEvent, TextareaState};
+use gpui_kit::component::input::{Enter, InputEvent, Paste, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::*;
@@ -95,25 +95,12 @@ fn write_drafts(cx: &mut App) {
             _ => Ok(()),
         }
     } else {
-        write_private(&path, &serde_json::to_vec(&cache.encode()).unwrap_or_default())
+        // Only this user's, the temp file too (`private_file`).
+        threadbear_core::private_file::write(&path, &serde_json::to_vec(&cache.encode()).unwrap_or_default())
     };
     if let Err(e) = result {
         eprintln!("threadbear: couldn't save the review drafts: {e}");
     }
-}
-
-fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, data)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&temp, path)
 }
 
 /// A `review.updated` from the runner for a thread with a window open on that
@@ -153,6 +140,15 @@ async fn riding_out(client: Arc<Client>, method: &'static str, params: Value, cx
 /// mustn't come to the front and count as Mike looking.
 fn scripted() -> bool {
     cfg!(feature = "automation") && std::env::var_os("THREADBEAR_AUTOMATION").is_some()
+}
+
+/// ⌘V on the window itself, so a paste with the keys outside the reply box
+/// reaches `paste_in_reply`; in the box, the box's own binding comes first.
+/// Bound once, for every review window.
+fn bind_keys(cx: &mut App) {
+    static BOUND: std::sync::Once = std::sync::Once::new();
+    let chord = if cfg!(target_os = "macos") { "cmd-v" } else { "ctrl-v" };
+    BOUND.call_once(|| cx.bind_keys([KeyBinding::new(chord, Paste, Some("ReviewWindow"))]));
 }
 
 impl Threadbear {
@@ -285,6 +281,9 @@ pub(crate) struct ReviewWindow {
     /// The thread's folder: a relative link in the agent's notes is from there.
     cwd: String,
     reply: Entity<TextareaState>,
+    /// The draft last put in the box. A render can run before the box's
+    /// Change event, so compare drafts before replacing text being edited.
+    reply_synced: String,
     /// Holds the keys when the reply box hasn't got them: the arrows step,
     /// Space flicks to today's version, Return and Esc go in and out.
     focus: FocusHandle,
@@ -309,10 +308,11 @@ impl ReviewWindow {
     fn new(parts: Parts, review: DesignReview, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let session = ReviewSession::new(&parts.thread_id, review, parts.cache);
         let typed = session.draft().reply.clone().unwrap_or_default();
-        let reply = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a reply").auto_grow(1, 13).default_value(typed));
+        let reply = cx.new(|cx| TextareaState::new(window, cx).placeholder("Add a reply").auto_grow(1, 13).default_value(typed.clone()));
         let mut subs = vec![cx.subscribe_in(&reply, window, |this, state, ev: &InputEvent, _, cx| match ev {
             InputEvent::Change => {
                 let text = state.read(cx).value().to_string();
+                this.reply_synced = text.clone();
                 if this.session.set_reply(&text) {
                     this.edited(cx);
                 }
@@ -342,6 +342,8 @@ impl ReviewWindow {
         });
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        crate::web_panels::keyboard_to_app(window);
+        bind_keys(cx);
         // The latest copy now, then every few seconds while it waits: replies
         // from the phone or another window, when the thread's events aren't
         // coming to this app.
@@ -363,6 +365,7 @@ impl ReviewWindow {
             session,
             cwd: parts.cwd,
             reply,
+            reply_synced: typed,
             focus,
             save_timer: None,
             call_task: None,
@@ -420,8 +423,12 @@ impl ReviewWindow {
     /// changed it: the runner's copy from another window, or an answer.
     fn sync_reply_box(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let wanted = self.session.shown_draft().reply.clone().unwrap_or_default();
-        if self.reply.read(cx).value().as_ref() != wanted.as_str() {
-            self.reply.update(cx, |s, cx| s.set_value(wanted, window, cx));
+        // A changed runner draft or answer still wins over an unreported local edit.
+        if self.reply_synced != wanted {
+            if self.reply.read(cx).value().as_ref() != wanted.as_str() {
+                self.reply.update(cx, |s, cx| s.set_value(wanted.clone(), window, cx));
+            }
+            self.reply_synced = wanted;
         }
         let editable = self.session.editable();
         self.reply.update(cx, |s, cx| s.set_disabled(!editable, cx));
@@ -610,6 +617,8 @@ impl ReviewWindow {
             return;
         }
         self.closed = true;
+        // Its clips stop and go with it.
+        crate::media_view::close_window(self.handle.window_id());
         let key = window_key(&self.session.thread_id, &self.session.review().id);
         reviews(cx).windows.remove(&key);
         self.save_now(cx);
@@ -769,6 +778,30 @@ impl ReviewWindow {
         }
     }
 
+    /// ⌘V with the keys on the window rather than the reply box (on open,
+    /// after a tick or a press on the stage) puts the words in the box, and
+    /// the cursor with them. Voice Type pastes what Mike says with ⌘V into
+    /// whatever has the keys, and he ticks an option and talks straight away:
+    /// nothing here took the paste, so the words went nowhere (12 Nov).
+    fn paste_in_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // In the box already, the paste was the box's own to take.
+        if !self.session.editable() || self.reply_focused(window, cx) {
+            return;
+        }
+        let Some(words) = cx.read_from_clipboard().and_then(|c| c.text()).filter(|w| !w.is_empty()) else { return };
+        let handle = self.reply.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        crate::web_panels::keyboard_to_app(window);
+        // Replace its selection, or insert at its cursor, as its own Paste does.
+        self.reply.update(cx, |s, cx| s.replace(words, window, cx));
+        // Save and Send must see the paste before the box's Change arrives.
+        let text = self.reply.read(cx).value().to_string();
+        self.reply_synced = text.clone();
+        if self.session.set_reply(&text) {
+            self.edited(cx);
+        }
+    }
+
     fn reply_focused(&self, window: &Window, cx: &App) -> bool {
         self.reply.read(cx).focus_handle(cx).is_focused(window)
     }
@@ -778,6 +811,7 @@ impl ReviewWindow {
     pub(crate) fn take_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus, cx);
+            crate::web_panels::keyboard_to_app(window);
         }
     }
 
@@ -948,6 +982,9 @@ pub(crate) fn plain_button(id: &'static str, title: &str, tip: &'static str, bus
 
 impl Render for ReviewWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // First, as it counts the frame the stage's clips are drawn in
+        // (media_view.rs); they hide while the title bar's menu is up.
+        let clips = crate::media_view::sweeper(window, crate::media_view::Cover { everything: self.more_open, menus: Vec::new() });
         self.sync_reply_box(window, cx);
         // The rail keeps the option on show in view as the stage moves.
         if self.session.mode == ReviewMode::Single && self.rail_follows != Some(self.session.focused()) {
@@ -987,6 +1024,8 @@ impl Render for ReviewWindow {
                     cx.stop_propagation();
                 }
             }))
+            // A paste nothing else took goes in the reply box.
+            .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste_in_reply(window, cx)))
             // On a shot, the View menu's zoom keys zoom the shot rather than
             // the app's text, as they do in Preview.
             .on_action(cx.listener(|this, _: &crate::shell::ZoomIn, _, cx| {
@@ -1015,6 +1054,7 @@ impl Render for ReviewWindow {
             .child(titlebar)
             .when_some(error, |s, e| s.child(self.render_error_bar(e, cx)))
             .child(body)
+            .child(clips)
     }
 }
 
@@ -1234,6 +1274,13 @@ pub(crate) async fn automation(app: &WeakEntity<Threadbear>, main: AnyWindowHand
                 if let Some(browse) = cmd["browse"].as_i64() {
                     v.browse(browse as i32, cx);
                 }
+                // The keys in the reply box, as a click in it gives them, for a
+                // real ⌘V after (features/tools/real-review-paste.ts).
+                if cmd["focusReply"].as_bool() == Some(true) {
+                    let handle = v.reply.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                    crate::web_panels::keyboard_to_app(window);
+                }
             })
         })
     })
@@ -1287,9 +1334,11 @@ impl ReviewWindow {
             "sendLabel": s.send_label(),
             "editable": s.editable(),
             "minimap": self.stage.minimap_showing(),
-            // What the stage draws: here a clip or a page is its still.
+            // What the stage draws: a clip playing in the system's player
+            // (on a Mac), or a page or a clip that can't play as its still.
             "stage": match (s.mode, s.shown_shot()) {
                 (ReviewMode::All, _) => "all",
+                (_, Some(shot)) if shot.video().is_some_and(|v| crate::media_view::state_of(&stage::stage_key(v)).is_some()) => "player",
                 (_, Some(shot)) if shot.media.is_some() => "still",
                 _ => "picture",
             },

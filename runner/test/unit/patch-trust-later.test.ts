@@ -477,6 +477,23 @@ test('schedule check: a change to what it runs holds it, the thread is told once
   await sched.update({ scheduleId: sc.id, title: 'Watch' });
   await due(h);
   assert.equal(ran.length, 1);
+  // Nor does a save from the apps' editors, which send the folder with every
+  // save and show no check (security review, 11 Nov 2026, finding 89): its
+  // folder as it was, written another way, or the same with model and effort.
+  await sched.update({ scheduleId: sc.id, title: 'Watch', text: 'Look again', cwd: dir, model: 'claude-haiku-5-5', effort: 'low' });
+  await sched.update({ scheduleId: sc.id, cwd: dir + '/' });
+  await due(h);
+  assert.equal(ran.length, 1, 'a save that kept its folder approved nothing');
+  assert.equal(h.runner.patchTrust.checkApproved('./check.sh', dir).approved, false);
+  // Nor a real move: approval is per folder, and nobody was shown the check
+  // there. Moving back finds it held still, as its scripts changed.
+  const other = repo({ 'check.sh': '#!/bin/sh\necho other\n' });
+  await sched.update({ scheduleId: sc.id, cwd: other });
+  await due(h);
+  assert.equal(ran.length, 1, 'moved, and held there');
+  assert.equal(h.runner.patchTrust.checkApproved('./check.sh', other).approved, false);
+  assert.equal(toldHeld(h), 2, 'and told once there');
+  await sched.update({ scheduleId: sc.id, cwd: dir });
 
   // Passing the check again does.
   await sched.update({ scheduleId: sc.id, check: './check.sh' });
@@ -486,7 +503,7 @@ test('schedule check: a change to what it runs holds it, the thread is told once
   fs.appendFileSync(path.join(dir, 'helper.sh'), '# again\n');
   await due(h);
   assert.equal(ran.length, 2);
-  assert.equal(toldHeld(h), 2);
+  assert.equal(toldHeld(h), 3);
   sched.stop();
 });
 
@@ -657,6 +674,52 @@ test('schedule check: a script changed while the card was up isn\'t approved', a
   assert.match(r.content[0].text, /changed while the approval card was up/);
   assert.equal(sched.list().length, 0);
   sched.stop();
+});
+
+// Finding 89, from the tools: moving a schedule's folder approves nothing in
+// the Scheduler any more, so update_schedule passes the check along with the
+// card it showed for the new folder, and that card's yes is what approves
+// it there. Without it, the card approved nothing (Muse's review).
+test('schedule check: moving its folder from a thread that asks first approves it there only as the card showed it', async () => {
+  const one = repo({ 'check.sh': '#!/bin/sh\necho\n' });
+  const two = repo({ 'check.sh': '#!/bin/sh\necho two\n' });
+  {
+    const { sched, asked, call, h } = askTools(one, 'ask');
+    const sc = await sched.create({ text: 'Look', title: 'Watch', cron: '*/5 * * * *', cwd: one, check: './check.sh\n# and-this-line-too' });
+    const r = await call('update_schedule', { scheduleId: sc.id, folder: two });
+    assert.equal(r.isError, undefined, r.content[0]?.text);
+    assert.equal(asked.length, 1, 'a card for it');
+    assert.match(JSON.stringify(asked[0]), /\.\/check\.sh/, 'the card says what it runs');
+    assert.match(JSON.stringify(asked[0]), /and-this-line-too/, 'all of it (Muse\'s third look)');
+    assert.ok(JSON.stringify(asked[0]).includes(two), 'and where');
+    assert.equal(h.runner.patchTrust.checkApproved('./check.sh\n# and-this-line-too', two).approved, true);
+    sched.stop();
+  }
+  {
+    // Its check changed by someone else while the card was up isn't put back.
+    const four = repo({ 'check.sh': '#!/bin/sh\necho four\n' });
+    let sched!: ReturnType<typeof askTools>['sched'];
+    let id = '';
+    const made = askTools(one, 'ask', () => void sched.update({ scheduleId: id, check: null }));
+    sched = made.sched;
+    id = (await sched.create({ text: 'Look', title: 'Watch', cron: '*/5 * * * *', cwd: one, check: './check.sh' })).id;
+    const r = await made.call('update_schedule', { scheduleId: id, folder: four });
+    await new Promise((res) => setTimeout(res, 50));
+    assert.equal(made.h.runner.patchTrust.checkApproved('./check.sh', four).approved, false);
+    assert.equal(sched.find(id).check, undefined, 'taken off, and not put back');
+    assert.equal(r.isError, true, r.content[0]?.text);
+    sched.stop();
+  }
+  {
+    const three = repo({ 'check.sh': '#!/bin/sh\necho three\n' });
+    const { sched, call, h } = askTools(one, 'ask', () => fs.appendFileSync(path.join(three, 'check.sh'), '# swapped\n'));
+    const sc = await sched.create({ text: 'Look', title: 'Watch', cron: '*/5 * * * *', cwd: one, check: './check.sh' });
+    const r = await call('update_schedule', { scheduleId: sc.id, folder: three });
+    assert.equal(r.isError, true);
+    assert.match(r.content[0].text, /changed while the approval card was up/);
+    assert.equal(h.runner.patchTrust.checkApproved('./check.sh', three).approved, false);
+    sched.stop();
+  }
 });
 
 test('Codex review: naming this runner doesn\'t get a thread that asks first past the check on the card', async () => {

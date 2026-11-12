@@ -79,8 +79,15 @@ impl FolderWatch {
             if folders.values().any(|a| a == asked) {
                 continue;
             }
-            let real = std::fs::canonicalize(asked).unwrap_or_else(|_| PathBuf::from(asked));
-            if self.watcher.watch(Path::new(&real), RecursiveMode::NonRecursive).is_ok() {
+            let watched = threadbear_core::open_policy::with_local_path(Path::new(asked), |local| {
+                #[cfg(windows)]
+                let real = local.to_path_buf();
+                #[cfg(not(windows))]
+                let real = std::fs::canonicalize(local)?;
+                self.watcher.watch(&real, RecursiveMode::NonRecursive).map_err(std::io::Error::other)?;
+                Ok(real)
+            });
+            if let Ok(real) = watched {
                 folders.insert(real, asked.clone());
             }
         }

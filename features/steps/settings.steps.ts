@@ -47,3 +47,8 @@ Then('Settings lists no private folders', async function (this: ThreadbearWorld)
 Then('Settings offers the small jobs pool {string}', async function (this: ThreadbearWorld, pool: string) {
   await this.until(`Small jobs offers ${pool}`, (d) => shown(d)?.smallJobPools?.includes(pool));
 });
+
+// Where the keyboard is in the Settings window: its list of sections, as it opens.
+When('I press the {word} arrow in Settings', async function (this: ThreadbearWorld, dir: string) {
+  await this.app.do({ cmd: 'arrow', dir, settings: true });
+});

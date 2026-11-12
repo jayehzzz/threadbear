@@ -15,7 +15,7 @@ use gpui_kit::*;
 // The zoom-aware px (style.rs), in place of GPUI's.
 use crate::style::px;
 use serde_json::json;
-use threadbear_core::logins::{provider_title, Account, Pool};
+use threadbear_core::logins::{provider_title, twin_label, Account, Pool};
 use threadbear_core::pools;
 
 /// The icons a pool can take (`Pools.iconChoices`), those this app has a
@@ -140,6 +140,9 @@ impl SettingsWindow {
         }
         let title = self.current_pool().map(|p| p.title.clone()).unwrap_or_default();
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Pool name").default_value(title));
+        // A new name typed and not yet taken: an update's restart waits for
+        // it. What it's filled with from the pool is saved (`fill_name`).
+        crate::unsent::watch(&name, cx);
         let sub = cx.subscribe_in(&name, window, |this, _, ev: &InputEvent, window, cx| {
             if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 this.commit_pool_name(window, cx);
@@ -155,6 +158,7 @@ impl SettingsWindow {
         let title = self.current_pool().map(|p| p.title.clone()).unwrap_or_default();
         if let Some(name) = self.pools.name.clone() {
             name.update(cx, |s, cx| s.set_value(title, window, cx));
+            crate::unsent::saved(&name, cx);
         }
     }
 
@@ -169,6 +173,7 @@ impl SettingsWindow {
             // Blank or unchanged: back to the name it has.
             None => name.update(cx, |s, cx| s.set_value(pool.title.clone(), window, cx)),
         }
+        crate::unsent::saved(&name, cx);
     }
 
     fn choose_pool(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -370,10 +375,17 @@ impl SettingsWindow {
     /// ticked ones in order.
     fn login_row(&self, pool: &Pool, account: &Account, included: bool, accounts: &[Account], cx: &mut Context<Self>) -> AnyElement {
         let secondary = style::secondary_text(cx);
-        let detail: Vec<String> = [Some(provider_title(account.provider_id())), account.note.clone()].into_iter().flatten().filter(|s| !s.is_empty()).collect();
+        // Two logins with one email (issue 18) read the same, so the title
+        // adds the note, or the id with none, and the note isn't said twice.
+        let twin = twin_label(account, accounts);
+        let note = account.note.clone().filter(|_| twin.is_none());
+        let detail: Vec<String> = [Some(provider_title(account.provider_id())), note].into_iter().flatten().filter(|s| !s.is_empty()).collect();
         let (pool_id, login) = (pool.id.clone(), account.id.clone());
         let me = cx.entity().downgrade();
-        let title = account.name();
+        let title = match twin {
+            Some(label) => format!("{} ({label})", account.name()),
+            None => account.name(),
+        };
         let label = h_flex()
             .gap(px(6.))
             .min_w_0()
@@ -399,7 +411,6 @@ impl SettingsWindow {
                 });
             }
         }
-        let _ = accounts;
         row_with(
             crate::highlights::tipped(h_flex().id(SharedString::from(format!("settings-pool-login-row-{}", account.id))).gap(px(8.)).min_w_0().child(toggle).child(label), if included { format!("{title} is in this pool") } else { format!("Add {title} to this pool") }).into_any_element(),
             controls.into_any_element(),

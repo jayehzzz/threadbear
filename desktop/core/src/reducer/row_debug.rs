@@ -49,7 +49,12 @@ impl RowDebug {
                     PlanCardState::SentBack => "sent back",
                 };
                 if card.entries.is_empty() {
-                    format!("plan ({state}): {}", PlanCardText::summary(&card.text))
+                    // Its title too, as the card draws it over the plan (the
+                    // nightly parity run looks for both).
+                    match PlanCardText::split(&card.text).0 {
+                        Some(title) => format!("plan ({state}): {title}: {}", PlanCardText::summary(&card.text)),
+                        None => format!("plan ({state}): {}", PlanCardText::summary(&card.text)),
+                    }
                 } else {
                     format!("plan ({state}), {}", card.entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>().join("; "))
                 }
@@ -60,7 +65,12 @@ impl RowDebug {
                     let loose = match &card.loose_ends {
                         None => String::new(),
                         Some(ends) if ends.is_empty() => ", loose ends: none".to_owned(),
-                        Some(ends) => format!(", loose ends: {}", ends.iter().map(|e| e.text.clone()).collect::<Vec<_>>().join("; ")),
+                        Some(ends) => {
+                            // A booked check-in is drawn under its own label.
+                            let booked: Vec<String> = ends.iter().filter(|e| e.is_booked()).map(|e| e.text.clone()).collect();
+                            let coming = if booked.is_empty() { String::new() } else { format!(", Coming back: {}", booked.join("; ")) };
+                            format!(", loose ends: {}{coming}", ends.iter().map(|e| e.text.clone()).collect::<Vec<_>>().join("; "))
+                        }
                     };
                     let next = if card.next.is_empty() {
                         String::new()
@@ -94,6 +104,10 @@ impl RowDebug {
             RowContent::Background(status) => BackgroundWork::line_with_detail(&status.tasks),
             RowContent::Changes(card) => card.title(),
             RowContent::Gap(gap) => gap.label(),
+            // Another lab's review, as the Swift RowDebug says it.
+            RowContent::LabReview(r) => {
+                format!("{}{}", r.heading(), r.findings.iter().map(|f| format!("; #{} {}: {}", f.id, f.outcome.as_deref().unwrap_or("no answer"), f.claim)).collect::<String>())
+            }
         }
     }
 
@@ -167,7 +181,10 @@ pub fn info(thread_id: &str, row: &Row, seqs: &[i64], runner_version: &str, sour
     // The command that prints those events, ready to run.
     if let (Some(first), Some(last)) = (seqs.iter().min(), seqs.iter().max()) {
         lines.push(match source {
-            EventsSource::Tb(tb) => format!("see: {tb} events {thread_id} --from {first} --to {last}"),
+            // The id quoted as one word: another runner's ids are what it
+            // wrote to the backend, and this line is meant to be pasted
+            // into a shell.
+            EventsSource::Tb(tb) => format!("see: {tb} events {} --from {first} --to {last}", shell_word(thread_id)),
             EventsSource::Fixture => {
                 let range = if first == last { format!("line {first}") } else { format!("lines {first}-{last}") };
                 format!("see: {range} of events.ndjson in the thread's fixture folder (line N is seq N)")
@@ -175,6 +192,17 @@ pub fn info(thread_id: &str, row: &Row, seqs: &[i64], runner_version: &str, sour
         });
     }
     lines.join("\n") + "\n"
+}
+
+/// `text` as one word a shell takes as it is: bare when it's only safe
+/// characters, in single quotes otherwise (the default data folder has a
+/// space; another runner's thread id could have anything).
+pub fn shell_word(text: &str) -> String {
+    if !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)) {
+        text.to_owned()
+    } else {
+        crate::sign_in::quoted(text)
+    }
 }
 
 /// "3, 7-9, 12": runs of seqs written as ranges, so a big group's events

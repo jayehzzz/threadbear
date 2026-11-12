@@ -49,7 +49,7 @@ pub fn resolve(text: &str, root: Option<&str>, known: &[String], home: &str, exi
     if let Some(rest) = path.strip_prefix("~/") {
         path = format!("{}/{rest}", home.trim_end_matches('/'));
     }
-    if path.starts_with('/') {
+    if path.starts_with('/') || crate::reducer::text::is_windows_path(&path) {
         return exists(&path).then_some(path);
     }
     let join = |base: &str| standardize(&format!("{}/{}", base.trim_end_matches('/'), path));
@@ -61,7 +61,7 @@ pub fn resolve(text: &str, root: Option<&str>, known: &[String], home: &str, exi
     }
     let trimmed = path.strip_prefix("./").unwrap_or(&path);
     for candidate in known.iter().rev() {
-        if (candidate == trimmed || candidate.ends_with(&format!("/{trimmed}"))) && exists(candidate) {
+        if (candidate == trimmed || candidate.replace('\\', "/").ends_with(&format!("/{}", trimmed.replace('\\', "/")))) && exists(candidate) {
             return Some(candidate.clone());
         }
         for base in [candidate.as_str(), parent(candidate)] {
@@ -132,8 +132,8 @@ pub fn search(folder: &str, path: &str) -> Option<String> {
     let mut seen = 0usize;
     let mut stack = vec![Path::new(folder).to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        let mut children: Vec<_> = entries.flatten().collect();
+        let Ok(entries) = crate::open_policy::local_read_dir(&dir) else { continue };
+        let mut children: Vec<_> = entries.into_iter().flatten().collect();
         // A steady order, so the same click finds the same file.
         children.sort_by_key(|e| e.file_name());
         let mut folders = Vec::new();
@@ -147,15 +147,19 @@ pub fn search(folder: &str, path: &str) -> Option<String> {
             if entry_name.starts_with('.') || SKIPPED.contains(&entry_name.as_ref()) {
                 continue;
             }
-            let full = entry.path();
+            // Keep the spelling the caller browses (a /var or 8.3 alias),
+            // even when Windows opened the directory by its resolved path.
+            let full = dir.join(&file_name);
             if entry_name == name {
                 let found = full.to_string_lossy().into_owned();
-                if found.ends_with(&suffix) {
+                // Windows' paths come back with backslashes, while what a
+                // reply names has forward ones, so nothing matched there.
+                if found.replace(std::path::MAIN_SEPARATOR, "/").ends_with(&suffix) && crate::open_policy::local_metadata(&full).is_ok() {
                     return Some(found);
                 }
             }
             let is_package = entry_name.rsplit_once('.').is_some_and(|(_, ext)| PACKAGES.contains(&ext.to_lowercase().as_str()));
-            if !is_package && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if !is_package && entry.is_folder {
                 folders.push(full);
             }
         }
@@ -182,7 +186,7 @@ pub fn tool_paths(items: &[Row], home: &str) -> Vec<String> {
             paths.extend(cd_targets(command, home));
         }
     }
-    paths.retain(|p| p.starts_with('/'));
+    paths.retain(|p| p.starts_with('/') || crate::reducer::text::is_windows_path(p));
     paths
 }
 
@@ -239,6 +243,11 @@ pub fn remote_home(cwd: &str, local_home: &str) -> String {
 
 /// `a/./b/../c` as `a/c` (`standardizingPath`).
 fn standardize(path: &str) -> String {
+    let normalized;
+    let path = if crate::reducer::text::is_windows_path(path) {
+        normalized = path.replace('\\', "/");
+        normalized.as_str()
+    } else { path };
     let rooted = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
     for part in path.split('/') {
@@ -263,7 +272,8 @@ fn standardize(path: &str) -> String {
 }
 
 fn parent(path: &str) -> &str {
-    match path.trim_end_matches('/').rsplit_once('/') {
+    let sep = |c| c == '/' || (crate::reducer::text::is_windows_path(path) && c == '\\');
+    match path.trim_end_matches(sep).rsplit_once(sep) {
         Some(("", _)) => "/",
         Some((dir, _)) => dir,
         None => "",
@@ -272,6 +282,13 @@ fn parent(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_absolute_tool_paths_are_found_without_a_thread_folder() {
+        let file = r"C:\work\notes.md";
+        let exists = |p: &str| p == file;
+        assert_eq!(super::resolve(file, Some(r"D:\other"), &[], "", &exists, &|_, _| None).as_deref(), Some(file));
+        assert_eq!(super::resolve("notes.md", None, &[file.into()], "", &exists, &|_, _| None).as_deref(), Some(file));
+    }
     use super::*;
     use crate::reducer::{ToolCall, ToolItem, ToolKind};
     use serde_json::json;
@@ -342,8 +359,10 @@ mod tests {
             std::fs::write(root.join(file), "x").unwrap();
         }
         let folder = root.to_string_lossy().into_owned();
-        assert_eq!(search(&folder, "Target.swift").as_deref(), Some(root.join("src/deep/down/Target.swift").to_string_lossy().as_ref()));
-        assert_eq!(search(&folder, "down/Target.swift").as_deref(), Some(root.join("src/deep/down/Target.swift").to_string_lossy().as_ref()));
+        // Joined a part at a time, so Windows' is the backslashed path it finds.
+        let target = root.join("src").join("deep").join("down").join("Target.swift");
+        assert_eq!(search(&folder, "Target.swift").as_deref(), Some(target.to_string_lossy().as_ref()));
+        assert_eq!(search(&folder, "down/Target.swift").as_deref(), Some(target.to_string_lossy().as_ref()));
         assert_eq!(search(&folder, "up/Target.swift"), None);
         for passed_over in ["Only.swift", "Secret.swift", "Inside.swift"] {
             assert_eq!(search(&folder, passed_over), None, "{passed_over}");

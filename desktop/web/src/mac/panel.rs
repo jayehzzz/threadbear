@@ -6,17 +6,25 @@
 // except the Convex dashboard's, which gets a context that keeps nothing as
 // its deploy key is in it. As WebPanelPool:
 //
-// - A link, a form or a new window to another site leaves the page where it
-//   is and goes to the app (Event::Leave), which opens it the way a link
-//   from a highlight goes (Mike, 11 Nov: a click on a video loaded YouTube
-//   in the panel with no way back). A redirect or a script's own navigation
-//   stays, so a sign-in that goes through another site and back still works.
-// - A same-site new window loads in the same view: there's no other window
-//   to give it. The Convex dashboard's links out all leave.
-// - Nothing downloads; Chromium's View Source isn't offered.
+// - A link, a form or a new window to another site, clicked, leaves the page
+//   where it is and goes to the app (Event::Leave), which opens it the way a
+//   link from a highlight goes (Mike, 11 Nov: a click on a video loaded
+//   YouTube in the panel with no way back). A redirect or a script's own
+//   navigation stays in a patch's panel, so a sign-in that goes through
+//   another site and back still works; in the Convex dashboard it's
+//   cancelled. Nothing goes out without a person's click, one page for each
+//   click and at most one a second (panel_rules: Codex review, 11 Nov, a
+//   script could otherwise open a browser tab a second).
+// - A same-site new window, clicked, loads in the same view: there's no
+//   other window to give it. The Convex dashboard's links out all leave.
+// - Only web addresses load as the panel's page: a file dropped on the page,
+//   or a file or data: page in a new window, doesn't. Its iframes are
+//   Chromium's to rule on (it keeps files out of them).
+// - Nothing downloads; Chromium's View Source isn't offered; what a page
+//   logs to its console stays out of Chromium's log.
 // - The app hears when it can go back, and when it's loading.
-use super::host::{tb_view_has_keyboard, tb_view_remove, tb_view_set_frame, tb_view_set_hidden, tb_view_set_parent};
-use crate::panel_rules::{leaves, site, Event, Kind};
+use super::host::{tb_view_has_keyboard, tb_view_input_count, tb_view_note_input, tb_view_remove, tb_view_set_frame, tb_view_set_hidden, tb_view_set_parent, tb_view_watch_input};
+use crate::panel_rules::{browse, popup, site, Browse, Event, Kind, LeaveGate, Popup};
 use cef::*;
 use futures::channel::{mpsc, oneshot};
 use serde_json::{json, Value as Json};
@@ -24,7 +32,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What the page's handlers share with it. They run on Chromium's UI
@@ -32,6 +40,14 @@ use std::sync::{Arc, Mutex};
 struct Shared {
     /// Scheme, host and port of the panel's own page.
     home: Mutex<String>,
+    /// The address the app loaded in the panel: the only page that isn't a
+    /// web address (a patch's data: page) that may load in it.
+    own: Mutex<String>,
+    /// How often a page may go from this panel to the browser.
+    gate: Mutex<LeaveGate>,
+    /// The page's own view (its address), whose clicks and keys AppKit
+    /// counts for the gate.
+    view: AtomicUsize,
     convex: bool,
     can_go_back: AtomicBool,
     loading: AtomicBool,
@@ -57,6 +73,20 @@ impl Shared {
 
     fn home(&self) -> String {
         self.home.lock().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    fn own(&self) -> String {
+        self.own.lock().map(|o| o.clone()).unwrap_or_default()
+    }
+
+    /// A page for the browser, one for each click and at most one a second
+    /// from this panel; any more are dropped without a word (`LeaveGate`).
+    fn leave(&self, url: String) {
+        let inputs = unsafe { tb_view_input_count(self.view.load(Ordering::Acquire) as *mut c_void) };
+        let allowed = self.gate.lock().is_ok_and(|mut gate| gate.allow(std::time::Instant::now(), inputs));
+        if allowed {
+            self.send(Event::Leave(url));
+        }
     }
 
     fn fail_calls(&self, why: &str) {
@@ -113,6 +143,9 @@ impl PanelPage {
         let (tx, rx) = mpsc::unbounded();
         let shared = Arc::new(Shared {
             home: Mutex::new(site(url).unwrap_or_default()),
+            own: Mutex::new(url.to_owned()),
+            gate: Mutex::new(LeaveGate::default()),
+            view: AtomicUsize::new(0),
             convex: matches!(kind, Kind::Convex { .. }),
             can_go_back: AtomicBool::new(false),
             loading: AtomicBool::new(true),
@@ -150,6 +183,9 @@ impl PanelPage {
             .ok_or("Chromium didn't make the page")?;
         let host = browser.host().ok_or("the page has no host")?;
         let view = host.window_handle();
+        // A person's clicks and keys in it, counted for the gate.
+        shared.view.store(view as usize, Ordering::Release);
+        unsafe { tb_view_watch_input(view) };
         let mut observer = Answers::new(shared.clone());
         let registration = host.add_dev_tools_message_observer(Some(&mut observer));
         // Out of sight until the app puts it somewhere.
@@ -209,6 +245,9 @@ impl PanelPage {
     pub fn load(&self, url: &str) {
         if let Ok(mut home) = self.shared.home.lock() {
             *home = site(url).unwrap_or_default();
+        }
+        if let Ok(mut own) = self.shared.own.lock() {
+            *own = url.to_owned();
         }
         *self.url.borrow_mut() = url.to_owned();
         if let Some(frame) = self.browser.main_frame() {
@@ -344,6 +383,18 @@ impl PanelPage {
         unsafe { tb_view_has_keyboard(self.view) }
     }
 
+    /// How many clicks and keys a person has given the page's view so far:
+    /// one changing says it's being used (an update's restart waits for it).
+    pub fn input_count(&self) -> u64 {
+        unsafe { tb_view_input_count(self.view) }
+    }
+
+    /// A scripted app's stand-in for a person's click in the page: the
+    /// specs click through DevTools, which AppKit never sees (`LeaveGate`).
+    pub fn note_input(&self) {
+        unsafe { tb_view_note_input(self.view) };
+    }
+
     /// Gives the page the keyboard, as a click in it does.
     pub fn focus(&self) {
         if let Some(host) = self.browser.host() {
@@ -408,16 +459,20 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        // The panel's own frame: panel_rules::browse says what happens (an
+        // iframe's are Chromium's to rule on).
         fn on_before_browse(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, request: Option<&mut Request>, user_gesture: c_int, is_redirect: c_int) -> c_int {
+            if !frame.is_some_and(|f| f.is_main() == 1) {
+                return 0;
+            }
             let url = request.map(|r| CefString::from(&r.url()).to_string()).unwrap_or_default();
-            let main = frame.is_some_and(|f| f.is_main() == 1);
-            // Clicked (a link or a form), not a redirect or a script on its own.
-            let clicked = user_gesture == 1 && is_redirect == 0;
-            if main && leaves(&url, &self.shared.home()) && (clicked || self.shared.convex) {
-                self.shared.send(Event::Leave(url));
-                1
-            } else {
-                0
+            match browse(&url, &self.shared.home(), &self.shared.own(), self.shared.convex, user_gesture == 1, is_redirect == 1) {
+                Browse::Stay => 0,
+                Browse::Leave => {
+                    self.shared.leave(url);
+                    1
+                }
+                Browse::Drop => 1,
             }
         }
     }
@@ -429,8 +484,9 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
-        // No new windows: one to another site leaves, one on the same site
-        // loads in this view (WebPanelPool's createWebViewWith).
+        // No new windows: a click's to another site leaves, one on the same
+        // site loads in this view (WebPanelPool's createWebViewWith), and a
+        // script's own is dropped (panel_rules::popup).
         fn on_before_popup(
             &self,
             browser: Option<&mut Browser>,
@@ -439,7 +495,7 @@ wrap_life_span_handler! {
             target_url: Option<&CefString>,
             _target_frame_name: Option<&CefString>,
             _target_disposition: WindowOpenDisposition,
-            _user_gesture: c_int,
+            user_gesture: c_int,
             _popup_features: Option<&PopupFeatures>,
             _window_info: Option<&mut WindowInfo>,
             _client: Option<&mut Option<Client>>,
@@ -448,12 +504,14 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut c_int>,
         ) -> c_int {
             let url = target_url.map(|u| u.to_string()).unwrap_or_default();
-            if self.shared.convex || leaves(&url, &self.shared.home()) {
-                if site(&url).is_some() {
-                    self.shared.send(Event::Leave(url));
+            match popup(&url, &self.shared.home(), self.shared.convex, user_gesture == 1) {
+                Popup::Leave => self.shared.leave(url),
+                Popup::LoadHere => {
+                    if let Some(frame) = browser.and_then(|b| b.main_frame()) {
+                        frame.load_url(Some(&CefString::from(url.as_str())));
+                    }
                 }
-            } else if let Some(frame) = browser.and_then(|b| b.main_frame()) {
-                frame.load_url(Some(&CefString::from(url.as_str())));
+                Popup::Drop => {}
             }
             1
         }
@@ -498,6 +556,14 @@ wrap_display_handler! {
     }
 
     impl DisplayHandler {
+        // What a page says to its console stays out of Chromium's log
+        // (web-runtime.log), as the sealed pages' does: a dashboard's code,
+        // or a script on its site, could log the deploy key (Codex review,
+        // 11 Nov).
+        fn on_console_message(&self, _browser: Option<&mut Browser>, _level: LogSeverity, _message: Option<&CefString>, _source: Option<&CefString>, _line: c_int) -> c_int {
+            1
+        }
+
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             if let Ok(mut now) = self.shared.title.lock() {
                 *now = title.map(|t| t.to_string()).unwrap_or_default();

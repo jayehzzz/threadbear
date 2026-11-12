@@ -5,9 +5,8 @@
 // `CliStatus`). Plain sentences, one per thing going on; the view adds the
 // buttons.
 //
-// The app's own update is the Swift app's AppUpdater, which builds main and
-// swaps it in. This app doesn't update itself yet (`system.selfupdate`), so
-// it hands these an `AppSide` with nothing on its way.
+// The app's own update is AppUpdater in the Swift app and app_update.rs in
+// this one, each building main and swapping it in (`AppSide`).
 use crate::inbox::parse_ms;
 use crate::slash::cli_name;
 use chrono::{DateTime, Duration, TimeZone};
@@ -186,11 +185,17 @@ pub struct AppSide {
     pub staged: Option<String>,
     pub building: bool,
     pub failed: bool,
+    /// The GPUI app's build found no Mac to build on, and tries again at its
+    /// next look (the Swift app builds where it is, so never).
+    pub waiting: bool,
+    /// Why the installed GPUI app can't follow main (one installed before it
+    /// could, say). The Swift app has no such case.
+    pub not_following: Option<String>,
 }
 
 impl AppSide {
     pub fn is_pending(&self) -> bool {
-        self.staged.is_some() || self.building
+        self.staged.is_some() || self.building || self.waiting
     }
 }
 
@@ -206,7 +211,7 @@ fn runner_failed(runner: Option<&RunnerUpdates>) -> bool {
 /// runner: the icon's grey dot. The icon itself is always there since the
 /// CLIs' versions moved into its panel (28 Oct).
 pub fn shown(app: &AppSide, runner: Option<&RunnerUpdates>) -> bool {
-    app.is_pending() || app.failed || runner_pending(runner) || runner_failed(runner) || from_mike(runner) || not_following(runner)
+    app.is_pending() || app.failed || app.not_following.is_some() || runner_pending(runner) || runner_failed(runner) || from_mike(runner) || not_following(runner)
 }
 
 /// A release of Mike's this copy's main doesn't have yet.
@@ -220,15 +225,31 @@ pub fn cli_pending(cli: &CliStatus) -> bool {
     matches!(cli.status.as_str(), "behind" | "held" | "missing") || cli.update.as_ref().is_some_and(|u| matches!(u.state.as_str(), "waiting" | "running" | "failed"))
 }
 
+/// The tooltip's line for a Threadbear Runner.app (or launch.mjs) that only
+/// install-runner.sh brings up to date.
+pub const REINSTALL_LINE: &str = "The runner needs reinstalling, which only you can do";
+
 /// The icon's tooltip: "Updates", then a line for each thing going on, or
 /// that everything is up to date. The panel has the rest.
 pub fn icon_tooltip(app: &AppSide, runner: Option<&RunnerUpdates>, clis: &[CliStatus]) -> String {
     let mut lines = vec!["Updates".to_owned()];
-    if app.is_pending() || app.failed || runner_pending(runner) || runner_failed(runner) {
-        lines.push(tooltip(app, runner));
+    // A runner app to reinstall gets its own line, as it's the one that's
+    // Mike's to do (the accent dot); left in, it read as "A runner update",
+    // which looks like one on its way by itself (12 Nov, Mike: "I thought
+    // blue dots reserved for something that needs me to action on it").
+    let moving = runner.map(|r| RunnerUpdates { launcher_changed: false, ..r.clone() });
+    let moving = moving.as_ref();
+    if app.is_pending() || app.failed || runner_pending(moving) || runner_failed(moving) {
+        lines.push(tooltip(app, moving));
+    }
+    if runner.is_some_and(|r| r.launcher_changed) {
+        lines.push(REINSTALL_LINE.to_owned());
     }
     if let Some(line) = upstream_tooltip(runner.and_then(|r| r.upstream.as_ref())) {
         lines.push(line);
+    }
+    if app.not_following.is_some() {
+        lines.push("The app isn't following main".to_owned());
     }
     if not_following(runner) {
         lines.push("A runner isn't following GitHub's main".to_owned());
@@ -243,12 +264,13 @@ pub fn icon_tooltip(app: &AppSide, runner: Option<&RunnerUpdates>, clis: &[CliSt
 }
 
 /// Whether it wants Mike (the accent dot): a launch.mjs only he can install,
-/// a release of his to bring in (they only come in when he says), or a
-/// machine that isn't following GitHub's main. Anything else sorts itself
+/// a release of his to bring in (they only come in when he says), a
+/// machine that isn't following GitHub's main, or an installed GPUI app that
+/// can't follow main until it's installed again. Anything else sorts itself
 /// out, a failed build included, so it gets the grey dot (27 Oct, Mike: "the
 /// blue dot usually indicates there's something for me to action").
-pub fn needs_you(_app: &AppSide, runner: Option<&RunnerUpdates>) -> bool {
-    runner.is_some_and(|r| r.launcher_changed) || from_mike(runner) || not_following(runner)
+pub fn needs_you(app: &AppSide, runner: Option<&RunnerUpdates>) -> bool {
+    app.not_following.is_some() || runner.is_some_and(|r| r.launcher_changed) || from_mike(runner) || not_following(runner)
 }
 
 /// A machine that isn't following GitHub's main: nothing fixes that by
@@ -421,10 +443,30 @@ pub fn app_line(a: &AppSide) -> String {
     if a.building {
         return "Building the app from main.".to_owned();
     }
+    if a.waiting {
+        return "The app has a new version on main, waiting for a Mac to build it on.".to_owned();
+    }
     if a.failed {
         return "The app's last build from main failed. The log says why.".to_owned();
     }
+    if let Some(why) = &a.not_following {
+        return format!("The app isn't following main: {why}.");
+    }
     a.running.as_ref().map_or_else(|| "The app is up to date.".to_owned(), |r| format!("The app is up to date ({r})."))
+}
+
+/// The Updates icon's right-click popover, in a line (`popoverLine`).
+pub fn popover_line(a: &AppSide) -> String {
+    if a.staged.is_some() {
+        return "A new version of the app is ready.".to_owned();
+    }
+    if a.building {
+        return "Building the app's next version.".to_owned();
+    }
+    if a.failed {
+        return "The app's last build failed.".to_owned();
+    }
+    app_line(a)
 }
 
 /// The runner's own build: building, built and starting, or failed.
@@ -741,6 +783,15 @@ mod tests {
     }
 
     #[test]
+    fn the_popover_says_the_app_update_in_a_line() {
+        let side = |staged: Option<&str>, building: bool, failed: bool| AppSide { running: Some("abc1234".into()), staged: staged.map(str::to_owned), building, failed, ..Default::default() };
+        assert_eq!(popover_line(&side(Some("def5678"), true, false)), "A new version of the app is ready.");
+        assert_eq!(popover_line(&side(None, true, false)), "Building the app's next version.");
+        assert_eq!(popover_line(&side(None, false, true)), "The app's last build failed.");
+        assert_eq!(popover_line(&side(None, false, false)), "The app is up to date (abc1234).");
+    }
+
+    #[test]
     fn checked_says_the_time_or_the_day() {
         let zone = FixedOffset::east_opt(8 * 3600).unwrap();
         let clis = mock_clis();
@@ -772,6 +823,9 @@ mod tests {
         assert_eq!(runner_lines(Some(&failed)), ["The runner couldn't update to main at abc1234: npm ci failed"]);
         let launcher = RunnerUpdates::decode(&json!({ "state": "idle", "launcherChanged": true })).unwrap();
         assert!(needs_you(&app, Some(&launcher)));
+        assert_eq!(icon_tooltip(&app, Some(&launcher), &[]), "Updates\nThe runner needs reinstalling, which only you can do");
+        let both = RunnerUpdates::decode(&json!({ "state": "building", "commit": "abc1234", "launcherChanged": true })).unwrap();
+        assert_eq!(icon_tooltip(&app, Some(&both), &[]), "Updates\nA runner update\nThe runner needs reinstalling, which only you can do");
         assert_eq!(runner_lines(Some(&launcher)), ["launch.mjs has changed on main. It only updates when you run this, once nothing is busy:"]);
         let behind = RunnerUpdates::decode(&json!({ "state": "idle", "behindRunners": [{ "name": "bruce", "problem": "3 days behind" }] })).unwrap();
         assert!(needs_you(&app, Some(&behind)));
@@ -783,6 +837,20 @@ mod tests {
         assert_eq!(runner_lines(None), ["This runner doesn't say how its updates are going."]);
         assert_eq!(RunnerUpdates::decode(&Value::Null), None);
         assert_eq!(app_line(&app), "The app is up to date.");
+    }
+
+    // The installed GPUI app can't follow main until it's installed again:
+    // only Mike can do that, so the accent dot.
+    #[test]
+    fn an_app_that_cant_follow_main_says_why_and_needs_you() {
+        let app = AppSide { running: Some("abc1234".into()), not_following: Some("it was installed before it could".into()), ..Default::default() };
+        assert_eq!(app_line(&app), "The app isn't following main: it was installed before it could.");
+        assert!(shown(&app, None) && needs_you(&app, None));
+        assert_eq!(icon_tooltip(&app, None, &[]), "Updates\nThe app isn't following main");
+        // Waiting for a Mac is on its way, so grey.
+        let waiting = AppSide { running: Some("abc1234".into()), waiting: true, ..Default::default() };
+        assert!(shown(&waiting, None) && !needs_you(&waiting, None));
+        assert_eq!(app_line(&waiting), "The app has a new version on main, waiting for a Mac to build it on.");
     }
 
     #[test]

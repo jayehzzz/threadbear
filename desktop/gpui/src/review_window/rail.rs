@@ -184,6 +184,7 @@ impl ReviewWindow {
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 let handle = reply.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
+                crate::web_panels::keyboard_to_app(window);
             })
             .child(crate::composer::bare_textarea(Textarea::new(&self.reply)).w_full().text_size(px(style::size::WORK)).line_height(px(style::natural_line(style::size::WORK))));
         // None: tinted while it's chosen, as the Swift button's tint is.
@@ -269,7 +270,7 @@ fn inline_note(id: impl Into<ElementId>, source: &str, color: Hsla, cwd: &str, c
     let (base, mono, link_color) = (cx.theme().font_family.clone(), cx.theme().mono_font_family.clone(), style::link_text(cx));
     let mut text = String::new();
     let mut runs: Vec<TextRun> = vec![];
-    let mut links: Vec<(Range<usize>, String)> = vec![];
+    let mut links: Vec<(Range<usize>, std::sync::Arc<str>)> = vec![];
     for run in rules::inline_markdown(source) {
         let start = text.len();
         text.push_str(&run.text);
@@ -289,7 +290,8 @@ fn inline_note(id: impl Into<ElementId>, source: &str, color: Hsla, cwd: &str, c
     if links.is_empty() {
         return styled.into_any_element();
     }
-    let (ranges, urls): (Vec<Range<usize>>, Vec<String>) = links.into_iter().unzip();
+    // The addresses as the parser shares them, one copy a link.
+    let (ranges, urls): (Vec<Range<usize>>, Vec<std::sync::Arc<str>>) = links.into_iter().unzip();
     let cwd = cwd.to_owned();
     InteractiveText::new(id, styled).on_click(ranges, move |ix, _, cx| crate::open_gate::open_link(&urls[ix], Origin::ThisMac, &cwd, cx)).into_any_element()
 }

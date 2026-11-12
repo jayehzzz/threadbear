@@ -49,6 +49,10 @@ pub struct ThreadSummary {
     /// Kept as it came: the reducer reads its own `BackgroundTask` from these.
     pub background: Option<Vec<Value>>,
     pub subagents: Option<Vec<Value>>,
+    /// The runner's loose-ends check for the done card (protocol "Loose
+    /// ends"), kept as it came and read with `loose_ends_check`, so one
+    /// the reducer can't read leaves the rest of the summary standing.
+    pub loose_ends: Option<Value>,
     pub projects: Option<Vec<Project>>,
     pub started_by: Option<Value>,
     pub schedule: Option<Value>,
@@ -76,6 +80,11 @@ pub struct ThreadSummary {
     pub on_old_runner: Option<bool>,
     /// Sharing (protocol "Sharing"): `{ access, slug }`.
     pub share: Option<Value>,
+    /// When it was made (the About window's numbers, den.rs).
+    pub created_at: Option<String>,
+    /// One of the tour's made-up threads (`threads.samples`): left out of
+    /// the About window's numbers.
+    pub sample: Option<bool>,
     /// Which other runner it lives on; none for this Mac's own threads.
     /// Never on the wire: a runner's summaries are all its own (Swift
     /// `ThreadSummary.runnerId`), and `remote::summary` sets it.
@@ -130,6 +139,22 @@ pub struct Project {
 }
 
 impl ThreadSummary {
+    /// While it's on its way to another machine, what its box says in place
+    /// of the words ("Moving to bruce…"): anything typed or answered now
+    /// could land on the wrong side of the move, so the box and the card
+    /// wait. None once it's there, or once the move failed or was called off
+    /// (`ThreadMove.line`, ComposerView's `moving`).
+    pub fn moving_line(&self) -> Option<String> {
+        let moving = self.moving.as_ref()?;
+        let state = moving.get("state").and_then(Value::as_str).unwrap_or("");
+        let name = moving.get("toName").and_then(Value::as_str).unwrap_or("");
+        match state {
+            "failed" | "cancelled" => None,
+            "ready" => Some(format!("Moving to {name} once this turn ends…")),
+            _ => Some(format!("Moving to {name}…")),
+        }
+    }
+
     /// Newer events than Mike has seen.
     pub fn unread(&self) -> bool {
         self.last_seq > self.last_seen_seq
@@ -144,6 +169,11 @@ impl ThreadSummary {
     /// The background list, read leniently: a malformed entry is left out.
     pub fn background_tasks(&self) -> Vec<BackgroundTask> {
         self.background.iter().flatten().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()
+    }
+    /// What's still open on the done card, as the reducer takes it
+    /// (Swift `ThreadSummary.looseEnds`, which decodes it leniently too).
+    pub fn loose_ends_check(&self) -> Option<crate::reducer::LooseEnds> {
+        self.loose_ends.as_ref().and_then(crate::reducer::LooseEnds::decode)
     }
     /// Sub-agents or a workflow still at work, or just finished with their
     /// result still to be read (Swift `agentsStillWorking`).
@@ -602,6 +632,16 @@ pub fn parse_ms(iso: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_thread_on_its_way_to_another_machine_says_so_in_its_box() {
+        let moving = |state: &str| thread(1, json!({ "moving": { "moveId": "m1", "to": "r2", "toName": "bruce", "state": state } }));
+        assert_eq!(moving("copying").moving_line().as_deref(), Some("Moving to bruce…"));
+        assert_eq!(moving("ready").moving_line().as_deref(), Some("Moving to bruce once this turn ends…"));
+        assert_eq!(moving("failed").moving_line(), None, "a failed move gives the box back");
+        assert_eq!(moving("cancelled").moving_line(), None);
+        assert_eq!(thread(2, json!({})).moving_line(), None);
+    }
 
     fn thread(n: u32, over: Value) -> ThreadSummary {
         let mut v = json!({

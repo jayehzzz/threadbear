@@ -6,6 +6,7 @@ import { sleep, type Driver, type Dump, type Row, type Thread } from './driver.t
 import { GpuiDriver } from './gpui.ts';
 import { longThreadFolder } from './long-thread.ts';
 import { SwiftDriver } from './swift.ts';
+import { removeTempFolders } from './temp.ts';
 import { webRuntimeCleanup, webRuntimeSetup } from './web-runtime.ts';
 
 // Whatever a person running the specs asked for (features/README.md), kept
@@ -16,16 +17,21 @@ setDefaultTimeout(90_000);
 
 export class ThreadbearWorld extends World {
   app: Driver;
+  /** Remove a scenario's files only after the app and its shells have ended. */
   /** What the last right-click on a sidebar row offered. */
   menuTitles?: string[];
   /** What the last command answered, for a step to read back. */
   lastAnswer?: string;
+  /** The row a swipe under way is on (swipes.steps.ts). */
+  swipedRow?: string;
   /** A row's position a scenario wants to compare with later. */
   notedIndex?: number;
   /** A row and its height, a scenario wants to compare with later. */
   notedRow?: { id: string; height: number };
   /** What the last `share` command said. */
   shareResult?: string;
+  /** The thread whose page flew to its heading (archive-flight.steps.ts). */
+  flownFrom?: string;
 
   constructor(options: IWorldOptions) {
     super(options);
@@ -66,7 +72,7 @@ export class ThreadbearWorld extends World {
 export function describe(d: Dump): string {
   const side = d.sidebar.sections.map((s) => `${s.name}${s.collapsed ? ' (folded)' : ''}: ${s.threads.map((t) => t.title).join(' | ') || '(none)'}`).join('\n');
   const rows = d.transcript.rows.map((r: Row) => `  ${r.kind}${r.expanded ? ' (open)' : ''}: ${r.text}`).join('\n');
-  return `connection: ${d.connection}\nbanner: ${d.banner?.text ?? '(none)'}\n${side}\nopen: ${d.selection?.title ?? '(none)'}, composer: ${JSON.stringify(d.composer.text)}\n${rows}`;
+  return `${d.reduceMotion ? 'Reduce Motion: on\n' : ''}connection: ${d.connection}\nbanner: ${d.banner?.text ?? '(none)'}\n${side}\nopen: ${d.selection?.title ?? '(none)'}, composer: ${JSON.stringify(d.composer.text)}\n${rows}`;
 }
 
 setWorldConstructor(ThreadbearWorld);
@@ -80,6 +86,14 @@ Before({ tags: '@sidebar.skeleton' }, () => {
 After({ tags: '@sidebar.skeleton' }, () => {
   delete process.env.THREADBEAR_MOCK_LIST_DELAY_MS;
   delete process.env.TB_DEV_APP_NO_READY;
+});
+
+// A runner slow to read a thread (switching-threads.feature).
+Before({ tags: '@thread.loading or @thread.kept' }, () => {
+  process.env.THREADBEAR_MOCK_EVENTS_DELAY_MS = '3000';
+});
+After({ tags: '@thread.loading or @thread.kept' }, () => {
+  delete process.env.THREADBEAR_MOCK_EVENTS_DELAY_MS;
 });
 
 Before(async function (this: ThreadbearWorld, { pickle }) {
@@ -115,5 +129,7 @@ After(async function (this: ThreadbearWorld, { result, pickle }) {
     if (fs.existsSync(file)) this.attach(fs.readFileSync(file), 'image/png');
   }
   await this.app.stop();
+  // Only now: Windows won't remove the folder the Terminal's shell is in.
+  removeTempFolders();
   webRuntimeCleanup();
 });

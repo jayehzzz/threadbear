@@ -4,16 +4,23 @@
 // channel; requests run there too and their results come back as tasks.
 // Read-outs that exist only for the scripted control (`automation.rs`).
 #![cfg_attr(not(feature = "automation"), allow(dead_code, unused_imports))]
+mod activity;
 mod activity_panels;
+mod about_window;
 mod alert;
 mod app;
+mod app_log;
+mod archive_flight;
+mod app_update;
 #[cfg(feature = "automation")]
 mod automation;
 mod card_run;
 mod chips;
+mod colour_space;
 mod composer;
 mod composer_card;
 mod composer_account;
+mod composer_answers;
 mod composer_chips;
 mod composer_context;
 mod composer_inline;
@@ -25,6 +32,7 @@ mod ding;
 mod draft_boxes;
 mod drafts;
 mod explain_pane;
+mod file_drag;
 mod file_edit;
 mod file_find;
 mod file_watch;
@@ -41,12 +49,15 @@ mod highlights_store;
 mod home_page;
 mod icons;
 mod installed;
+mod key_hints;
 mod librarian;
 mod mac_switch;
+mod media_view;
 mod move_sheet;
 mod new_thread;
 mod notify;
 mod open_gate;
+mod pane_cache;
 mod patch_icons;
 mod patches;
 mod prefs;
@@ -59,11 +70,14 @@ mod push_button;
 mod quit_prompt;
 mod rails;
 mod remote;
+mod remote_pictures;
 mod reply_buttons;
 mod reply_links;
 mod review_window;
 mod rich_boxes;
 mod rich_window;
+mod row_motion;
+mod row_swipe;
 mod rows;
 mod runner_launcher;
 mod runners_panel;
@@ -76,16 +90,23 @@ mod shell;
 mod shell_blocks;
 mod sidebar;
 mod slash_palette;
+mod slash_resize;
+mod spinner;
 mod style;
+mod swift_import;
+mod swipe_nav;
 mod terminal;
 mod terminal_element;
 mod thread;
+mod tips;
 mod thread_panels;
+mod unsent;
 mod updates_panel;
 mod usage;
 mod viewer;
 mod web_panels;
 mod web_runtime;
+mod window_menu;
 
 use app::Threadbear;
 use gpui_kit::*;
@@ -118,9 +139,42 @@ impl Sink for ChannelSink {
 /// A request on the connection's runtime, awaited from GPUI's.
 pub async fn call(client: Arc<Client>, method: impl Into<String>, params: Value) -> Result<Value, RpcError> {
     let method = method.into();
+    // Local Windows files are opened under the desktop's path guard, once.
+    // A runner resolving the same raw path again can follow a different
+    // link, and a directory listing can stat a child link into an SMB share.
+    #[cfg(windows)]
+    if params["runnerId"].is_null() && matches!(method.as_str(), "files.read" | "files.list") {
+        return RT.spawn_blocking(move || {
+            let result = if method == "files.read" { threadbear_core::local_files::read(&params) } else { threadbear_core::local_files::list(&params) };
+            result.map_err(|e| RpcError { code: -32602, message: e.to_string(), data: None })
+        }).await.unwrap_or_else(|e| Err(RpcError { code: -1, message: e.to_string(), data: None }));
+    }
     RT.spawn(async move { client.call(&method, params).await })
         .await
         .unwrap_or_else(|e| Err(RpcError { code: -1, message: e.to_string(), data: None }))
+}
+
+/// `threads.update` (a rename, a pick, an archive) for a thread: one of this
+/// runner's goes in restart order while it's connected (`inRestartOrder`),
+/// so a pick the restarting runner turns away goes again on the new one,
+/// and nothing made later lands before it. With no connection it waits for
+/// a restarting runner, or fails if none is restarting; another Mac's
+/// thread goes as it is.
+/// Its place in that order is taken as this is called, where the click is
+/// handled, so call it there and await it later, not inside a task.
+pub fn call_for_thread(client: Arc<Client>, remote: bool, method: &'static str, params: Value) -> impl std::future::Future<Output = Result<Value, RpcError>> + 'static {
+    // Connected or not: while a restart's under way it waits for the new
+    // runner in its place, and with none it fails (Codex's review, 12 Nov:
+    // one made while down skipped the queue once the new runner was up).
+    let place = (!remote).then(|| client.place(params["threadId"].as_str().unwrap_or("")));
+    async move {
+        let Some(place) = place else {
+            return call(client, method, params).await;
+        };
+        RT.spawn(async move { client.call_in_restart_order_at(place, method, params, Arc::new(|_| {})).await })
+            .await
+            .unwrap_or_else(|e| Err(RpcError { code: -1, message: e.to_string(), data: None }))
+    }
 }
 
 pub fn now_ms() -> i64 {
@@ -146,9 +200,19 @@ fn initial_bounds(settings: &Settings, cx: &App) -> Bounds<Pixels> {
 }
 
 fn main() {
+    // A build staged while the app last ran, put in place and the new app
+    // opened once this one's gone: before anything else (app_update.rs).
+    if app_update::apply_staged_at_launch() {
+        std::process::exit(0);
+    }
+    // What it was built from, for the runner to tell a thread waiting for
+    // the app to restart (docs/protocol.md, "App restarts").
+    app_update::announce_build();
     // Before anything else, to catch a panic at launch. Only the installed
     // release, and a scripted app into its own folder (crash_reporting.rs).
     crash_reporting::start();
+    // The app's own log (app_log.rs), before the connection's first line.
+    app_log::start();
     // All of Lucide (about 1 MB), so `icons.rs` can name any icon; the default
     // `Assets` has only gpui-kit's own hundred.
     let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
@@ -157,6 +221,8 @@ fn main() {
     let links = deep_links::receive(&application);
     application.run(|cx| {
         gpui_kit::init(cx);
+        // Every window's colours as sRGB, before the first opens (colour_space.rs).
+        colour_space::install(cx);
         // The main thread watched for freezes from here on (hang_watch.rs).
         hang_watch::start(cx);
         // Whether the web runtime is installed; nothing starts until a page needs it.
@@ -165,8 +231,17 @@ fn main() {
         rich_boxes::init(cx);
         // And the panels' pages, the Convex dashboard's among them.
         web_panels::init(cx);
-        let settings = Settings::load();
+        // Videos and PDFs in the system's views: their calls back (a PDF's
+        // links, to the open gate) and the menus they hide under.
+        media_view::init(cx);
+        let mut settings = Settings::load();
+        // The Swift app's settings and drafts, brought across once, before
+        // anything reads them (swift_import.rs).
+        let brought = swift_import::run_once(&mut settings, cx);
         let bounds = initial_bounds(&settings, cx);
+        // Back from an update's restart made while another app was in front:
+        // the window comes back behind it, not taking the keys (app_update.rs).
+        let focus = settings.saved.update_restore.as_ref().is_none_or(|r| r["front"].as_bool() != Some(false));
         let (window, app) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -178,12 +253,19 @@ fn main() {
                 app_owns_titlebar_drag: true,
                 window_min_size: Some(size(px(760.), px(480.))),
                 app_id: Some("threadbear".into()),
+                focus,
                 ..Default::default()
             },
             cx,
             move |window, cx| cx.new(|cx| Threadbear::new(settings, window, cx)),
         )
         .expect("failed to open the window");
+        // Its close quits, and File's and Window's commands reach whichever
+        // window is in front (window_menu.rs).
+        window.update(cx, |_, w, cx| window_menu::install(w, cx)).ok();
         deep_links::listen(links, app.downgrade(), window, cx);
+        if let Some(note) = brought {
+            app.update(cx, |t, cx| t.show_import_note(note, cx));
+        }
     });
 }

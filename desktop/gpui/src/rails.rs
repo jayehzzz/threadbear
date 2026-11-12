@@ -8,15 +8,15 @@ use crate::shell::{self, SidebarMode};
 use crate::style::px;
 use crate::{icons, style};
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{v_flex, ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use threadbear_core::shortcuts::ShortcutCommand;
+use crate::tips::Tip as _;
 
 /// `ActivityBar.width`.
 pub(crate) const BAR_WIDTH: f32 = 44.;
-const BUTTON: f32 = 32.;
+pub(crate) const BUTTON: f32 = 32.;
 
 /// What one button says and does, built fresh each frame.
 pub(crate) struct RailButton {
@@ -29,11 +29,13 @@ pub(crate) struct RailButton {
     pub(crate) dot: bool,
     pub(crate) quiet_dot: bool,
     pub(crate) active: bool,
+    /// Its key, shown beside it while ⌘ is held (key_hints.rs).
+    pub(crate) hint: Option<String>,
 }
 
 impl RailButton {
     fn new(id: impl Into<SharedString>, symbol: &'static str, title: impl Into<String>, active: bool) -> Self {
-        Self { id: id.into(), symbol, face: None, tip: title.into(), badge: None, dot: false, quiet_dot: false, active }
+        Self { id: id.into(), symbol, face: None, tip: title.into(), badge: None, dot: false, quiet_dot: false, active, hint: None }
     }
 }
 
@@ -49,6 +51,7 @@ fn rail_button(button: RailButton, on_click: impl Fn(&mut Threadbear, &mut Windo
     let color = if button.active { fg } else { secondary };
     let (tip_text, label): (SharedString, SharedString) = (button.tip.clone().into(), button.tip.into());
     let tip_for_tooltip = tip_text.clone();
+    let badge_key = button.id.clone();
     let mut el = div()
         .id(button.id)
         .relative()
@@ -63,15 +66,16 @@ fn rail_button(button: RailButton, on_click: impl Fn(&mut Threadbear, &mut Windo
         .when(!button.active, |s| s.hover(move |h| h.bg(hover_fill).text_color(fg)))
         .test_support()
         .aria_label(label)
-        .tooltip(move |window, cx| Tooltip::new(tip_for_tooltip.clone()).build(window, cx))
+        .tip(tip_for_tooltip.clone())
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)))
         .child(match button.face {
             Some(face) => face,
             None => icons::symbol(button.symbol).with_size(px(15.)).into_any_element(),
         });
     if let Some(badge) = button.badge.filter(|b| *b > 0) {
-        // Grey, not accent: a count of what's there, not an alarm.
-        let text = if badge > 99 { "99+".to_string() } else { badge.to_string() };
+        // Grey, not accent: a count of what's there, not an alarm. It rolls
+        // to a new number (row_motion.rs), as the Swift badge does.
+        let text = crate::row_motion::rolling(&format!("rail-{}", badge_key), badge, 12., cx.reduce_motion(), |n| div().child(if n > 99 { "99+".to_string() } else { n.to_string() }).into_any_element());
         el = el.child(
             div()
                 .absolute()
@@ -95,7 +99,8 @@ fn rail_button(button: RailButton, on_click: impl Fn(&mut Threadbear, &mut Windo
     } else if button.dot || button.quiet_dot {
         el = el.child(div().absolute().top(px(1.)).right(px(1.)).size(px(7.)).rounded_full().bg(dot_color).border_1().border_color(background));
     }
-    el.into_any_element()
+    // Its key to the right while ⌘ is held (`shortcutHint(_, .after)`).
+    el.children(crate::key_hints::hint(button.hint, crate::key_hints::Placement::After)).into_any_element()
 }
 
 impl Threadbear {
@@ -104,6 +109,11 @@ impl Threadbear {
             Some(key) => format!("{title} ({})", key.display()),
             None => title.to_string(),
         }
+    }
+
+    /// A command's key as the menus show it ("⌘1"), if it has one.
+    pub(crate) fn shortcut_display(&self, command: ShortcutCommand) -> Option<String> {
+        self.shortcuts.key(command).map(|k| k.display())
     }
 
     /// The Inbox's thread count, for the Threads button's badge.
@@ -130,12 +140,13 @@ impl Threadbear {
     }
 
     /// The column down the left (`ActivityBar`).
-    pub(crate) fn render_activity_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_activity_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let inbox_count = self.inbox_count(cx);
         let mut views = vec![];
         let mode = self.mode;
         let mut button = RailButton::new("rail-threads", "bubble.left.and.bubble.right", "Threads", mode == SidebarMode::Inbox);
         button.tip = self.shortcut_tip("Threads", ShortcutCommand::ShowInbox);
+        button.hint = self.shortcut_display(ShortcutCommand::ShowInbox);
         button.badge = Some(inbox_count);
         views.push(rail_button(button, |this, _, cx| {
             this.unfold_threads(cx);
@@ -144,26 +155,41 @@ impl Threadbear {
         if self.schedules_supported {
             let mut button = RailButton::new("rail-scheduled", "clock", "Scheduled", mode == SidebarMode::Scheduled);
             button.tip = self.shortcut_tip("Scheduled", ShortcutCommand::ShowScheduled);
+            button.hint = self.shortcut_display(ShortcutCommand::ShowScheduled);
             button.badge = Some(self.scheduled.active_count());
-            views.push(rail_button(button, |this, _, cx| {
+            views.push(rail_button(button, |this, window, cx| {
                 this.unfold_threads(cx);
-                this.set_mode(SidebarMode::Scheduled, cx)
+                this.set_mode(SidebarMode::Scheduled, cx);
+                // Its page takes the thread's place, and the list the
+                // keyboard, so Esc there goes back to the Inbox.
+                window.focus(&this.sidebar.focus, cx);
+                crate::web_panels::keyboard_to_app(window);
             }, cx));
         }
         if self.projects_supported {
             let mut button = RailButton::new("rail-projects", "square.stack.3d.up", "Projects", mode == SidebarMode::Projects);
             button.tip = self.shortcut_tip("Projects", ShortcutCommand::ShowProjects);
-            views.push(rail_button(button, |this, _, cx| {
+            button.hint = self.shortcut_display(ShortcutCommand::ShowProjects);
+            views.push(rail_button(button, |this, window, cx| {
                 this.unfold_threads(cx);
-                this.set_mode(SidebarMode::Projects, cx)
+                this.set_mode(SidebarMode::Projects, cx);
+                // Its page takes the thread's place, and the list the
+                // keyboard, so Esc there goes back to the Inbox.
+                window.focus(&this.sidebar.focus, cx);
+                crate::web_panels::keyboard_to_app(window);
             }, cx));
             let mut button = RailButton::new("rail-librarian", "books.vertical", "Librarian", mode == SidebarMode::Librarian);
             button.tip = self.shortcut_tip("Librarian", ShortcutCommand::ShowLibrarian);
+            button.hint = self.shortcut_display(ShortcutCommand::ShowLibrarian);
             // The look under way and the ones waiting (`pendingCount`).
             button.badge = self.librarian.status.as_ref().map(|s| s.pending_count());
-            views.push(rail_button(button, |this, _, cx| {
+            views.push(rail_button(button, |this, window, cx| {
                 this.unfold_threads(cx);
-                this.set_mode(SidebarMode::Librarian, cx)
+                this.set_mode(SidebarMode::Librarian, cx);
+                // Its page takes the thread's place, and the list the
+                // keyboard, so Esc there goes back to the Inbox.
+                window.focus(&this.sidebar.focus, cx);
+                crate::web_panels::keyboard_to_app(window);
             }, cx));
         }
         // Connectors, Runners and Updates at the foot (activity_panels.rs),
@@ -189,7 +215,9 @@ impl Threadbear {
         let mut button = RailButton::new("rail-updates", "arrow.down.circle", self.updates_tooltip(), self.activity_panel_showing(shell::UPDATES, cx));
         button.dot = self.updates_dot();
         button.quiet_dot = self.updates_quiet_dot();
-        foot.push(rail_button(button, |this, _, cx| this.toggle_under_threads(shell::UPDATES, cx), cx));
+        let updates = rail_button(button, |this, _, cx| this.toggle_under_threads(shell::UPDATES, cx), cx);
+        // Right-click: the app's update in a popover (updates_panel.rs).
+        foot.push(self.with_update_popover(updates, window, cx));
         // Usage, as a honey pot filled to the room the next thread would get,
         // its tooltip each pool's best room (usage.rs). Toggles its panel
         // under the threads, as VS Code's bar does its views.
@@ -201,6 +229,7 @@ impl Threadbear {
         let usage = rail_button(button, |this, _, cx| this.toggle_under_threads(shell::USAGE, cx), cx);
         let mut button = RailButton::new("rail-settings", "gearshape", "Settings", false);
         button.tip = self.shortcut_tip("Settings", ShortcutCommand::Settings);
+        button.hint = self.shortcut_display(ShortcutCommand::Settings);
         let settings = rail_button(button, |this, window, cx| this.run_command(shell::Command::Settings, window, cx), cx);
         let hairline = cx.theme().border;
         div()

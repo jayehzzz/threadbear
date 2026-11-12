@@ -36,7 +36,10 @@ sort it newest first or oldest first instead, which is handy for working
 through a long inbox from the bottom up. ⌥⌘↓ (Go > Next Inbox Thread)
 opens the thread below the open one in the Inbox, or the Inbox's first if
 the open one is somewhere else; past the last one, a note says you're
-caught up. When your threads pass 100, and each thousand after (archived ones
+caught up. Once you've clicked the list, the up and down arrows move through
+the threads, and Esc in the Scheduled, Projects or Librarian view goes back
+to the Inbox. The list scrolls to keep the open thread's row in sight,
+whether you got there by the arrows, ⌥⌘↓ or a thread named in a reply. When your threads pass 100, and each thousand after (archived ones
 count), a note says so once, the next time you're at the app. Running holds threads whose agent is
 working now. A thread that
 asks you something keeps its place in the inbox, wake-up or not, and so does
@@ -228,6 +231,8 @@ the small picture in the corner to jump to a part. Pinching out, ⌘0, Esc or a
 double-click goes back to the whole thing, and ⌘+ and ⌘- zoom too. Tick as
 many as you like, or None if none of them will do, write what you think in
 the box at the bottom, and Send takes it all back to the thread.
+Pasting with the keyboard outside the reply box puts the words in it and moves
+the cursor there, so you can dictate just after ticking an option.
 
 Inside a thread, rest the pointer on a link for a moment, in a reply or on a
 Needs you card's buttons, to see where it goes: a picture of the file, or
@@ -244,6 +249,15 @@ naming the app, on the Mac and the phone, and so does a file that isn't a
 plain document (a `.command`, an app, a kind Threadbear can't place).
 Another Mac's program never opens here, and its replies never show
 pictures from this Mac.
+
+On Windows, file links and their hover cards only read local drives. A UNC
+share, mapped network drive or device path is refused, including through a
+local symbolic link or junction. A local link to another local file works.
+WSL's `\\wsl$` and `\\wsl.localhost` paths count as shares too.
+Files on ordinary disk and CD/DVD volumes work; third-party virtual drives
+such as VeraCrypt and RAM disks are refused until the app can verify them.
+An open Terminal shell holds off an automatic update restart on Windows:
+the app cannot yet tell whether PowerShell is waiting or running a command.
 
 The Browser panel, the globe on a thread's right-hand rail, lists the pages a
 thread's agents have open through [BrowserBear](https://github.com/mikecann/browserbear):
@@ -449,7 +463,8 @@ thread's outlined while it'll take it, and the file goes in where the cursor is.
 So "this one [Picture 1] should look like this one [Picture 2]" says which
 is which. The thumbnails show over the text too; the cross on one takes it
 and its chip out. Hover a chip to see its picture, in the composer or once
-it's sent; in the thread, clicking one opens the picture in Quick Look.
+it's sent. Click a chip or a thumbnail, in the composer or in the thread,
+to open the picture, with the arrows to step through the others.
 Any other file you paste or drop in (a video, a PDF, a folder) goes in as
 its full path where you drop it, for the agent to open where it is.
 Nothing's copied, so a big one is fine.
@@ -692,8 +707,10 @@ clear the first. If something is already running in that shell (or the
 shell has become another program, as `exec ssh` does), or you've typed on
 its prompt, nothing gets added: the command goes on the clipboard and a
 bubble says so (a shell without bracketed paste, like macOS's old bash,
-always copies). Pasting lines into a shell like that asks first, as each
-line would run as soon as it arrived. Play isn't there on a thread
+always copies). Pasting lines (or a Tab) into a shell like that asks
+first, as each line would run as soon as it arrived. A paste leaves out control
+characters (anything but Tab and line breaks), so copied text with a
+hidden one in it can't run itself. Play isn't there on a thread
 on another Mac or the cloud, or an archived one, as this Mac's shell
 wouldn't be in the right place; Copy still is. Nor is it on a thread open
 in a panel of its own, as the Terminal shows the main panel's thread's
@@ -896,8 +913,10 @@ something slow like Slack. What a check prints is kept until a run
 carrying it has been sent, so a runner restart in between doesn't lose it.
 Ask a thread to "only run when there's something new" and it writes the
 check. Run now skips it. It's bound to what it runs: if a script it
-reaches changes, it doesn't run until the same check is passed to the
-schedule again, and the thread is told once.
+reaches changes, or you move the schedule to another folder, it doesn't
+run until the same check is passed to the schedule again (ask a thread to
+pass it), and the thread is told once. Changing a schedule's words, time or
+folder in the app never approves its check.
 
 If you run Threadbear on more than one Mac (or on a Linux server as well,
 INSTALL.md section 6), a schedule that starts a new
@@ -927,8 +946,15 @@ to make here and how). To add a Mac, give it a key of its own from this one: `tb
 add <name> --ssh <that Mac>` writes it there, and its runner uses it from
 its next restart. Set that Mac up with `./threadbear setup --existing`, which
 leaves out the Convex login and deploy key (either could do anything to your
-backend) and ends by telling you to run that command; `tb runner check` there
-says if an older setup left them behind.
+backend) and ends by telling you to run that command, with that Mac's
+`<user>@<name>.local`. It needs Remote Login on there (System Settings >
+General > Sharing; setup says if it's off), and ssh from this Mac that asks
+nothing: trust its host key once by hand (setup says how to check its
+fingerprint) and `ssh-copy-id` it if it wants a password. If ssh fails,
+`tb runner add` says which of those it was. `tb runner check` there says if
+an older setup or an earlier `npx convex login` left a deploy key or Convex
+login behind. Revoke and remove them, then rotate the main key unless that
+Mac has only just joined, never had the main key and has run no threads yet.
 That key only reaches its own Mac's threads, schedules and Pocket cards: it
 can't pair a phone or put a schedule on another Mac, and that Mac's app
 doesn't list the other Macs' threads. Only the first Mac's key can. A new
@@ -975,6 +1001,28 @@ The figures come every 10 seconds while the details are open and the
 window can be seen; a runner too old to send them says so. The runners are
 in your order, the same as in Settings > Runners and on the phone: drag one
 to change it.
+
+A thread can move to another of your machines whole: the same thread, with
+its whole conversation, its pictures and Highlights, and the git work in
+its own worktree (commits and uncommitted changes alike). Right-click it
+(or use its **...** menu) and pick **Move to**, then the machine; offline
+ones are greyed. It waits for the turn it's on to end, and its message box
+and any open card are locked until it lands or you cancel; a message sent
+from your phone meanwhile goes with it. It goes straight away, to the
+folder and login that machine guesses. If it can't go, or something won't
+come (background jobs, changes in a checkout other threads share), a small
+window shows the folder and login with why; change either and it checks
+again, then press **Move**. The row says "Moving to" with a spinner until
+it's gone, then the thread is listed under the other machine, in the same
+place and still open, and its next message carries on in the same Claude
+session there. If anything goes wrong before it lands, it stays where it
+was and the row says why for a minute, in its tooltip. Its schedules come
+too, but not a schedule's shell check or the thread's "Always allow"
+answers: set those again on the new machine. A thread moved to your main
+Mac arrives asking before tools run, even if it had Full access or Auto
+there. Agents can do the same with `move_thread` and a `runner`, and
+`tb move <thread> --to <machine>` (`--preview` to see where it would go).
+Moves are started from your first Mac and need Threadbear's backend.
 
 ## Accounts, pools and Usage
 <!-- slug: accounts -->
@@ -1054,7 +1102,9 @@ new installs still default Small jobs to the Claude pool.
 Logins are grouped into pools, one for Claude and one for Codex to begin
 with (Settings > Pools). A new thread in a pool starts on the login with room whose
 weekly limit resets soonest, so a week's leftover gets spent before it's
-lost rather than draining the login with the most room. When the one it's on gets close to its limit, it moves to
+lost rather than draining the login with the most room. A login is used
+until it's all but out (under 1% left), so none of a week goes to waste. When
+the one it's on runs out, before a turn or partway through one, it moves to
 another login in the pool with room, and carries on from where it was. When
 none has room, the thread waits and carries on by itself once a limit
 resets. With only one login, that means it waits for that login's limit to
@@ -1069,7 +1119,11 @@ With more than one machine, they all share the same pools, so you set them
 up once from Settings > Pools on any of them. A pool knows its logins by
 email, and each machine uses the ones it's signed in to: a pool of three
 Claude logins is just one on a server signed in to one of them, and a pool
-none of its logins are in doesn't show there. A login signed in on several
+none of its logins are in doesn't show there. Two logins on one machine
+signed in to the same account (two config folders, say) are told apart
+there by which login you picked, and Settings > Pools shows the login's
+note or id beside the email; other machines still match them by email.
+`tb accounts` says when two logins share an email. A login signed in on several
 machines is one subscription, so each machine shows the newest reading of
 its room from your first Mac, and one that hit its limit there waits on
 the others too. A Mac with a key of its own gets your first Mac's readings of only the
@@ -1122,9 +1176,10 @@ verdict: a list of concrete findings, or nothing that holds up. Then your
 thread wakes with them numbered, and it can't finish until it has answered
 each one: fixed, disputed (saying why), or left for you to decide, which
 comes to you as a question. Anything it fixed gets reviewed again, just the
-new change, until a round finds nothing. The done card shows who reviewed,
-how it came out, and each finding with what was done about it; the line
-over them opens the review thread. The review thread is archived when it's
+new change, until a round finds nothing. A quiet line in the thread, over
+the reply, shows who reviewed and how it came out, with each finding and
+what was done about it under it; the line opens the review thread. It
+stays off the done card, as it happens in the background. The review thread is archived when it's
 done, so it stays out of your inbox. A thread gets at most three reviews
 between your messages, and if the last one's fixes weren't looked at, the
 card says so. For now the findings only show on the Mac whose runner ran
@@ -1223,6 +1278,12 @@ In the file, a key is its modifiers and then the key, joined with `+`: `cmd`,
 `ctrl`, `opt` and `shift`, then a character, or `down`, `up`, `left`, `right`,
 `return`, `tab`, `space`, `delete`, `home`, `end`, `pageup`, `pagedown` or `f1`
 to `f20`.
+
+The rest are every Mac app's own and can't be changed: the Edit menu's (⌘Z,
+⇧⌘Z, ⌘X, ⌘C, ⌘V, ⌘A, with Start Dictation and Emoji & Symbols under them),
+⌘W to close the window in front, ⌘M to minimize it, ⌃⌘F for full screen, and
+⌘H and ⌥⌘H to hide. In Settings, the up and down arrows move through its
+sections.
 
 ## Experiments
 <!-- slug: experiments -->
@@ -1658,7 +1719,8 @@ and each one scrolls when it's taller than the window. Drag the window wider
 or taller for more room.
 
 When something goes wrong, the app says so in an orange bar at the top of
-the thread. Investigate on that bar starts a thread in your Threadbear
+the thread, and the runner's own warnings show there too (a message it
+couldn't start, an update to `main` that failed). Investigate on that bar starts a thread in your Threadbear
 folder with the error, the thread it came up in, what you were doing and
 which versions you're on, and asks it to find the cause and fix it. The new
 thread opens and the bar goes once it's made.
@@ -1673,8 +1735,10 @@ while it does: the new version opens the same thread underneath and takes
 over, so you shouldn't see it go.
 
 Whatever's typed in a message box and not sent is kept through a quit or a
-restart. A message you send while the runner is restarting waits under its
-bubble and goes once the new one is up. If one can't be sent, its words go
+restart. While a runner restart waits for threads to finish, a quiet line at
+the top says how many it's waiting for, and hovering it names them. A message
+you send while the runner is restarting waits under its bubble and goes once
+the new one is up. If one can't be sent, its words go
 back in that thread's box and a note above the thread says which thread,
 until you dismiss it.
 
@@ -1682,6 +1746,24 @@ A runner update lets a job a thread left running in the background finish, for
 up to about 4 hours after the thread's last turn. If one goes on longer it's
 stopped, and the thread gets told and wakes by itself to check on it, so you'll
 see it pick back up rather than go quiet.
+
+The new desktop app (the `gpuiApp` experiment) follows `main` too, from the
+checkout you installed it from. Its build takes every core of a Mac for
+minutes, so it builds on one of your check hosts (`checkHosts` in
+`runner.json`) and only the finished app comes back. With none set it
+builds on this Mac in the background, and with them set but none
+answering, its Updates panel says it's waiting for a Mac and it tries again
+later. The new version goes in when you quit it, when you choose Restart to
+Update in its app menu or Updates panel, or by itself once nothing's typed
+and nothing's open that a restart would close (a menu, a dialog, a drag, a
+field you're typing in another of its windows, a Terminal shell running
+something or with words at its prompt, a web panel you've used in the last
+minute): straight away while you're in another app, and with it in front
+once you haven't touched the Mac for five seconds. "Typed" is any box: a
+message, a card's own answer, a project's goals being edited, a picture
+still coming in. It opens again on the list and the thread you had, behind
+the app you're in if that's where you were. It has no handover yet, so its
+window goes for a moment and comes back.
 
 The Updates icon on the left-hand rail shows what's on its way for the app,
 the runner and the Claude Code and Codex tools. A grey dot means something
@@ -1714,6 +1796,17 @@ nothing from the release before you answer. There's only ever one; if you leave 
 a newer release goes into the same thread. A release Mike marks important
 (a security or data fix) starts one straight away. Change how often, or
 turn it off, in Settings (⌘,) > General > Updates from Mike.
+
+### Moving to the new desktop app
+
+The first time the new desktop app (the `gpuiApp` experiment) opens, it
+brings across what the Mac app remembers: the zoom, folded sections, the
+Inbox's order, the appearance, the panel layout, where the window was, the
+ding, Ask before quitting, the activity log switch, what a click on a link
+does, how files and folders show, and anything typed in a message box and
+not sent. It only fills in what it hasn't got of its own, does it once, and
+a note at the top says what came across. The tour and Finish setting up
+aren't in it yet: its Help menu says so.
 
 ### Light and dark
 
@@ -1748,7 +1841,9 @@ title in it). An agent reads it with `tb activity`, or
 It's off until you turn it on. It's kept in the `activity` folder of
 Threadbear's data folder, a file a day, and each file is deleted after 30
 days. Threadbear never sends it anywhere, though once an agent has read
-some of it, that's part of its thread like anything else it reads.
+some of it, that's part of its thread like anything else it reads. The new
+desktop app (the `gpuiApp` experiment) keeps the same log in the same files,
+with its own switch in its Settings, and marks its lines as its own.
 
 ### Keeping the Mac awake
 
@@ -1800,7 +1895,8 @@ you turn it on, and it stays on your Mac.
   its version, the threads that are busy, and any restart or update on the
   way.
 - `threadbear` in Terminal opens the app, and quitting it with ⌘Q is always
-  safe, since your threads keep running without it. Quit asks first, with
+  safe, since your threads keep running without it. Closing its window
+  (⌘W or the red button) quits it too, without asking. Quit asks first, with
   a Don't ask again box; Settings > General > Quitting turns asking back
   on. If the app says it can't reach the runner, click Start runner.
 - Threadbear > About Threadbear says which commit your copy was built from,

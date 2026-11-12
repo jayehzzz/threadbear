@@ -331,16 +331,20 @@ fn control_code(c: char) -> Option<u8> {
 
 /// A paste, as a terminal sends it: line breaks as Return, inside the brackets
 /// when the program asked for them (bracketed paste), so a newline in it runs
-/// nothing. Inside the brackets nothing may end them early: any ESC goes, as a
-/// pasted `ESC [ 201 ~` would let what follows run by itself. Without them
-/// every control character but Tab and Return goes too: each would be a key
-/// pressed (^C, ^D, ^U, an ESC that starts a vim command), not text.
+/// nothing. Every control character but Tab and Return goes, brackets or not.
+/// Without them each would be a key pressed (^C, ^D, ^U, an ESC that starts a
+/// vim command), not text. Inside them an ESC could end them early (a pasted
+/// `ESC [ 201 ~` lets what follows run by itself), and the rest never reach
+/// the program as text anyway: the pty's own line discipline takes ^C, ^\, ^Z,
+/// ^S and ^Q as signals before the shell sees the brackets, so a pasted ^\
+/// quits bash's paste half way and the line break after it runs the command
+/// (Daybreak, 11 Nov). C1 controls (U+0080 to U+009F, U+009B being CSI) go too.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let text = text.replace("\r\n", "\r").replace('\n', "\r");
+    let inner: String = text.chars().filter(|c| !c.is_control() || matches!(c, '\t' | '\r')).collect();
     if !bracketed {
-        return text.chars().filter(|c| !c.is_control() || matches!(c, '\t' | '\r')).collect::<String>().into_bytes();
+        return inner.into_bytes();
     }
-    let inner: String = text.chars().filter(|c| *c != '\u{1b}' && *c != '\u{9b}').collect();
     [b"\x1b[200~".as_slice(), inner.as_bytes(), b"\x1b[201~".as_slice()].concat()
 }
 
@@ -350,9 +354,11 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// which never asks for brackets, and any program that hasn't (Codex's review,
 /// 11 Nov: a shell block copied when the Terminal was busy, pasted there
 /// later, ran its first lines). So the app asks first, as Windows Terminal
-/// and iTerm do.
+/// and iTerm do. A Tab is asked about too: it's the Tab key there, and zsh's
+/// completion with bracketed paste off expands a `$(...)` before it, which
+/// runs it (Codex's review of the paste fix, 11 Nov).
 pub fn paste_runs(text: &str) -> bool {
-    text.contains(['\n', '\r'])
+    text.contains(['\n', '\r', '\t'])
 }
 
 /// Text that arrives all at once, from an input method or a text expander,
@@ -366,6 +372,9 @@ pub fn is_bulk_text(text: &str) -> bool {
 pub fn paste_question(text: &str) -> (String, &'static str) {
     let lines = text.lines().count().max(1);
     let title = if lines == 1 { "Paste this line?".to_owned() } else { format!("Paste {lines} lines?") };
+    if !text.contains(['\n', '\r']) {
+        return (title, "The program in this terminal will take each Tab in it as the Tab key, which a shell can use to complete or expand what's before it.");
+    }
     (title, "The program in this terminal will take each line break as Return, so at a shell's prompt each line runs as soon as it's pasted.")
 }
 
@@ -593,6 +602,15 @@ pub enum Step {
     Busy,
 }
 
+/// Whether a shell's terminal has something a restart would lose, as quitting
+/// ends every shell: a program running (a command still going, vim with its
+/// buffer, ssh), or anything typed at the prompt, put there or edited
+/// (Codex's review, 12 Nov). An idle shell at an empty prompt, or one that's
+/// ended, has nothing.
+pub fn holds_a_restart(running: bool, shell_alone_in_front: bool, line: &Line) -> bool {
+    running && (!shell_alone_in_front || *line != Line::Empty)
+}
+
 /// How long a new shell may take to reach its first prompt, after which it's
 /// treated as busy and the command is copied.
 pub const STARTING_FOR_SECS: f64 = 10.;
@@ -808,6 +826,18 @@ mod tests {
     }
 
     #[test]
+    fn a_shell_holds_a_restart_while_busy_or_typed_in() {
+        // Idle at an empty prompt, or ended: nothing to lose.
+        assert!(!holds_a_restart(true, true, &Line::Empty));
+        assert!(!holds_a_restart(false, false, &Line::Edited));
+        // A command running, vim, ssh: the shell isn't the one in front.
+        assert!(holds_a_restart(true, false, &Line::Empty));
+        // Words at the prompt, typed or put there from a reply.
+        assert!(holds_a_restart(true, true, &Line::Edited));
+        assert!(holds_a_restart(true, true, &Line::Put("ls".into())));
+    }
+
+    #[test]
     fn a_thread_gets_its_own_shell_in_its_folder() {
         let t = thread("t1", "/work/repo");
         let target = target_for(Some(&t), "/Users/me", None, |_| true);
@@ -983,6 +1013,23 @@ mod tests {
         assert_eq!(paste_bytes("echo\x1b[201~\nrm -rf ~", true), b"\x1b[200~echo[201~\rrm -rf ~\x1b[201~");
     }
 
+    /// Daybreak's finding 84: inside the brackets a ^\\ (or ^C, ^Z) is still a
+    /// signal to the pty, which flushes the opening bracket, so the line break
+    /// after it ran the command. Every control but Tab and Return goes, C0,
+    /// DEL and C1 alike; tests/paste_pty.rs plays it against a real bash.
+    #[test]
+    fn a_bracketed_paste_has_no_control_characters_in_it() {
+        assert_eq!(
+            paste_bytes("\u{1c}printf \"TB_%s_RAN\\n\" PASTE\n", true),
+            b"\x1b[200~printf \"TB_%s_RAN\\n\" PASTE\r\x1b[201~"
+        );
+        let every: String = (0u32..0x20).chain(0x7f..0xa0).filter_map(char::from_u32).collect();
+        assert_eq!(paste_bytes(&format!("a{every}b"), true), b"\x1b[200~a\t\r\rb\x1b[201~");
+        assert_eq!(paste_bytes(&format!("a{every}b"), false), b"a\t\r\rb");
+        // Text that isn't control stays as it is, either way.
+        assert_eq!(paste_bytes("caf\u{e9} \u{65e5}\u{672c} \u{1f43b}", true), "\x1b[200~caf\u{e9} \u{65e5}\u{672c} \u{1f43b}\x1b[201~".as_bytes());
+    }
+
     #[test]
     fn mouse_reports() {
         assert_eq!(mouse_report(MouseButton::Left, true, false, 0, 0, false, false, false, true).unwrap(), b"\x1b[<0;1;1M");
@@ -1103,6 +1150,9 @@ mod tests {
         assert!(!paste_runs("echo one"));
         assert!(paste_runs("touch /tmp/x\n"));
         assert!(paste_runs("a\rb"));
+        assert!(paste_runs("echo $(touch /tmp/x)\t"), "a Tab is the Tab key without brackets");
+        assert!(paste_question("ls\t").1.contains("Tab"));
+        assert!(paste_question("ls\n").1.contains("Return"));
         assert_eq!(paste_question("a\nb\n").0, "Paste 2 lines?");
         assert_eq!(paste_question("ls\n").0, "Paste this line?");
     }

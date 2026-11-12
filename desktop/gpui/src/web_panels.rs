@@ -136,6 +136,39 @@ fn panels(cx: &App) -> Option<Entity<WebPanels>> {
     cx.try_global::<Shared>().map(|s| s.0.clone())
 }
 
+thread_local! {
+    /// Each page's count of clicks and keys when last asked, and when it
+    /// last changed, by its key (`holds_a_restart`).
+    static USED: std::cell::RefCell<HashMap<String, (u64, Option<std::time::Instant>)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Whether a web panel's page holds an update's restart off: what's typed
+/// in a page can't be read from here, so one with the keyboard, or clicked
+/// or typed in within the last minute, counts as being typed in (core's
+/// `web_page_holds`). Asked once a second (app_update.rs).
+pub(crate) fn holds_a_restart(cx: &App) -> bool {
+    let Some(panels) = panels(cx) else { return false };
+    let now = std::time::Instant::now();
+    USED.with(|used| {
+        let mut used = used.borrow_mut();
+        let pages = &panels.read(cx).pages;
+        used.retain(|key, _| pages.iter().any(|k| &k.key == key));
+        let mut holds = false;
+        for kept in pages {
+            let count = kept.page.input_count();
+            // A page first seen here hasn't been used since: only a change
+            // in its count from here on counts.
+            let seen = used.entry(kept.key.clone()).or_insert((count, None));
+            if seen.0 != count {
+                *seen = (count, Some(now));
+            }
+            let ago = seen.1.map(|at| now.duration_since(at).as_secs_f64());
+            holds |= threadbear_core::app_update::web_page_holds(kept.page.has_keyboard(), ago);
+        }
+        holds
+    })
+}
+
 /// ⌘C, ⌘X, ⌘V, ⌘A, ⌘Z and ⇧⌘Z while a page has the keyboard: that page's
 /// own Edit command, as the Swift app's Edit menu sends copy: to its web
 /// view. GPUI's view sees key equivalents before the page does (it answers
@@ -185,7 +218,50 @@ pub(crate) fn sweeper(menu_at: Option<Point<Pixels>>, popover: bool) -> AnyEleme
         f.set(f.get() + 1);
         f.get()
     });
-    canvas(move |_, window, cx| sweep(frame, menu_at, popover, window, cx), |_, _, _, _| {}).absolute().size_0().into_any_element()
+    canvas(
+        move |_, window, cx| sweep(frame, menu_at, popover, window, cx),
+        |_, _, window, _| {
+            // A press anywhere GPUI draws is one outside every page (a page's
+            // own view takes the presses over it), so the keyboard comes back
+            // from a page that had it, as a click in another view takes it in
+            // any Mac app. GPUI's view never asks for it on a click itself.
+            window.on_mouse_event(|_: &MouseDownEvent, phase, window, _| {
+                if phase.capture() && threadbear_web::keyboard_holder(native_view(window).unwrap_or(std::ptr::null_mut())) == threadbear_web::KeyboardHolder::Page {
+                    keyboard_to_app(window);
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+    .into_any_element()
+}
+
+/// Gives GPUI's view its window's keyboard. Called wherever the app asks GPUI
+/// to focus something, at that moment: AppKit's keyboard follows GPUI's focus
+/// as the Swift app's makeFirstResponder does, even when it's the same box
+/// again (a picture dropped on the composer while a page had the keyboard),
+/// and a page clicked after the request keeps it. GPUI's view never takes it
+/// back by itself. `focus_requests_take_the_keyboard` checks every request
+/// does this.
+pub(crate) fn keyboard_to_app(window: &Window) {
+    if let Some(view) = native_view(window) {
+        threadbear_web::take_keyboard(view);
+    }
+}
+
+/// The automation's `native-keys`: `text` typed through AppKit, so the keys
+/// go wherever AppKit sends a person's (`keyboard` in the dump).
+pub(crate) fn send_keys(window: AnyWindowHandle, text: &str, cx: &mut AsyncApp) -> Result<(), String> {
+    let view = cx.update_window(window, |_, window, _| native_view(window).map(|v| v as usize)).map_err(|e| e.to_string())?.ok_or("the window has no view")?;
+    threadbear_web::send_keys(view as *mut c_void, text);
+    Ok(())
+}
+
+/// Who has the main window's keyboard, for the dump: "app" (GPUI's own
+/// view), "page", "hidden page", "window" (nobody) or "other".
+pub(crate) fn keyboard_dump(window: &Window) -> Value {
+    json!(threadbear_web::keyboard_holder(native_view(window).unwrap_or(std::ptr::null_mut())).name())
 }
 
 fn sweep(frame: u64, menu_at: Option<Point<Pixels>>, popover: bool, window: &mut Window, cx: &mut App) {
@@ -209,6 +285,16 @@ fn sweep(frame: u64, menu_at: Option<Point<Pixels>>, popover: bool, window: &mut
     }
     if panels.read(cx).covered != covered_any {
         panels.update(cx, |p, _| p.covered = covered_any);
+    }
+    // A page's view that had the keyboard and went out of sight (⌘N's
+    // new-thread page, another thread, a menu over it) leaves it with the
+    // window itself, which beeps at every letter while GPUI draws its caret
+    // and ⌘V still reaches GPUI (Mike, 12 Nov, a dictated paste and then
+    // nothing he typed; features/tools/real-typing.ts plays it with real keys).
+    use threadbear_web::KeyboardHolder;
+    let holder = threadbear_web::keyboard_holder(native_view(window).unwrap_or(std::ptr::null_mut()));
+    if matches!(holder, KeyboardHolder::HiddenPage | KeyboardHolder::Window | KeyboardHolder::Other) {
+        keyboard_to_app(window);
     }
 }
 
@@ -303,6 +389,25 @@ impl WebPanels {
         }
         self.pages.retain(|k| k.key != key);
         self.failed.remove(key);
+    }
+}
+
+/// show_panel's `reload` (`reloadRequested`): a url panel's page back to
+/// its own address, so what the agent just changed is what Mike sees (the
+/// app closes a preview opened over it). A page not made yet loads fresh
+/// when it's drawn, so there's nothing to do for it.
+pub(crate) fn reload_requested(thread: &ThreadSummary, panel_id: &str, cx: &mut App) {
+    let Some(panel) = thread.panels().into_iter().find(|p| p.id == panel_id && p.kind == "url") else { return };
+    let Some(panels) = panels(cx) else { return };
+    let key = match &panel.convex {
+        Some(configured) => format!("convex:{}", panels.read(cx).selected(configured)),
+        None => match panel.url.clone().filter(|u| !u.trim().is_empty()) {
+            Some(url) => url,
+            None => return,
+        },
+    };
+    if let Some(page) = panels.read(cx).page(&key).cloned() {
+        page.reload();
     }
 }
 
@@ -901,8 +1006,9 @@ fn load_selections() -> HashMap<String, String> {
 
 fn save_selections(selections: &HashMap<String, String>) {
     if let Ok(text) = serde_json::to_string_pretty(&Stored { convex_deployments: selections.clone() }) {
-        // Best effort: it's a preference, not data.
-        let _ = std::fs::write(store_path(), text);
+        // Best effort: it's a preference, not data. Written whole, and only
+        // this user's, as everything in the data folder is.
+        let _ = threadbear_core::private_file::write(&store_path(), text.as_bytes());
     }
 }
 
@@ -1040,12 +1146,14 @@ pub(crate) fn fill_pane_dump(pane: &mut serde_json::Map<String, Value>, thread: 
 
 // ---------------------------------------------------------------- automation
 
-/// `{"cmd":"webPanel","do":"eval"|"click"|"focus"|"wait"|"choose", "key"?, "js"?, "selector"?, "title"?, "deployment"?, "wait"?}`:
+/// `{"cmd":"webPanel","do":"eval"|"click"|"drop"|"focus"|"wait"|"choose", "key"?, "js"?, "selector"?, "times"?, "file"?, "title"?, "deployment"?, "wait"?}`:
 /// a script's way into a panel's page, the one shown last unless `key` names
 /// another. `eval` runs `js` in the page and answers its value; `click`
-/// clicks the element `selector` finds as a person would (a real mouse press
-/// through DevTools' Input domain, so the page sees a user's gesture, which
-/// is what decides whether a link leaves the panel); `focus` gives the page
+/// clicks the element `selector` finds with a person's gesture behind it
+/// (DevTools' `userGesture`, which is what decides whether a link leaves the
+/// panel; `times` clicks again straight after); `drop` drops the file at
+/// `file` on it as the Finder
+/// would; `focus` gives the page
 /// the keyboard, as a click in it does; `wait` waits until it's done loading
 /// (and has `title`, if given). Each answers the page's dump. `choose` picks
 /// `deployment` in the Convex panel that offers it.
@@ -1098,15 +1206,41 @@ pub(crate) async fn automation(cmd: &Value, cx: &mut AsyncApp) -> Result<Value, 
         }
         "click" => {
             let selector = cmd["selector"].as_str().ok_or("click needs selector")?;
-            let find = format!(
-                "(() => {{ const e = document.querySelector({}); if (!e) return null; e.scrollIntoView({{ block: 'center' }}); const r = e.getBoundingClientRect(); return {{ x: r.left + r.width / 2, y: r.top + r.height / 2 }}; }})()",
+            // The element's own click, run with a person's gesture behind it
+            // (DevTools' `userGesture`), which is what the panel's rules go
+            // by. Mouse events posted through DevTools' Input domain went
+            // missing now and then on a busy check host (no new window was
+            // even asked for), and a gesture is all they'd add.
+            let click = format!(
+                "(() => {{ const e = document.querySelector({}); if (!e) return false; e.scrollIntoView({{ block: 'center' }}); e.click(); return true; }})()",
                 serde_json::to_string(selector).unwrap_or_default()
             );
-            let at = page.devtools("Runtime.evaluate", json!({ "expression": find, "returnByValue": true })).await.map_err(|_| "the page went away".to_owned())??;
-            let point = &at["result"]["value"];
-            let (Some(x), Some(y)) = (point["x"].as_f64(), point["y"].as_f64()) else { return Err(format!("nothing in the page matches {selector}")) };
-            for kind in ["mousePressed", "mouseReleased"] {
-                page.devtools("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 })).await.map_err(|_| "the page went away".to_owned())??;
+            // `times`: clicks one straight after another, each a gesture of
+            // its own, as fast as DevTools takes them.
+            for _ in 0..cmd["times"].as_u64().unwrap_or(1).clamp(1, 10) {
+                // Counted as a person's click in the page, as AppKit counts
+                // a real one (LeaveGate).
+                page.note_input();
+                let done = page.devtools("Runtime.evaluate", json!({ "expression": click, "returnByValue": true, "userGesture": true })).await.map_err(|_| "the page went away".to_owned())?;
+                match done {
+                    Ok(done) if done["result"]["value"] != json!(true) => return Err(format!("nothing in the page matches {selector}")),
+                    Ok(_) => {}
+                    // The click took the page somewhere before DevTools could
+                    // answer: it worked.
+                    Err(why) if why.contains("navigated or closed") => {}
+                    Err(why) => return Err(why),
+                }
+            }
+        }
+        // A file from the Finder dropped on the page at (`x`, `y`), through
+        // DevTools' Input domain as a real drop is delivered: `file` is its path.
+        "drop" => {
+            let file = cmd["file"].as_str().ok_or("drop needs file")?;
+            let (x, y) = (cmd["x"].as_f64().unwrap_or(60.), cmd["y"].as_f64().unwrap_or(60.));
+            // Copy, link or move, as the Finder offers.
+            let data = json!({ "items": [], "files": [file], "dragOperationsMask": 1 | 2 | 16 });
+            for kind in ["dragEnter", "dragOver", "drop"] {
+                page.devtools("Input.dispatchDragEvent", json!({ "type": kind, "x": x, "y": y, "data": data })).await.map_err(|_| "the page went away".to_owned())??;
             }
         }
         // The keyboard, as a click in the page gives it. A scripted app's
@@ -1131,7 +1265,7 @@ pub(crate) async fn automation(cmd: &Value, cx: &mut AsyncApp) -> Result<Value, 
                 cx.background_executor().timer(Duration::from_millis(100)).await;
             }
         }
-        other => return Err(format!("do must be eval, click, focus, wait or choose, not {other:?}")),
+        other => return Err(format!("do must be eval, click, drop, focus, wait or choose, not {other:?}")),
     }
     Ok(cx.update(|cx| dump_page(&key, cx)))
 }

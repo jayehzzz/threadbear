@@ -73,7 +73,7 @@ import { SharedPools } from './shared-pools.ts';
 import { sandboxFor } from './sandbox.ts';
 import { readPools } from './pools.ts';
 import { machineSampler } from './runner-stats.ts';
-import { detectMachineIcon } from './machine.ts';
+import { machineIcon } from './machine.ts';
 import { filesMethods } from './files.ts';
 import { devicesMethods } from './devices.ts';
 import { flushSentry, reportException, reportLoggedError, reportLoggedWarning, startSentry } from './sentry.ts';
@@ -88,6 +88,14 @@ import { EFFORT_LEVELS, ErrorCode, RpcError, isPermissionMode, type EffortLevel,
 export const REPORTS_LISTENING = true;
 
 async function main(): Promise<void> {
+  // How long each part of a start takes, said once listening ('started in'),
+  // so a slow restart shows where the time went.
+  const bootSince = performance.now();
+  // Each step's time is ms since main() began; loading the code before it
+  // (Node's start and the imports) is `imports`.
+  const bootSteps: Record<string, number> = {};
+  const bootImports = Math.round(bootSince);
+  const bootStep = (name: string) => (bootSteps[name] = Math.round(performance.now() - bootSince));
   const cfg = loadConfig();
   // A dev runner on a copy of the real data dir (real-copy.ts): whatever
   // came with the copy, it never syncs as Mike's runner (nor relays or
@@ -131,7 +139,9 @@ async function main(): Promise<void> {
   // Waits until the old CLIs are gone, so a resume never runs beside them.
   // A copy's run/ lists the live runner's CLIs: forgotten, never stopped.
   if (copyOfReal) registry.removeFile();
+  bootStep('setup');
   const swept = copyOfReal ? 0 : await registry.sweepOrphans();
+  bootStep('orphans');
   if (swept) log.warn('stopped process groups left from a previous run', { count: swept });
 
   const store = new ThreadStore(cfg.home);
@@ -370,9 +380,12 @@ async function main(): Promise<void> {
       if (n) log.warn('stopped process groups a draining runner left', { pid, count: n });
     },
   });
+  bootStep('before peers');
   const kept = await peers.connectAll();
+  bootStep('peers');
   elsewhere = peersElsewhere(peers);
   runner.start({ skip: kept });
+  bootStep('threads');
   // Answers to ask_secret go after a day (docs/protocol.md, "Secrets").
   runner.secrets.startSweeping((e) => log.warn('secret sweep failed', { error: String(e) }));
   // After the threads are loaded, so a schedule that came due while the
@@ -385,7 +398,8 @@ async function main(): Promise<void> {
   // gives it for this runner too (the app's Runners panel says "up 3h").
   const startedAt = new Date().toISOString();
   // The kind of Mac this is, for its icon in lists (machine.ts).
-  const runnerIcon = cfg.sync.icon ?? (await detectMachineIcon());
+  const runnerIcon = cfg.sync.icon ?? (await machineIcon(paths.run(cfg.home)));
+  bootStep('machine');
   scheduler = new Scheduler({
     runner,
     home: cfg.home,
@@ -538,13 +552,11 @@ async function main(): Promise<void> {
       schedule: ({ scheduleId, action }) => (action === 'run' ? scheduler.runNow(scheduleId) : scheduler.update({ scheduleId, paused: action === 'pause' })),
       // The Mac's Move sheet asking, through the relay (threads.movePreview).
       moveDescribe: async (id) => {
-        if (!experimentOn(cfg.home, 'moveToRunner')) throw new Error(`Moving threads is off on ${cfg.sync.name ?? defaultRunnerName()}: turn on the moveToRunner experiment there.`);
         const info = await describeMovePreview(id);
         if (!info) throw new Error("That thread isn't on this runner.");
         return info;
       },
       movePreview: async (p) => {
-        if (!experimentOn(cfg.home, 'moveToRunner')) throw new Error(`Moving threads is off on ${cfg.sync.name ?? defaultRunnerName()}: turn on the moveToRunner experiment there.`);
         return runner.previewMove({ ...p, self: syncRunnerId });
       },
     },
@@ -820,7 +832,6 @@ async function main(): Promise<void> {
   runner.movedInAtMostAsk = () => Boolean(sync.ownerKey());
   const moves = (movesRef = new Moves({
     self: () => syncRunnerId,
-    on: () => experimentOn(cfg.home, 'moveToRunner'),
     backend: () => sync.movesBackend(),
     log,
     // A move coming here of a thread still on its old runner: its row in
@@ -878,7 +889,6 @@ async function main(): Promise<void> {
   moves.start();
   const startedMoves = new Map<string, string>();
   const moveOn = () => {
-    if (!experimentOn(cfg.home, 'moveToRunner')) throw new RpcError(ErrorCode.badParams, 'Moving threads to another runner is an experiment that is off on this runner.');
     if (!sync.ownerKey()) throw new RpcError(ErrorCode.badParams, "Only the main Mac's runner can move a thread.");
   };
   methods['threads.move'] = async (p) => {
@@ -964,6 +974,7 @@ async function main(): Promise<void> {
   };
   methods['requests.get'] = (p) => cross.get(String(p.threadId ?? ''), String(p.approvalId ?? ''));
   methods['requests.answer'] = (p) => cross.answer(String(p.threadId ?? ''), String(p.approvalId ?? ''), p.allow === true, typeof p.runnerId === 'string' ? p.runnerId : undefined, typeof p.fingerprint === 'string' ? p.fingerprint : undefined);
+  bootStep('services');
   const server = (rpcServer = new RpcServer({
     host: cfg.host,
     port: cfg.port,
@@ -977,7 +988,7 @@ async function main(): Promise<void> {
     gate: new CallerGate({ runner, remote: peers, schedules: scheduler }),
     callerOfPort: (port) => threadOfPort(port, { registry, known: (id) => runner.has(id) || peers.owns(id), log }),
     updates: () => (draining ? undefined : runnerUpdates()),
-    appHello: (build) => appRestarts.appHello(build),
+    appHello: (build, app) => appRestarts.appHello(build, app),
     helloNotices: () => {
       // Like a missing claude: said to every client, until it's there.
       const noCodex = missingCodex(updates.codexBinary(), cfg);
@@ -1006,6 +1017,8 @@ async function main(): Promise<void> {
   }
   recordListening(cfg.home, port, DEFAULT_CWD);
   log.info('runner listening', { url: `ws://${cfg.host}:${port}/rpc` });
+  bootStep('listening');
+  log.info('started in', { imports: bootImports, msSinceStart: bootSteps});
   // Tests read this line to know the runner is up.
   process.stdout.write(`threadbear-runner listening on ${port}\n`);
   tellLaunchListening();
@@ -1030,15 +1043,25 @@ async function main(): Promise<void> {
   });
   // Only once listening: a runner that can't listen exits, and the next
   // one should still find the resume.
-  restarter.resumeAfterRestart();
-  runner.tellStoppedWork();
-  runner.carryOnStopped();
+  // Each step on its own: one that throws (a thread's record another runner
+  // wrote wrong, past the boundaries each has per thread) is logged rather
+  // than ending the start (security review, 11 Nov 2026, finding 96).
+  const step = (name: string, fn: () => void) => {
+    try {
+      fn();
+    } catch (e) {
+      log.error(`startup step failed: ${name}`, { error: String(e) });
+    }
+  };
+  step('resume after restart', () => restarter.resumeAfterRestart());
+  step('tell stopped work', () => runner.tellStoppedWork());
+  step('carry on stopped', () => runner.carryOnStopped());
   // A thread waited on may have finished while the runner was down. Only
   // now: waking one starts its CLI, whose tools need what's set up above.
   runner.holdWaits = false;
-  runner.reconcileWaits();
+  step('reconcile waits', () => runner.reconcileWaits());
   // Reviews a runner that went away owed (runner/lab-review.ts).
-  runner.startOwedReviews();
+  step('owed reviews', () => runner.startOwedReviews());
 
   let stopping = false;
   const stop = async (signal: string) => {

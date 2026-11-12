@@ -7,7 +7,6 @@ use crate::composer::Composer;
 use crate::style;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Enter, InputEvent, Textarea, TextareaState};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -18,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 use threadbear_core::composer::{self, OWN_ANSWER};
 use threadbear_core::reducer::{Ask, AskNote, AsksCard, RowContent};
+use crate::tips::Tip as _;
 
 /// What Mike has picked on the open card, kept with the composer so it
 /// survives moving to another thread and back (AppModel's askPicks, nextPicks
@@ -34,9 +34,54 @@ pub(crate) struct CardState {
     pub(crate) collapsed: bool,
     /// The ask a paged card is showing.
     pub(crate) page: usize,
+    /// The slide between two pages while it's going (CardDeck).
+    slide: Option<PageSlide>,
+    slide_serial: u64,
     /// The boxes under "Something else", by ask.
     inputs: HashMap<usize, Entity<TextareaState>>,
+    /// Where each box is on screen, measured as it's drawn.
+    box_bounds: BoxBounds,
     subs: Vec<Subscription>,
+}
+
+/// Each Something else box's place in the window, by ask, for a file let go
+/// over it.
+#[derive(Default)]
+struct BoxBounds(std::cell::RefCell<HashMap<usize, std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>>>);
+
+impl BoxBounds {
+    fn entry_cell(&self, ask: usize) -> std::rc::Rc<std::cell::Cell<Bounds<Pixels>>> {
+        self.0.borrow_mut().entry(ask).or_default().clone()
+    }
+
+    fn get(&self, ask: usize) -> Option<Bounds<Pixels>> {
+        self.0.borrow().get(&ask).map(|cell| cell.get())
+    }
+}
+
+impl CardState {
+    /// The Something else boxes there are, whose chips count in each.
+    pub(crate) fn answer_inputs(&self) -> Vec<Entity<TextareaState>> {
+        self.inputs.values().cloned().collect()
+    }
+}
+
+/// A paged card going from one ask to another: the next pushes in from the
+/// right as the old goes off left (back the other way), and the page number
+/// rolls (Mike picked it from a mockup, 7 Nov).
+#[derive(Clone, Copy)]
+struct PageSlide {
+    from: usize,
+    to: usize,
+    serial: u64,
+}
+
+/// How long the slide takes (CardDeck.duration).
+const SLIDE: Duration = Duration::from_millis(180);
+
+/// Easing out, as Core Animation's `.easeOut` does it near enough.
+fn ease_out(t: f32) -> f32 {
+    1. - (1. - t) * (1. - t)
 }
 
 impl Composer {
@@ -99,8 +144,7 @@ impl Composer {
                     }
                     if let Some(card) = this.open_card(cx) {
                         if let Some(next) = composer::next_unanswered(page, card.asks.len(), &this.card.picks, false) {
-                            this.card.page = next;
-                            cx.notify();
+                            this.set_page(next, cx);
                         }
                     }
                 })
@@ -109,14 +153,26 @@ impl Composer {
             .detach();
         } else if !picked {
             self.focus(window, cx);
+            crate::web_panels::keyboard_to_app(window);
         }
     }
 
-    fn set_note(&mut self, ask: usize, text: String, cx: &mut Context<Self>) {
+    fn set_note(&mut self, ask: usize, text: String, images: Vec<threadbear_core::reducer::ImageRef>, cx: &mut Context<Self>) {
         let note = self.card.notes.entry(ask as i64).or_default();
         note.text = text;
+        note.images = images;
         self.push_card_state(cx);
         cx.notify();
+    }
+
+    /// What's in a Something else box changed (AskAnswerBox.textDidChange):
+    /// its words and the pictures whose chips are in, in order, are that
+    /// ask's answer.
+    pub(crate) fn answer_box_changed(&mut self, input: &Entity<TextareaState>, cx: &mut Context<Self>) {
+        let Some(ask) = self.card.inputs.iter().find(|(_, i)| *i == input).map(|(ask, _)| *ask) else { return };
+        let text = input.read(cx).value().to_string();
+        let (draft, images) = threadbear_core::inline_chips::draft_in(&text, &self.box_chips_in(input, cx), 0..text.len());
+        self.set_note(ask, draft, images, cx);
     }
 
     fn toggle_follow_up(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -127,6 +183,7 @@ impl Composer {
         self.push_card_state(cx);
         cx.notify();
         self.focus(window, cx);
+        crate::web_panels::keyboard_to_app(window);
     }
 
     fn toggle_explain(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -137,10 +194,31 @@ impl Composer {
         self.push_card_state(cx);
         cx.notify();
         self.focus(window, cx);
+        crate::web_panels::keyboard_to_app(window);
     }
 
+    /// ‹ and ›, and moving on after a pick: the asks slide like a deck while
+    /// the heading stays put (ComposerCardHost.showPage). A click meanwhile
+    /// goes to the page it's sliding to.
     fn set_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        let from = self.card.page;
         self.card.page = page;
+        if from != page {
+            self.card.slide_serial += 1;
+            let serial = self.card.slide_serial;
+            self.card.slide = Some(PageSlide { from, to: page, serial });
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SLIDE + Duration::from_millis(20)).await;
+                this.update(cx, |this, cx| {
+                    if this.card.slide.is_some_and(|s| s.serial == serial) {
+                        this.card.slide = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -148,6 +226,7 @@ impl Composer {
         self.card.collapsed = !self.card.collapsed;
         cx.notify();
         self.focus(window, cx);
+        crate::web_panels::keyboard_to_app(window);
     }
 
     fn archive_thread(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -162,13 +241,19 @@ impl Composer {
         if let Some(input) = self.card.inputs.get(&ask) {
             return input.clone();
         }
-        let existing = self.card.notes.get(&(ask as i64)).map(|n| n.text.clone()).unwrap_or_default();
-        let input = cx.new(|cx| TextareaState::new(window, cx).placeholder("Say something else…").auto_grow(1, 8).submit_on_enter(true).default_value(existing));
+        let existing = self.card.notes.get(&(ask as i64)).cloned().unwrap_or_default();
+        let input = cx.new(|cx| TextareaState::new(window, cx).placeholder("Say something else…").auto_grow(1, 8).submit_on_enter(true));
+        // Its words are only here until they're sent: an update's restart
+        // waits for them (unsent.rs).
+        crate::unsent::watch(&input, cx);
+        // What was answered before (a refused send put back), its pictures
+        // as chips again.
+        if !existing.is_empty() {
+            let content = self.content_for(&existing.text, &existing.images);
+            input.update(cx, |s, cx| s.set_value(content, window, cx));
+        }
         let sub = cx.subscribe_in(&input, window, move |this, input, ev: &InputEvent, window, cx| match ev {
-            InputEvent::Change => {
-                let text = input.read(cx).value().to_string();
-                this.set_note(ask, text, cx);
-            }
+            InputEvent::Change => this.answer_box_changed(input, cx),
             InputEvent::PressEnter { secondary, shift: false } => this.answer_box_return(ask, *secondary, window, cx),
             _ => {}
         });
@@ -177,9 +262,27 @@ impl Composer {
         input
     }
 
+    /// Pictures for an ask's box, from its picture button
+    /// (AskAnswerBox.choosePictures): chips where the cursor was, as a paste
+    /// would put them.
+    fn choose_answer_pictures(&mut self, ask: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Add".into()) });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                this.update_in(cx, |this, window, cx| {
+                    let input = this.answer_box(ask, window, cx);
+                    this.take_paths_in(&input, paths, window, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn focus_answer_box(&mut self, ask: usize, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.answer_box(ask, window, cx);
         input.update(cx, |s, cx| s.focus(window, cx));
+        crate::web_panels::keyboard_to_app(window);
     }
 
     /// Return in a Something else box goes on to the next ask still
@@ -199,12 +302,12 @@ impl Composer {
         let filled = composer::filled_picks(&self.card.picks, &self.card.notes);
         let Some(next) = composer::next_unanswered(ask, card.asks.len(), &filled, or_this) else { return false };
         if is_paged(&card) && self.card.page != next {
-            self.card.page = next;
-            cx.notify();
+            self.set_page(next, cx);
             self.focus(window, cx);
+            crate::web_panels::keyboard_to_app(window);
         } else {
-            // On a card showing every ask it's in sight already; the box says
-            // so by staying put (the Swift app beeps here).
+            // In sight already: the beep, as there's nowhere further to go.
+            crate::composer_answers::beep();
         }
         true
     }
@@ -264,6 +367,7 @@ impl Composer {
         self.card.next_picks.clear();
         self.card.explain.clear();
         self.card.inputs.clear();
+        self.card.box_bounds = BoxBounds::default();
         self.card.subs.clear();
         self.push_card_state(cx);
     }
@@ -303,24 +407,37 @@ impl Composer {
                     }
                 })),
         );
+        // What's still open (doneText): a booked check-in alone goes under
+        // "Coming back", as it doesn't stop an archive.
         if let Some(ends) = &card.loose_ends {
             if !ends.is_empty() {
-                let open = ends.iter().any(|e| e.kind != "booked");
+                let open = ends.iter().any(|e| !e.is_booked());
                 column = column.child(small_label(if open { "Still open" } else { "Coming back" }, cx));
                 // Open ones first, then the check-ins (looseEndsText), each a
                 // body line 4 under the last, its mark where a row's circle goes.
-                for end in ends.iter().filter(|e| e.kind != "booked").chain(ends.iter().filter(|e| e.kind == "booked")) {
-                    let booked = end.kind == "booked";
+                for (n, end) in ends.iter().filter(|e| !e.is_booked()).chain(ends.iter().filter(|e| e.is_booked())).enumerate() {
+                    let booked = end.is_booked();
                     let mark = if booked { crate::icons::symbol("clock").text_color(style::secondary_text(cx)) } else { crate::icons::symbol("exclamationmark.circle").text_color(style::needs_you_text(cx)) };
-                    column = column.child(
-                        h_flex()
-                            .w_full()
-                            .items_start()
-                            .mt(px(8.))
-                            .pl(px(metrics::ROW_INSET))
-                            .child(div().flex_none().w(px(metrics::ROW_WORDS - metrics::ROW_INSET)).h(px(style::size::BODY_LINE)).flex().items_center().child(mark.with_size(px(15.))))
-                            .child(div().flex_1().min_w_0().text_size(px(style::size::BODY)).line_height(px(style::size::BODY_LINE)).text_color(style::label_text(cx)).child(end.text.clone())),
-                    );
+                    let words = div().flex_1().min_w_0().text_size(px(style::size::BODY)).line_height(px(style::size::BODY_LINE)).text_color(style::label_text(cx)).child(end.line(&threadbear_core::chrono::Local));
+                    let mut line = h_flex()
+                        .id(("loose-end", n))
+                        .w_full()
+                        .items_start()
+                        .mt(px(8.))
+                        .pl(px(metrics::ROW_INSET))
+                        .child(div().flex_none().w(px(metrics::ROW_WORDS - metrics::ROW_INSET)).h(px(style::size::BODY_LINE)).flex().items_center().child(mark.with_size(px(15.))))
+                        .child(words);
+                    // A thread it started links to it (`thread:<id>`).
+                    if let Some(id) = end.thread_id.clone() {
+                        let this = this.clone();
+                        line = line.cursor_pointer().tip("Open this thread").on_click(move |_, window, cx| {
+                            if let Some(this) = this.upgrade() {
+                                let target = format!("thread:{id}");
+                                this.update(cx, |this, cx| this.open_ask_link(&target, window, cx));
+                            }
+                        });
+                    }
+                    column = column.child(line);
                 }
             }
         }
@@ -344,7 +461,7 @@ impl Composer {
                         .rounded(px(6.))
                         .cursor_pointer()
                         .hover(|s| s.bg(style::hover_fill(cx)))
-                        .tooltip(|window, cx| Tooltip::new("Send this with your next message").build(window, cx))
+                        .tip("Send this with your next message")
                         .on_click(move |_, window, cx| {
                             if let Some(this) = this2.upgrade() {
                                 this.update(cx, |this, cx| this.toggle_follow_up(index, window, cx));
@@ -365,7 +482,7 @@ impl Composer {
                                 .cursor_pointer()
                                 .hover(|s| s.bg(style::hover_fill(cx)))
                                 .child(Icon::from(IconName::CircleQuestionMark).with_size(px(14.)).text_color(if explained { style::accent(cx) } else { style::quiet_text(cx) }))
-                                .tooltip(|window, cx| Tooltip::new("Ask what this means").build(window, cx))
+                                .tip("Ask what this means")
                                 .on_click(move |_, window, cx| {
                                     cx.stop_propagation();
                                     if let Some(this) = this3.upgrade() {
@@ -414,7 +531,7 @@ impl Composer {
                         this.update(cx, |this, cx| this.set_page(page.saturating_sub(1), cx));
                     }
                 }))
-                .child(div().px(px(metrics::PAGER_PAD)).text_size(px(style::size::LABEL)).line_height(px(16.)).text_color(style::secondary_label(cx)).child(format!("{} of {}", page + 1, card.asks.len())))
+                .child(page_counter(page, card.asks.len(), self.card.slide.filter(|s| s.to == page), cx))
                 .child(pager_arrow("›", page + 1 < card.asks.len(), "Next ask", ("page-next", 0usize), cx, move |_, _, cx| {
                     if let Some(this) = this_next.upgrade() {
                         this.update(cx, |this, cx| this.set_page(page + 1, cx));
@@ -439,7 +556,7 @@ impl Composer {
                 // SF's chevron at 11 pt semibold is about 10 by 6; Lucide's,
                 // a 12 by 6 stroke in 24, comes to that at 17.
                 .child(Icon::from(if collapsed { IconName::ChevronUp } else { IconName::ChevronDown }).with_size(px(17.)))
-                .tooltip(move |window, cx| Tooltip::new(if collapsed { "Expand" } else { "Collapse" }).build(window, cx))
+                .tip(if collapsed { "Expand" } else { "Collapse" })
                 .on_click(move |_, window, cx| {
                     if let Some(this) = collapse_this.upgrade() {
                         this.update(cx, |this, cx| this.toggle_collapsed(window, cx));
@@ -459,9 +576,23 @@ impl Composer {
             // Every page in the same cell, so the cell is the tallest one's
             // height; only the page showing is drawn, and it goes last so
             // it's the one on top for the pointer.
-            let mut pages = div().w_full().grid().grid_cols(1);
+            let slide = self.card.slide.filter(|s| s.to == page && s.from < card.asks.len());
+            let mut pages = div().w_full().grid().grid_cols(1).overflow_hidden();
             for (index, ask) in card.asks.iter().enumerate().filter(|(i, _)| *i != page).chain(card.asks.iter().enumerate().filter(|(i, _)| *i == page)) {
-                pages = pages.child(div().w_full().min_w_0().col_start(1).row_start(1).when(index != page, |d| d.invisible()).child(self.render_ask(index, ask, numbered, window, cx)));
+                let body = v_flex().w_full().child(self.render_ask(index, ask, numbered, window, cx));
+                let cell = div().w_full().min_w_0().col_start(1).row_start(1);
+                pages = pages.child(match slide {
+                    // The two asks sliding like a deck (CardDeck): the next
+                    // pushes in from the right as the old goes off left, and
+                    // back the other way.
+                    Some(s) if index == s.from || index == s.to => {
+                        let forward = s.to > s.from;
+                        let (start, end) = if index == s.to { (if forward { 1. } else { -1. }, 0.) } else { (0., if forward { -1. } else { 1. }) };
+                        let id = ElementId::NamedInteger("card-slide".into(), s.serial * 1000 + index as u64);
+                        cell.child(body.relative().with_animation(id, Animation::new(SLIDE).with_easing(ease_out), move |el, t| el.left(relative(start + (end - start) * t))))
+                    }
+                    _ => cell.when(index != page, |d| d.invisible()).child(body),
+                });
             }
             column = column.child(pages);
         } else {
@@ -482,7 +613,11 @@ impl Composer {
     fn open_ask_link(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
         let url = if target.starts_with('/') { threadbear_core::open_policy::file_url(target) } else { target.to_owned() };
         if let Some(pane) = self.pane.upgrade() {
-            pane.update(cx, |p, cx| p.link_clicked(&url, "", window, cx));
+            // Once this update is over: the pane reads this composer to reach
+            // the app (a review's window, a file into the side pane), which
+            // GPUI refuses while the composer is the one being updated.
+            // "Open the design options" on a card crashed the app (12 Nov).
+            window.defer(cx, move |window, cx| pane.update(cx, |p, cx| p.link_clicked(&url, "", window, cx)));
         }
     }
 
@@ -515,12 +650,36 @@ pub(crate) trait AskHost: Sized + 'static {
     fn ask_reading_style(&mut self, cx: &App) -> gpui_kit::base::TextViewStyle;
     fn ask_pick_answer(&mut self, ask: usize, option: i64, window: &mut Window, cx: &mut Context<Self>);
     fn ask_open_link(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>);
+    /// The card a link button shows while the pointer rests on it (a page's
+    /// address, a file's picture or name), and the key its hover is kept
+    /// under; None where its links have none.
+    fn ask_link_card(&self, _title: &str, _target: &str, _cx: &App) -> Option<AnyElement> {
+        None
+    }
+    fn ask_link_key(&self, _ask: usize, _link: usize) -> Option<SharedString> {
+        None
+    }
     fn ask_answer_box(&mut self, ask: usize, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextareaState>;
     /// Return in an ask's box; `command` is ⌘Return.
     fn ask_box_return(&mut self, ask: usize, command: bool, window: &mut Window, cx: &mut Context<Self>);
     /// Where an ask's command is run from (card_run.rs): its thread and that
     /// thread's runner. None shows the command with no Run.
     fn ask_run_target(&self, _cx: &App) -> Option<crate::card_run::RunTarget> {
+        None
+    }
+    /// The box's text field, given its chips and paste where a host takes
+    /// pictures in it (the composer's card does).
+    fn ask_box_field(&mut self, _ask: usize, field: Textarea, _cx: &mut Context<Self>) -> Textarea {
+        field
+    }
+    /// The pictures over the box's words and the button that adds them, where
+    /// a host takes pictures; None for words alone.
+    fn ask_box_pictures(&mut self, _ask: usize, _cx: &mut Context<Self>) -> Option<(Option<AnyElement>, AnyElement)> {
+        None
+    }
+    /// Where the box is on screen, kept for a file dropped over it (the
+    /// thread's drop layer is over everything while a file's dragged).
+    fn ask_box_bounds(&self, _ask: usize) -> Option<std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>> {
         None
     }
 
@@ -571,8 +730,17 @@ pub(crate) trait AskHost: Sized + 'static {
             for (n, title, target) in links {
                 let this = this.clone();
                 let look = if n == 0 { ButtonLook::Picked } else { ButtonLook::Plain };
-                let tip: &'static str = if target.starts_with("review:") { "Open the design options" } else { "Open this" };
-                row = row.child(card_button(("ask-link", index * 100 + n), &format!("{title} ↗"), look, tip, cx).on_click(move |_, window, cx| {
+                // Resting on one shows where it goes, as a reply's link does
+                // (RowRenderer's AskButton peek); a review has none, its
+                // window being the look, and keeps its tip.
+                let key = self.ask_link_key(index, n).filter(|_| crate::reply_links::has_card(&target));
+                let tip: &'static str = if key.is_some() { "" } else if target.starts_with("review:") { "Open the design options" } else { "Open this" };
+                let shown = key.as_ref().filter(|k| crate::chips::card_shown(k, crate::chips::SLOWER)).and_then(|_| self.ask_link_card(&title, &target, cx)).map(|card| crate::chips::under(metrics::BUTTON_HEIGHT, card));
+                let button = card_button(("ask-link", index * 100 + n), &format!("{title} ↗"), look, tip, cx)
+                    .relative()
+                    .when_some(key, |b, key| b.on_hover(move |on, window, cx| crate::chips::hover(&key, *on, crate::chips::SLOWER, window, cx)))
+                    .children(shown);
+                row = row.child(button.on_click(move |_, window, cx| {
                     if let Some(this) = this.upgrade() {
                         let target = target.clone();
                         this.update(cx, |this, cx| this.ask_open_link(&target, window, cx));
@@ -624,6 +792,15 @@ pub(crate) trait AskHost: Sized + 'static {
         if picked == Some(OWN_ANSWER) {
             let input = self.ask_answer_box(index, window, cx);
             let this3 = this.clone();
+            let field = crate::composer::bare_textarea(Textarea::new(&input)).text_size(px(style::size::COMPOSER)).line_height(px(style::size::BODY_LINE));
+            let field = self.ask_box_field(index, field, cx);
+            // Its pictures over the words, and the button that adds them at
+            // the right of its last line (AskAnswerBox).
+            let (strip, add) = match self.ask_box_pictures(index, cx) {
+                Some((strip, add)) => (strip, Some(add)),
+                None => (None, None),
+            };
+            let measured = self.ask_box_bounds(index).map(|cell| canvas(move |bounds, _, _| cell.set(bounds), |_, _, _, _| {}).absolute().size_full());
             // AskAnswerBox: 8 under the buttons, 10 and 6 in from its edge.
             block = block.child(
                 div()
@@ -638,15 +815,19 @@ pub(crate) trait AskHost: Sized + 'static {
                         }
                     })
                     .child(
-                        div()
+                        v_flex()
+                            .relative()
                             .w_full()
                             .px(px(10.))
                             .py(px(6.))
+                            .gap(px(6.))
                             .rounded(px(10.))
                             .border_1()
                             .border_color(style::hairline(cx))
                             .bg(style::answer_box_fill(cx))
-                            .child(crate::composer::bare_textarea(Textarea::new(&input)).text_size(px(style::size::COMPOSER)).line_height(px(style::size::BODY_LINE))),
+                            .children(strip)
+                            .child(h_flex().w_full().items_end().gap(px(4.)).child(div().flex_1().min_w_0().child(field)).children(add))
+                            .children(measured),
                     ),
             );
         }
@@ -688,7 +869,7 @@ pub(crate) trait AskHost: Sized + 'static {
                     .when(n > 0, |s| s.border_t_1().border_color(style::primary_opacity(cx, 0.055)))
                     .cursor_pointer()
                     .hover(|s| s.bg(style::hover_fill(cx)))
-                    .tooltip(move |window, cx| Tooltip::new(if own { "Answer in your own words" } else { "Pick this answer" }).build(window, cx))
+                    .tip(if own { "Answer in your own words" } else { "Pick this answer" })
                     .on_click(move |_, window, cx| {
                         if let Some(this) = this.upgrade() {
                             this.update(cx, |this, cx| this.ask_pick_answer(index, value, window, cx));
@@ -744,6 +925,14 @@ impl AskHost for Composer {
         self.open_ask_link(target, window, cx);
     }
 
+    fn ask_link_card(&self, title: &str, target: &str, cx: &App) -> Option<AnyElement> {
+        self.pane.upgrade()?.read(cx).ask_link_card(title, target, cx)
+    }
+
+    fn ask_link_key(&self, ask: usize, link: usize) -> Option<SharedString> {
+        Some(format!("ask-link:{}:{ask}:{link}", self.thread_id.as_deref()?).into())
+    }
+
     fn ask_answer_box(&mut self, ask: usize, window: &mut Window, cx: &mut Context<Self>) -> Entity<TextareaState> {
         self.answer_box(ask, window, cx)
     }
@@ -756,6 +945,116 @@ impl AskHost for Composer {
         let pane = self.pane.upgrade()?;
         let pane = pane.read(cx);
         Some(crate::card_run::RunTarget { client: Some(pane.client_handle()), thread: pane.summary.id.clone(), app: self.app.clone() })
+    }
+
+    /// Pictures pasted in an ask's box go in as chips where the cursor is,
+    /// as in the composer (AskAnswerBox, Mike 1 Nov).
+    fn ask_box_field(&mut self, ask: usize, field: Textarea, cx: &mut Context<Self>) -> Textarea {
+        let Some(input) = self.card.inputs.get(&ask).cloned() else { return field };
+        let this = cx.entity().downgrade();
+        let tokens = this.clone();
+        let (clicks, click_input) = (this.clone(), input.clone());
+        field
+            .token(move |ctx, _window, cx| match tokens.upgrade() {
+                Some(this) => this.read(cx).render_chip(ctx, cx),
+                None => div().into_any_element(),
+            })
+            .on_paste(move |item, window, cx| this.upgrade().is_some_and(|this| this.update(cx, |this, cx| this.take_clipboard_in(&input, item, window, cx))))
+            // A click on a picture's chip opens it among this box's others,
+            // as in the message box (Composer::open_picture).
+            .on_token_click(move |event, window, cx| {
+                if let Some(this) = clicks.upgrade() {
+                    this.update(cx, |this, cx| this.open_picture(&click_input, event.token().id(), window, cx));
+                }
+            })
+    }
+
+    /// Its pictures over the words, 44 square with × on hover, and the
+    /// picture button at the right (AskAnswerBox's thumbs and addButton).
+    fn ask_box_pictures(&mut self, ask: usize, cx: &mut Context<Self>) -> Option<(Option<AnyElement>, AnyElement)> {
+        let input = self.card.inputs.get(&ask).cloned()?;
+        let chips = Self::chips_in(&input, cx);
+        let strip = (!chips.is_empty()).then(|| {
+            let mut row = h_flex().gap(px(6.));
+            for (n, (_, id)) in chips.into_iter().enumerate() {
+                let path = self.pictures.get(&id).map(|c| c.image.as_ref().map_or_else(|| c.source.clone(), |i| std::path::PathBuf::from(&i.path)));
+                let in_yet = self.pictures.get(&id).is_some_and(|c| c.image.is_some());
+                let (remove_input, remove_id) = (input.clone(), id.clone());
+                let tile = div()
+                    .relative()
+                    .size(px(44.))
+                    .rounded(px(6.))
+                    .overflow_hidden()
+                    .border(gpui_kit::px(0.5))
+                    .border_color(style::hairline(cx))
+                    .bg(style::chip_fill(cx))
+                    .when_some(path, |d, path| d.child(img(path).size(px(44.)).object_fit(ObjectFit::Cover).when(!in_yet, |i| i.opacity(0.5))));
+                let remove = crate::composer::remove_badge(("answer-picture-remove", ask * 100 + n)).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    // Not the thumbnail's click under it, which opens the picture.
+                    cx.stop_propagation();
+                    this.remove_picture_in(&remove_input, remove_id.clone(), window, cx);
+                }));
+                let (open_input, open_id) = (input.clone(), id.clone());
+                let group: SharedString = format!("answer-picture-{ask}-{n}").into();
+                row = row.child(
+                    div()
+                        .id(("answer-picture", ask * 100 + n))
+                        .group(group.clone())
+                        .relative()
+                        .cursor_pointer()
+                        .child(tile)
+                        // Placed itself in the corner, as the message box's are
+                        // (Composer::render_strip).
+                        .child(div().absolute().top(px(2.)).right(px(2.)).invisible().group_hover(group, |s| s.visible()).child(remove))
+                        .tip(crate::viewer::TILE_TIP)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_picture(&open_input, &open_id, window, cx);
+                        })),
+                );
+            }
+            row.into_any_element()
+        });
+        let add = div()
+            .id(("answer-add-pictures", ask))
+            .flex_none()
+            .size(px(22.))
+            .mb(px((style::size::BODY_LINE - 22.) / 2.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|s| s.bg(style::hover_fill(cx)))
+            .child(Icon::from(IconName::ImagePlus).with_size(px(14.)).text_color(style::secondary_label(cx)))
+            .tip("Add pictures to this answer (or paste or drop them in the box)")
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.choose_answer_pictures(ask, window, cx)))
+            .into_any_element();
+        Some((strip, add))
+    }
+
+    fn ask_box_bounds(&self, ask: usize) -> Option<std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>> {
+        Some(self.card.box_bounds.entry_cell(ask))
+    }
+}
+
+impl Composer {
+    /// Files dropped on the thread: on a Something else box they're that
+    /// answer's, anywhere else the message's (ComposerDropView, AskAnswerBox).
+    pub(crate) fn take_dropped_paths(&mut self, paths: Vec<std::path::PathBuf>, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        // On a paged card only the page showing has a box in sight; the
+        // others keep where they were last drawn.
+        let shown = self.open_card(cx).filter(|c| !self.card.collapsed && is_paged(c)).map(|_| self.card.page);
+        let over = self
+            .card
+            .inputs
+            .iter()
+            .filter(|(ask, _)| shown.is_none_or(|page| page == **ask) && !self.card.collapsed)
+            .find(|(ask, _)| self.card.box_bounds.get(**ask).is_some_and(|b| b.contains(&at)))
+            .map(|(_, input)| input.clone());
+        match over {
+            Some(input) => self.take_paths_in(&input, paths, window, cx),
+            None => self.take_paths(paths, window, cx),
+        }
     }
 }
 
@@ -772,14 +1071,36 @@ impl Composer {
         let mut lines = vec![format!("{} picked", self.card.picks.len())];
         for (i, ask) in card.asks.iter().enumerate() {
             let options = composer::choices(ask);
-            let choices: Vec<String> = options.iter().enumerate().map(|(n, o)| if ask.suggested == Some(n) { format!("*{o}") } else { o.clone() }).collect();
+            // Each with what it does in brackets, when the agent said, and the
+            // ask's links after, as the Swift dump's `decisions` has them (the
+            // nightly parity run, scripts/parity, reads them here).
+            let notes_fit = ask.option_notes.len() == ask.options.len();
+            let choices: Vec<String> = options
+                .iter()
+                .enumerate()
+                .map(|(n, o)| {
+                    let star = if ask.suggested == Some(n) { "*" } else { "" };
+                    let note = if notes_fit { ask.option_notes.get(n).map(|s| s.trim()).unwrap_or("") } else { "" };
+                    if note.is_empty() { format!("{star}{o}") } else { format!("{star}{o} ({note})") }
+                })
+                .collect();
+            let links = if ask.links.is_empty() { String::new() } else { format!(" links: {}", ask.links.iter().map(|l| l.title.as_str()).collect::<Vec<_>>().join(", ")) };
             let picked = self.card.picks.get(&(i as i64));
             let answer = match picked {
-                Some(&OWN_ANSWER) => format!("something else: \"{}\"", self.card.notes.get(&(i as i64)).map(|n| n.text.clone()).unwrap_or_default()),
+                // Its pictures after the words, as the Swift dump's ownAnswer.
+                Some(&OWN_ANSWER) => {
+                    let note = self.card.notes.get(&(i as i64)).cloned().unwrap_or_default();
+                    let pictures = match note.images.len() {
+                        0 => String::new(),
+                        1 => " +1 picture".to_owned(),
+                        n => format!(" +{n} pictures"),
+                    };
+                    format!("something else: \"{}\"{pictures}", note.text)
+                }
                 Some(n) => options.get(*n as usize).cloned().unwrap_or_else(|| "no answer".to_owned()),
                 None => "no answer".to_owned(),
             };
-            lines.push(format!("  {}. {} [{}] -> {}", i + 1, ask.action, choices.join(" | "), answer));
+            lines.push(format!("  {}. {} [{}]{links} -> {}", i + 1, ask.action, choices.join(" | "), answer));
         }
         Some(lines)
     }
@@ -814,9 +1135,22 @@ impl Composer {
             if self.card.picks.get(&(ask as i64)) != Some(&OWN_ANSWER) {
                 self.pick_answer(ask, OWN_ANSWER, window, cx);
             }
-            self.set_note(ask, rest.to_owned(), cx);
+            self.set_note(ask, rest.to_owned(), Vec::new(), cx);
             let input = self.answer_box(ask, window, cx);
             input.update(cx, |s, cx| s.set_value(rest.to_owned(), window, cx));
+        }
+        // `picture`: "ask:path", a picture into that ask's box, after its
+        // words, as the Swift `decide` adds one (addNoteImages).
+        if let Some(value) = cmd["picture"].as_str() {
+            let Some((n, path)) = value.split_once(':') else { return Err(format!("no ask in {value}")) };
+            let Some(ask) = n.parse::<usize>().ok().filter(|n| (1..=card.asks.len()).contains(n)).map(|n| n - 1) else { return Err(format!("no ask in {value}")) };
+            if self.card.picks.get(&(ask as i64)) != Some(&OWN_ANSWER) {
+                self.pick_answer(ask, OWN_ANSWER, window, cx);
+            }
+            let input = self.answer_box(ask, window, cx);
+            let end = input.read(cx).value().len();
+            input.update(cx, |s, cx| s.set_selected_range(end..end, cx));
+            self.take_paths_in(&input, vec![std::path::PathBuf::from(path)], window, cx);
         }
         if cmd["send"].as_bool().unwrap_or(false) {
             self.send(window, cx);
@@ -848,6 +1182,17 @@ impl Composer {
                 let (a, n): (usize, i64) = (a.parse().map_err(|_| "bad ask")?, n.parse().map_err(|_| "bad choice")?);
                 self.pick_answer(a, n, window, cx);
             }
+            // Rests on a link button: its card shows as it would after the
+            // pause ("peek:0:0"), and "peek" alone puts it away.
+            ["peek", a, n] => {
+                let key = self.ask_link_key(a.parse().map_err(|_| "bad ask")?, n.parse().map_err(|_| "bad link")?).ok_or("no thread")?;
+                crate::chips::show_card(Some(&key));
+                window.refresh();
+            }
+            ["peek"] => {
+                crate::chips::show_card(None);
+                window.refresh();
+            }
             ["run", a, _] => {
                 let run = card.asks.get(a.parse::<usize>().map_err(|_| "bad ask")?).and_then(|ask| ask.run.clone()).ok_or("no command on that ask")?;
                 crate::card_run::press_ask(self, &run, cx)?;
@@ -863,6 +1208,15 @@ impl Composer {
     pub(crate) fn card_lines(&self, cx: &App) -> Option<Vec<String>> {
         let card = self.open_card(cx)?;
         let mut lines = Vec::new();
+        // A link button's card while it shows: "peek: <title> | <detail>",
+        // as its card says them, last.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let peek = card.asks.iter().enumerate().flat_map(|(a, ask)| ask.links.iter().enumerate().map(move |(n, link)| (a, n, link))).find_map(|(a, n, link)| {
+            let key = self.ask_link_key(a, n)?;
+            let target = link.target(&home)?;
+            (crate::chips::card_shown(&key, crate::chips::SLOWER) && crate::reply_links::has_card(&target)).then_some(())?;
+            self.pane.upgrade()?.read(cx).ask_link_words(&link.title, &target)
+        });
         if card.is_done() {
             lines.push("Done".to_owned());
             for (i, next) in card.next.iter().enumerate() {
@@ -882,6 +1236,9 @@ impl Composer {
                     lines.push(format!("    $ {}", run.command));
                 }
             }
+        }
+        if let Some((title, detail)) = peek {
+            lines.push(format!("peek: {title} | {detail}"));
         }
         Some(lines)
     }
@@ -1041,8 +1398,26 @@ pub(crate) fn card_button(id: impl Into<ElementId>, title: &str, look: ButtonLoo
         .line_height(px(16.))
         .cursor_pointer()
         .hover(|s| s.opacity(0.85))
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        // No tip where the button shows a card of its own instead.
+        .when(!tip.is_empty(), |b| b.tip(tip))
         .child(title.to_owned())
+}
+
+/// "2 of 3" between the pager's arrows. While the asks slide the number
+/// rolls, the old one up and out as the new comes up from below (CardDeck).
+fn page_counter(page: usize, count: usize, slide: Option<PageSlide>, cx: &App) -> AnyElement {
+    let secondary = style::secondary_label(cx);
+    let words = move |text: String| div().text_size(px(style::size::LABEL)).line_height(px(16.)).text_color(secondary).child(text);
+    let Some(slide) = slide else { return div().px(px(metrics::PAGER_PAD)).child(words(format!("{} of {count}", page + 1))).into_any_element() };
+    let travel = 10.;
+    let new = ElementId::NamedInteger("card-page-in".into(), slide.serial);
+    let old = ElementId::NamedInteger("card-page-out".into(), slide.serial);
+    let number = div()
+        .relative()
+        .overflow_hidden()
+        .child(words((slide.to + 1).to_string()).relative().with_animation(new, Animation::new(SLIDE).with_easing(ease_out), move |el, t| el.top(px(travel * (1. - t))).opacity(t)))
+        .child(words((slide.from + 1).to_string()).absolute().top_0().left_0().with_animation(old, Animation::new(SLIDE).with_easing(ease_out), move |el, t| el.top(px(-travel * t)).opacity(1. - t)));
+    h_flex().px(px(metrics::PAGER_PAD)).child(number).child(words(format!(" of {count}"))).into_any_element()
 }
 
 /// ‹ and › on a paged card (asksHeading's arrows): boxed as a plain button
@@ -1057,7 +1432,7 @@ fn pager_arrow(glyph: &'static str, enabled: bool, tip: &'static str, id: impl I
         .rounded(px(7.5))
         .text_size(px(style::size::LABEL))
         .line_height(px(16.))
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .tip(tip)
         .map(|s| {
             if enabled {
                 s.px(px(metrics::PAGER_PAD - 1.))

@@ -19,7 +19,6 @@ use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -30,6 +29,7 @@ use std::time::Duration;
 use threadbear_core::completion_sound::{self, Ding};
 use threadbear_core::new_thread::abbreviate_home;
 use threadbear_core::runner_settings::{experiment_about, BringIn, RunnerSettings, StandingInstructions};
+use crate::tips::Tip as _;
 
 mod devices;
 mod keyboard;
@@ -197,7 +197,23 @@ pub(crate) struct SettingsWindow {
     /// The ding's volume (Notifications).
     volume: Entity<SliderState>,
     scroll: ScrollHandle,
+    /// The list of sections down the left: up and down move through them
+    /// while it has the keyboard, which it has as the window opens and
+    /// again once a section is clicked (`SettingsSidebar`'s focus).
+    sidebar_focus: FocusHandle,
     _subs: Vec<Subscription>,
+}
+
+// Settings' sidebar keys (`onMoveCommand`).
+actions!(settings_sidebar, [PreviousSection, NextSection]);
+
+const SIDEBAR_CONTEXT: &str = "SettingsSidebar";
+
+fn bind_sidebar_keys(cx: &mut App) {
+    static BOUND: std::sync::Once = std::sync::Once::new();
+    BOUND.call_once(|| {
+        cx.bind_keys([KeyBinding::new("up", PreviousSection, Some(SIDEBAR_CONTEXT)), KeyBinding::new("down", NextSection, Some(SIDEBAR_CONTEXT))]);
+    });
 }
 
 impl SettingsWindow {
@@ -282,8 +298,12 @@ impl SettingsWindow {
             keyboard: Default::default(),
             volume,
             scroll: ScrollHandle::new(),
+            sidebar_focus: cx.focus_handle(),
             _subs: subs,
         };
+        bind_sidebar_keys(cx);
+        window.focus(&this.sidebar_focus, cx);
+        crate::web_panels::keyboard_to_app(window);
         this.follow_saved_instructions(instructions_now, window, cx);
         this
     }
@@ -299,6 +319,14 @@ impl SettingsWindow {
             window.set_window_title(tab.title());
             self.scroll.set_offset(point(gpui_kit::px(0.), gpui_kit::px(0.)));
             cx.notify();
+        }
+    }
+
+    /// The section above or below the one showing, stopping at the ends.
+    fn step_section(&mut self, step: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let at = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0) as i32 + step;
+        if let Some(tab) = usize::try_from(at).ok().and_then(|i| Tab::ALL.get(i)) {
+            self.show(*tab, window, cx);
         }
     }
 
@@ -457,6 +485,13 @@ impl SettingsWindow {
         let on_fill = style::primary_opacity(cx, 0.1);
         let (fg, secondary) = (cx.theme().foreground, style::secondary_text(cx));
         v_flex()
+            .id("settings-sidebar")
+            // A click on a section gives the list the keyboard (GPUI focuses
+            // what's pressed), so the arrows carry on from there.
+            .track_focus(&self.sidebar_focus)
+            .key_context(SIDEBAR_CONTEXT)
+            .on_action(cx.listener(|this, _: &PreviousSection, window, cx| this.step_section(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NextSection, window, cx| this.step_section(1, window, cx)))
             .w(px(SIDEBAR_WIDTH))
             .flex_none()
             .h_full()
@@ -499,7 +534,7 @@ impl SettingsWindow {
         let folder_control = h_flex()
             .gap(px(8.))
             .items_center()
-            .child(div().id("settings-default-folder").max_w(px(280.)).text_ellipsis_middle().whitespace_nowrap().overflow_hidden().text_size(px(13.)).text_color(style::secondary_text(cx)).tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)).child(folder))
+            .child(div().id("settings-default-folder").max_w(px(280.)).text_ellipsis_middle().whitespace_nowrap().overflow_hidden().text_size(px(13.)).text_color(style::secondary_text(cx)).tip(full.clone()).child(folder))
             .child(self.button("settings-choose-folder", "Choose…", "Pick the folder new threads start in", cx, |this, window, cx| this.choose_default_folder(window, cx)));
         sections.push(section(
             "settings-new-threads",
@@ -524,6 +559,21 @@ impl SettingsWindow {
                 cx,
             ));
         }
+        // Why it's worth turning on, then what's in it, for anyone wary of
+        // turning it on (the Swift app's, Mike, 29 Oct). This Mac's own
+        // (activity.rs), but where the Swift app has it.
+        let activity = self.app.upgrade().is_some_and(|a| a.read(cx).settings.saved.activity_log == Some(true));
+        let switch = self.switch("settings-activity-log", activity, "Note what you click and open in this app", cx, |this, on, cx| {
+            this.app.update(cx, |app, cx| app.set_activity_log(on, cx)).ok();
+        });
+        sections.push(section(
+            "settings-activity",
+            "Activity log",
+            "When you ask a thread to change Threadbear, its agent can check this log first to see how you really use the app. It notes the buttons, rows and menu items you use (by their tooltips and titles), your shortcuts, the threads and pages you open, and when you send or answer something, never what you type. It stays on this Mac for 30 days and Threadbear never sends it anywhere.",
+            "read it with tb activity and tell you what's in it.",
+            vec![row("Keep an activity log", switch, cx)],
+            cx,
+        ));
         if let Some(on) = settings.keep_awake {
             let switch = self.switch("settings-keep-awake", on, "Stop your Mac sleeping on its own while a thread is working", cx, |this, on, cx| this.update(json!({ "keepAwake": on }), cx));
             sections.push(section(
@@ -671,7 +721,7 @@ impl SettingsWindow {
         let volume = h_flex()
             .gap(px(8.))
             .items_center()
-            .child(div().id("settings-ding-volume").test_support().aria_label("How loud the ding is").w(px(180.)).tooltip(|window, cx| Tooltip::new("How loud the ding is").build(window, cx)).child(Slider::new(&self.volume).horizontal()))
+            .child(div().id("settings-ding-volume").test_support().aria_label("How loud the ding is").w(px(180.)).tip("How loud the ding is").child(Slider::new(&self.volume).horizontal()))
             .child(self.button("settings-ding-play", "Play", "Hear the ding", cx, |this, _, cx| {
                 if let Some(app) = this.app.upgrade() {
                     let s = &app.read(cx).settings;
@@ -876,7 +926,7 @@ impl SettingsWindow {
             .id(SharedString::from(format!("{id}-holder")))
             .test_support()
             .aria_label(tip)
-            .tooltip(move |window, cx| Tooltip::new(shown.clone()).build(window, cx))
+            .tip(shown.clone())
             .flex_none()
             .child(crate::mac_switch::MacSwitch::new(SharedString::from(id), on).on_change(move |on, _, cx| {
                 let set = set.clone();
@@ -1010,7 +1060,8 @@ impl Render for SettingsWindow {
                 .bg(cx.theme().background)
                 .text_color(cx.theme().foreground)
                 .child(sidebar)
-                .child(div().id("settings-pane").flex_1().min_w_0().h_full().child(page));
+                .child(div().id("settings-pane").flex_1().min_w_0().h_full().child(page))
+                .child(crate::tips::window_presses());
         }
         let mut sections = match self.tab {
             Tab::General => self.render_general(settings.as_ref(), window, cx),
@@ -1048,6 +1099,8 @@ impl Render for SettingsWindow {
                     h_flex().w_full().justify_center().child(v_flex().w_full().max_w(px(700.)).px(px(20.)).pt(px(20.)).pb(px(24.)).gap(px(30.)).children(sections)),
                 ),
             )
+            // Last: every press in the window, for the activity log (tips.rs).
+            .child(crate::tips::window_presses())
     }
 }
 
@@ -1087,6 +1140,32 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, cx: &mut App) ->
         return Ok(Some(done));
     }
     devices::automation(app, cmd, cx)
+}
+
+/// Scrolls Settings' pane so `bounds`, a control drawn out of sight in it,
+/// comes into view, as a person scrolls to a switch before pressing it: a
+/// script's click by tooltip only finds what's on show. On a small screen
+/// the window can't be made tall enough for all of General (GitHub's Macs'
+/// is 1024 by 768, so Keep the Mac awake was below the bottom, 11 Nov).
+/// False when it's in view already, or Settings isn't open.
+#[cfg(feature = "automation")]
+pub(crate) fn scroll_into_view(app: &Entity<Threadbear>, bounds: Bounds<Pixels>, cx: &App) -> bool {
+    let Some((_, view)) = app.read(cx).settings_window.as_ref() else { return false };
+    let scroll = &view.read(cx).scroll;
+    let (pane, offset, most) = (scroll.bounds(), scroll.offset(), scroll.max_offset());
+    let margin = gpui_kit::px(12.);
+    let y = if bounds.bottom() > pane.bottom() {
+        offset.y - (bounds.bottom() - pane.bottom()) - margin
+    } else if bounds.top() < pane.top() {
+        offset.y + (pane.top() - bounds.top()) + margin
+    } else {
+        return false;
+    };
+    // The offset runs from 0 (the top) down to minus the most it can scroll.
+    let lowest = gpui_kit::px(0.) - most.y;
+    let y = if y < lowest { lowest } else if y > gpui_kit::px(0.) { gpui_kit::px(0.) } else { y };
+    scroll.set_offset(point(offset.x, y));
+    true
 }
 
 #[cfg(feature = "automation")]

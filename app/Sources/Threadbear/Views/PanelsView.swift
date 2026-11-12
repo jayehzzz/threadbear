@@ -1043,6 +1043,11 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     }
 
     private func makeView(_ config: WKWebViewConfiguration, sealed: Bool = false) -> WKWebView {
+        // A page's own script opens no window without a click. WebKit lets
+        // one on a Mac by default, and every window a panel's page asks for
+        // goes to the browser or loads over it, so a compromised script
+        // could open a browser tab a second (Codex review, 11 Nov).
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
         let view = sealed ? SealedPreviewWebView(frame: .zero, configuration: config) : FirstClickWebView(frame: .zero, configuration: config)
         view.navigationDelegate = self
         view.uiDelegate = self
@@ -1061,6 +1066,16 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     func canGoBack(_ url: URL) -> Bool { views[url]?.canGoBack ?? false }
 
     func goBack(_ url: URL) { views[url]?.goBack() }
+
+    /// Whether the dashboard's own navigation off its site goes to the
+    /// browser: only a link or a form, and only one someone clicked
+    /// (`userInitiated`, checked beside this, as a script can make either
+    /// type). One a script started, or a redirect, is cancelled without
+    /// opening anything, or a compromised dashboard script could open a
+    /// browser tab a second (Codex review, 11 Nov).
+    nonisolated static func convexSendsOut(_ type: WKNavigationType) -> Bool {
+        type == .linkActivated || type == .formSubmitted
+    }
 
     /// Whether a click in a patch's panel should open somewhere else rather
     /// than load over its page: a link, a form or a window.open (not a
@@ -1082,20 +1097,71 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         view.removeFromSuperview()
         leavers.removeValue(forKey: ObjectIdentifier(view))
         backWatches.removeValue(forKey: ObjectIdentifier(view))?.invalidate()
+        lastOut.removeValue(forKey: ObjectIdentifier(view))
     }
 
     /// A link or a form, or anything asking for a new window (window.open,
-    /// which WebKit calls `.other`).
+    /// which WebKit calls `.other`), that a person clicked or typed.
     private static func isClick(_ action: WKNavigationAction) -> Bool {
-        action.navigationType == .linkActivated || action.navigationType == .formSubmitted || action.targetFrame == nil
+        (action.navigationType == .linkActivated || action.navigationType == .formSubmitted || action.targetFrame == nil) && userInitiated(action)
     }
 
-    /// A link out of a patch's panel, if this is one (leavesPanel).
+    /// Whether a person's click or key is behind a navigation. Its type
+    /// isn't enough: a script's own `form.submit()` is `.formSubmitted` and
+    /// its `a.click()` `.linkActivated`, so a page could send a tab to the
+    /// browser over and over (Codex review, 11 Nov). WebKit keeps the real
+    /// answer in `_isUserInitiated`, which it doesn't publish; without it
+    /// nothing counts as a click, so nothing goes out.
+    static func userInitiated(_ action: WKNavigationAction) -> Bool {
+        guard action.responds(to: NSSelectorFromString("_isUserInitiated")) else { return false }
+        return (action.value(forKey: "_isUserInitiated") as? Bool) ?? false
+    }
+
+    /// Uses up the click behind a navigation that's about to open a page, so
+    /// it opens only that one: a click handler that keeps running (a busy
+    /// loop between `a.click()`s) still has its gesture a second later, past
+    /// `allowOut` (Codex review, 11 Nov). WebKit's `_userInitiatedAction`,
+    /// which it doesn't publish either, can be used up; false if it already
+    /// was. Without it, only `userInitiated` and `allowOut` hold.
+    static func takeClick(_ action: WKNavigationAction) -> Bool {
+        guard userInitiated(action) else { return false }
+        guard action.responds(to: NSSelectorFromString("_userInitiatedAction")),
+              let gesture = action.value(forKey: "_userInitiatedAction") as? NSObject,
+              gesture.responds(to: NSSelectorFromString("isConsumed")), gesture.responds(to: NSSelectorFromString("consume"))
+        else { return true }
+        if (gesture.value(forKey: "consumed") as? Bool) == true { return false }
+        gesture.perform(NSSelectorFromString("consume"))
+        return true
+    }
+
+    /// When each view last sent a page out, for `allowOut`.
+    private var lastOut: [ObjectIdentifier: Date] = [:]
+
+    /// One page a second at most from a panel to the browser or over it,
+    /// however fast its clicks come: each is a person's, but a page can make
+    /// every click a new window (Codex review, 11 Nov). The GPUI app's
+    /// LeaveGate does the same.
+    private func allowOut(_ view: WKWebView) -> Bool {
+        let now = Date()
+        if let last = lastOut[ObjectIdentifier(view)], now.timeIntervalSince(last) < 1 { return false }
+        lastOut[ObjectIdentifier(view)] = now
+        return true
+    }
+
+    /// The address the pool loaded in `view`: its slot, or for a Convex
+    /// view the embedded dashboard.
+    private func ownURL(of view: WKWebView) -> URL? {
+        guard let slot = views.first(where: { $0.value === view })?.key else { return nil }
+        return slot.scheme == "threadbear-convex" ? Self.convexEmbedded : slot
+    }
+
+    /// A link out of a patch's panel, if this is one (leavesPanel). It
+    /// leaves the page where it is even when it's one too many to open.
     private func sendOut(_ webView: WKWebView, _ action: WKNavigationAction) -> Bool {
         guard let leaver = leavers[ObjectIdentifier(webView)], let url = action.request.url,
               Self.leavesPanel(url, home: leaver.home, linkClick: Self.isClick(action),
                                mainFrame: action.targetFrame?.isMainFrame ?? true) else { return false }
-        leaver.open(url)
+        if Self.takeClick(action), allowOut(webView) { leaver.open(url) }
         return true
     }
 
@@ -1125,10 +1191,21 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             decisionHandler(allowed ? .allow : .cancel)
             return
         }
+        // Only a web page loads as a panel's page: a script's blob: or data:
+        // page, or anything else, is cancelled (Codex review, 11 Nov). Its
+        // own address (the mock runner's data: pages) and a blank page do
+        // load; an iframe's are WebKit's to rule on.
+        if navigationAction.targetFrame?.isMainFrame ?? true, let url = navigationAction.request.url,
+           LinkPolicy.web(url) == nil, url.absoluteString != "about:blank", url != ownURL(of: webView) {
+            decisionHandler(.cancel)
+            return
+        }
         if isConvexView(webView), navigationAction.targetFrame?.isMainFrame ?? true,
            let url = navigationAction.request.url, url.host != Self.convexEmbedded.host,
            LinkPolicy.web(url) != nil {
-            OpenGate.openWeb(url)
+            if Self.convexSendsOut(navigationAction.navigationType), Self.takeClick(navigationAction), allowOut(webView) {
+                OpenGate.openWeb(url)
+            }
             decisionHandler(.cancel)
             return
         }
@@ -1179,13 +1256,18 @@ final class WebPanelPool: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if isPreviewView(webView) { return nil }
-        guard let url = navigationAction.request.url else { return nil }
+        // Only a window someone clicked for, and only a web page: WebKit
+        // already holds back a script's own (javaScriptCanOpenWindowsAutomatically
+        // is off), and this is the second lock on it.
+        guard let url = navigationAction.request.url, Self.userInitiated(navigationAction), LinkPolicy.web(url) != nil else { return nil }
         // A target="_blank" link off a patch panel's site, if WebKit didn't
         // already ask about it above.
         if sendOut(webView, navigationAction) { return nil }
-        // A page's window.open goes to the browser only as a web page: the
-        // page chose the address (OpenGate refuses anything else).
-        if isConvexView(webView) { OpenGate.openWeb(url) } else { webView.load(URLRequest(url: url)) }
+        if isConvexView(webView) {
+            if Self.takeClick(navigationAction), allowOut(webView) { OpenGate.openWeb(url) }
+        } else {
+            webView.load(URLRequest(url: url))
+        }
         return nil
     }
 }

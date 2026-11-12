@@ -173,11 +173,148 @@ void tb_view_remove(void *nativeView) {
   [view removeFromSuperview];
 }
 
+// A person's clicks and keys in each watched page view, counted as AppKit
+// hands them over. After a page sends something to the browser, the next
+// needs a new one (panel_rules.rs's LeaveGate): Chromium leaves a click's
+// activation with the page when the app makes no window for it, so the page
+// could otherwise use one click for a page a second (Codex review, 12 Nov). Keys
+// go to the view with the keyboard, clicks to the view under them, and a key
+// held down counts once. A press from VoiceOver isn't counted, as AppKit
+// never sees it. Weak keys: a page's view going takes its count with it.
+static NSMapTable<NSView *, NSNumber *> *g_inputs;
+
+static void tb_note_input(NSView *view) {
+  if (!view) {
+    return;
+  }
+  // Found first, counted after: the table can't change while it's walked.
+  NSMutableArray<NSView *> *under = [NSMutableArray array];
+  for (NSView *watched in g_inputs) {
+    if ([view isDescendantOf:watched]) {
+      [under addObject:watched];
+    }
+  }
+  for (NSView *watched in under) {
+    [g_inputs setObject:@([[g_inputs objectForKey:watched] unsignedLongLongValue] + 1) forKey:watched];
+  }
+}
+
+void tb_view_watch_input(void *nativeView) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    g_inputs = [NSMapTable weakToStrongObjectsMapTable];
+    NSEventMask mask = NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown | NSEventMaskKeyDown;
+    [NSEvent addLocalMonitorForEventsMatchingMask:mask handler:^NSEvent *(NSEvent *event) {
+      NSWindow *window = event.window;
+      if (event.type == NSEventTypeKeyDown) {
+        if (event.isARepeat) {
+          return event;
+        }
+        NSResponder *responder = window.firstResponder;
+        tb_note_input([responder isKindOfClass:[NSView class]] ? (NSView *)responder : nil);
+      } else if (window.contentView) {
+        // hitTest takes a point in the view's superview's coordinates.
+        NSView *content = window.contentView;
+        NSView *frame = content.superview ?: content;
+        NSPoint point = [frame convertPoint:event.locationInWindow fromView:nil];
+        tb_note_input([content hitTest:point]);
+      }
+      return event;
+    }];
+  });
+  NSView *view = (__bridge NSView *)nativeView;
+  if (view && ![g_inputs objectForKey:view]) {
+    [g_inputs setObject:@0 forKey:view];
+  }
+}
+
+uint64_t tb_view_input_count(void *nativeView) {
+  NSView *view = (__bridge NSView *)nativeView;
+  return view ? [[g_inputs objectForKey:view] unsignedLongLongValue] : 0;
+}
+
+// A scripted app's stand-in for a person's click in the page (the specs'
+// clicks come through DevTools, which AppKit never sees).
+void tb_view_note_input(void *nativeView) {
+  tb_note_input((__bridge NSView *)nativeView);
+}
+
 // Whether the page's view, or one inside it, has its window's keyboard.
 bool tb_view_has_keyboard(void *nativeView) {
   NSView *view = (__bridge NSView *)nativeView;
   NSResponder *responder = view.window.firstResponder;
   return view && [responder isKindOfClass:[NSView class]] && [(NSView *)responder isDescendantOf:view];
+}
+
+// Who has the keyboard in the window GPUI's view `nativeView` fills: 0 that
+// view, 1 a page's view inside it that's showing, 2 nobody or the window
+// itself, 3 a page's view inside it that's hidden, 4 anything else. A page's
+// view is a subview of GPUI's (tb_view_set_parent), so "inside it" is a page.
+int tb_view_keyboard_holder(void *nativeView) {
+  NSView *view = (__bridge NSView *)nativeView;
+  NSWindow *window = view.window;
+  if (!view || !window) {
+    return 2;
+  }
+  NSResponder *responder = window.firstResponder;
+  if (responder == view) {
+    return 0;
+  }
+  if (!responder || responder == window) {
+    return 2;
+  }
+  if ([responder isKindOfClass:[NSView class]] && [(NSView *)responder isDescendantOf:view]) {
+    return [(NSView *)responder isHiddenOrHasHiddenAncestor] ? 3 : 1;
+  }
+  return 4;
+}
+
+// Gives GPUI's view its window's keyboard (web_panels.rs says when). It never
+// takes it back by itself: it doesn't accept first responder, so a click on
+// it leaves the keyboard with a page's view, and once that view's hidden,
+// with the window, which beeps at every letter.
+bool tb_view_take_keyboard(void *nativeView) {
+  NSView *view = (__bridge NSView *)nativeView;
+  NSWindow *window = view.window;
+  if (!view || !window || window.firstResponder == view) {
+    return false;
+  }
+  return [window makeFirstResponder:view];
+}
+
+// A scripted app's stand-in for typing `text` (UTF-8, letters and spaces):
+// each character's key down and up handed to the window GPUI's view is in,
+// which gives them to whoever has its keyboard, as AppKit does a person's
+// keys. A script's own keystrokes go straight into GPUI and never meet AppKit,
+// so they can't tell who has the keyboard.
+void tb_view_send_keys(void *nativeView, const char *text) {
+  NSView *view = (__bridge NSView *)nativeView;
+  NSWindow *window = view.window;
+  NSString *all = text ? [NSString stringWithUTF8String:text] : nil;
+  if (!window || !all) {
+    return;
+  }
+  // US keyboard key codes, which is all the input context reads besides the
+  // characters themselves.
+  static const unsigned short codes[26] = {0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46, 45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6};
+  for (NSUInteger i = 0; i < all.length; i++) {
+    NSString *one = [all substringWithRange:NSMakeRange(i, 1)];
+    unichar c = [one.lowercaseString characterAtIndex:0];
+    unsigned short code = (c >= 'a' && c <= 'z') ? codes[c - 'a'] : 49;
+    for (int down = 1; down >= 0; down--) {
+      NSEvent *event = [NSEvent keyEventWithType:(down ? NSEventTypeKeyDown : NSEventTypeKeyUp)
+                                        location:NSZeroPoint
+                                   modifierFlags:0
+                                       timestamp:[[NSProcessInfo processInfo] systemUptime]
+                                    windowNumber:window.windowNumber
+                                         context:nil
+                                      characters:one
+                     charactersIgnoringModifiers:one
+                                       isARepeat:NO
+                                         keyCode:code];
+      [window sendEvent:event];
+    }
+  }
 }
 
 @interface TBMenuTarget : NSObject

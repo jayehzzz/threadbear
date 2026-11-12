@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use threadbear_core::rich_block::{self as rich, RichBlock, RichKind};
+use threadbear_core::rich_block::{self as rich, png_cost, FrameBudget, PictureBudget, RichBlock, RichKind};
 use threadbear_core::web_runtime::State;
 
 /// What the kit calls the box's nodes.
@@ -41,9 +41,12 @@ const MAX_BODY: f32 = 560.;
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// How long Copy shows its tick.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
-/// Blocks' states kept in memory (sizes only), and pictures.
+/// Blocks' states kept in memory (sizes only). Their pictures are kept by
+/// what they take up (`PictureBudget`).
 const STATES_KEPT: usize = 2000;
-const PICTURES_KEPT: usize = 120;
+/// The biggest picture file read back from the disk cache: a page's look is
+/// at most 1440 by 3200 pixels, under 20 MB even as noise.
+const PICTURE_FILE_MAX: u64 = 40 * 1024 * 1024;
 
 /// The buttons' tips (RichBlockCell.Action.tip), which scripts find them by.
 pub(crate) fn drawn_tip(block: &RichBlock) -> &'static str {
@@ -142,8 +145,18 @@ pub(crate) struct RichStore {
     state_order: VecDeque<String>,
     /// Blocks showing their source, by id (RichBlocks.showingSource).
     showing_source: HashSet<String>,
-    pictures: HashMap<String, (Arc<Image>, Arc<Image>)>,
-    picture_order: VecDeque<String>,
+    pictures: PictureBudget<(Arc<Image>, Arc<Image>)>,
+    /// Pictures that just left `pictures`, for `release` to take out of
+    /// gpui's caches.
+    let_go: Vec<Arc<Image>>,
+    /// The decoded pictures boxes have drawn, by image id, for `release` to
+    /// drop their textures.
+    textures: HashMap<u64, Arc<RenderImage>>,
+    /// The pictures handed to boxes in the frame being drawn (`FrameBudget`),
+    /// and whether the frame's end is waited for.
+    in_frame: FrameBudget,
+    frame_images: HashMap<u64, Arc<Image>>,
+    frame_hooked: bool,
     queue: VecDeque<(String, RichBlock, u32)>,
     /// Asked for while the runtime couldn't draw them: asked again once it can.
     asked: HashSet<String>,
@@ -184,8 +197,12 @@ pub(crate) fn init(cx: &mut App) {
             states: HashMap::new(),
             state_order: VecDeque::new(),
             showing_source: HashSet::new(),
-            pictures: HashMap::new(),
-            picture_order: VecDeque::new(),
+            pictures: PictureBudget::new(PictureBudget::<(Arc<Image>, Arc<Image>)>::BYTES),
+            let_go: Vec::new(),
+            textures: HashMap::new(),
+            in_frame: FrameBudget::default(),
+            frame_images: HashMap::new(),
+            frame_hooked: false,
             queue: VecDeque::new(),
             asked: HashSet::new(),
             busy: false,
@@ -203,7 +220,7 @@ pub(crate) fn store(cx: &App) -> Option<Entity<RichStore>> {
 }
 
 impl RichStore {
-    fn remember(&mut self, key: String, state: Drawing) {
+    fn remember(&mut self, key: String, state: Drawing, cx: &mut App) {
         self.state_order.retain(|k| *k != key);
         self.state_order.push_back(key.clone());
         self.states.insert(key, state);
@@ -214,8 +231,11 @@ impl RichStore {
                 break;
             }
             self.states.remove(&oldest);
-            self.pictures.remove(&oldest);
+            if let Some((dark, light)) = self.pictures.remove(&oldest) {
+                self.let_go.extend([dark, light]);
+            }
         }
+        self.release(cx);
     }
 
     pub(crate) fn state(&self, block: &RichBlock, zoom: u32) -> Option<&Drawing> {
@@ -241,7 +261,7 @@ impl RichStore {
             return;
         }
         if let Some(drawn) = disk::load_size(&key) {
-            self.remember(key, drawn);
+            self.remember(key, drawn, cx);
             cx.notify();
             return;
         }
@@ -250,7 +270,7 @@ impl RichStore {
             self.asked.insert(key);
             return;
         }
-        self.remember(key.clone(), Drawing::Queued);
+        self.remember(key.clone(), Drawing::Queued, cx);
         self.queue.push_back((key, block, zoom));
         cx.notify();
         self.pump(cx);
@@ -258,7 +278,7 @@ impl RichStore {
 
     fn fail_queued(&mut self, why: &str, cx: &mut Context<Self>) {
         for (key, _, _) in std::mem::take(&mut self.queue) {
-            self.remember(key, Drawing::Failed(format!("the web runtime didn't start: {why}")));
+            self.remember(key, Drawing::Failed(format!("the web runtime didn't start: {why}")), cx);
         }
         cx.notify();
     }
@@ -276,7 +296,7 @@ impl RichStore {
         }
         let Some((key, block, zoom)) = self.queue.pop_front() else { return };
         self.busy = true;
-        self.remember(key.clone(), Drawing::Drawing);
+        self.remember(key.clone(), Drawing::Drawing, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = draw(&block, zoom, cx).await;
@@ -291,39 +311,114 @@ impl RichStore {
             Ok(drawn) => {
                 let dark = Arc::new(Image::from_bytes(ImageFormat::Png, drawn.dark.clone()));
                 let light = Arc::new(Image::from_bytes(ImageFormat::Png, drawn.light.clone()));
-                self.keep_pictures(key.clone(), (dark, light));
+                self.keep_pictures(key.clone(), (dark, light), cx);
                 if block.kind == RichKind::Mermaid {
                     self.window_pages.insert(block.id.clone(), drawn.window_page.clone());
                 }
-                self.remember(key.clone(), Drawing::Drawn { width: drawn.width, height: drawn.height, clipped: drawn.clipped });
+                self.remember(key.clone(), Drawing::Drawn { width: drawn.width, height: drawn.height, clipped: drawn.clipped }, cx);
                 // Onto disk off the main thread: the next launch shows it at once.
                 cx.background_executor().spawn(async move { disk::save(&key, &block.id, &drawn) }).detach();
             }
-            Err(why) => self.remember(key, Drawing::Failed(why)),
+            Err(why) => self.remember(key, Drawing::Failed(why), cx),
         }
         cx.notify();
         self.pump(cx);
     }
 
-    fn keep_pictures(&mut self, key: String, pictures: (Arc<Image>, Arc<Image>)) {
-        self.picture_order.retain(|k| *k != key);
-        self.picture_order.push_back(key.clone());
-        self.pictures.insert(key, pictures);
-        while self.picture_order.len() > PICTURES_KEPT {
-            if let Some(oldest) = self.picture_order.pop_front() {
-                self.pictures.remove(&oldest);
+    fn keep_pictures(&mut self, key: String, pictures: (Arc<Image>, Arc<Image>), cx: &mut App) {
+        // One allocation for the same picture however many blocks drew it.
+        let dark = self.shared(pictures.0);
+        // A page that looks the same in both: one allocation for the two.
+        let light = if pictures.1.id() == dark.id() { dark.clone() } else { self.shared(pictures.1) };
+        let pictures = (dark, light);
+        let in_frame = &self.in_frame;
+        let parts = [(pictures.0.id(), png_cost(&pictures.0.bytes)), (pictures.1.id(), png_cost(&pictures.1.bytes))];
+        for (dark, light) in self.pictures.keep_parts_with(key, pictures, &parts, |key| in_frame.pins(key)) {
+            self.let_go.extend([dark, light]);
+        }
+        self.release(cx);
+    }
+
+    /// A drawn block's pictures, read back from disk if they've left memory.
+    fn pictures(&mut self, key: &str, cx: &mut App) -> Option<(Arc<Image>, Arc<Image>)> {
+        if let Some(found) = self.pictures.get(key) {
+            return Some(found);
+        }
+        let loaded = disk::load_pictures(key)?;
+        self.keep_pictures(key.to_owned(), loaded.clone(), cx);
+        // The pair as kept: the same allocation as another block drawn alike.
+        self.pictures.get(key).or(Some(loaded))
+    }
+
+    /// Takes the pictures that left memory out of gpui's caches at once,
+    /// wherever they left from (a box needn't be on screen): their decoded
+    /// pixels, which gpui keeps until an image is removed, and for one that
+    /// was drawn its texture in every window, after the frame being drawn.
+    fn release(&mut self, cx: &mut App) {
+        let mut dropped = false;
+        for picture in std::mem::take(&mut self.let_go) {
+            // Still kept under another key (two blocks drawn the same):
+            // still wanted.
+            if self.pictures.values().any(|(dark, light)| dark.id() == picture.id() || light.id() == picture.id()) {
+                continue;
+            }
+            // Drawn in this frame: let go once it's over (`end_frame`).
+            if self.in_frame.holds(picture.id()) {
+                self.let_go.push(picture);
+                continue;
+            }
+            if let Some(texture) = self.textures.remove(&picture.id()) {
+                cx.defer(move |cx| cx.drop_image(texture, None));
+                dropped = true;
+            }
+            picture.remove_asset(cx);
+        }
+        // A thread drawn before (its scene kept, not built again) may still
+        // show it: the panes watching the store draw again, and a box still
+        // there asks for its pictures afresh.
+        if dropped {
+            if let Some(store) = store(cx) {
+                cx.defer(move |cx| store.update(cx, |_, cx| cx.notify()));
             }
         }
     }
 
-    /// A drawn block's pictures, read back from disk if they've left memory.
-    fn pictures(&mut self, key: &str) -> Option<(Arc<Image>, Arc<Image>)> {
-        if let Some(found) = self.pictures.get(key) {
-            return Some(found.clone());
+    /// A box's pictures for this frame, if they fit in what the frame's
+    /// boxes may take up together (the first always does).
+    fn hand_out(&mut self, key: &str, pictures: &(Arc<Image>, Arc<Image>)) -> bool {
+        let cost = png_cost(&pictures.0.bytes).saturating_add(png_cost(&pictures.1.bytes));
+        let fits = self.in_frame.hand_out(key, [pictures.0.id(), pictures.1.id()], cost, FrameBudget::BYTES);
+        if fits {
+            for picture in [&pictures.0, &pictures.1] {
+                self.frame_images.entry(picture.id()).or_insert_with(|| picture.clone());
+            }
         }
-        let loaded = disk::load_pictures(key)?;
-        self.keep_pictures(key.to_owned(), loaded.clone());
-        Some(loaded)
+        fits
+    }
+
+    /// The picture already in memory with the same bytes, if there is one
+    /// (another block that drew the same, or one drawn this frame), so a
+    /// reply of many blocks drawn alike holds one copy, not one each
+    /// (Codex's third look at Daybreak 92).
+    fn shared(&self, picture: Arc<Image>) -> Arc<Image> {
+        let id = picture.id();
+        if let Some(found) = self.frame_images.get(&id) {
+            return found.clone();
+        }
+        self.pictures.values().flat_map(|(dark, light)| [dark, light]).find(|p| p.id() == id).cloned().unwrap_or(picture)
+    }
+
+    /// The frame's drawn: what was let go during it goes now.
+    fn end_frame(&mut self, cx: &mut Context<Self>) {
+        self.frame_hooked = false;
+        self.in_frame.end();
+        self.frame_images.clear();
+        // What went over the budget for the frame's pictures comes back
+        // within it.
+        for (dark, light) in self.pictures.trim_with(|_| false) {
+            self.let_go.extend([dark, light]);
+        }
+        self.release(cx);
     }
 
     fn copy(&mut self, block: &RichBlock, cx: &mut Context<Self>) {
@@ -405,7 +500,14 @@ mod disk {
 
     pub(super) fn load_pictures(key: &str) -> Option<(Arc<Image>, Arc<Image>)> {
         let dir = folder()?;
-        let read = |look: &str| std::fs::read(dir.join(format!("{key}-{look}.png"))).ok().map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)));
+        // Only a file no bigger than a page's look can be: the Swift app
+        // shares the folder, and it's read whole.
+        let read = |look: &str| {
+            let file = dir.join(format!("{key}-{look}.png"));
+            let meta = std::fs::metadata(&file).ok()?;
+            (meta.is_file() && meta.len() <= super::PICTURE_FILE_MAX).then_some(())?;
+            std::fs::read(&file).ok().map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Png, bytes)))
+        };
         Some((read("dark")?, read("light")?))
     }
 
@@ -414,12 +516,10 @@ mod disk {
     }
 
     /// Written whole and renamed into place, so the Swift app or the next
-    /// launch never reads half a picture.
+    /// launch never reads half a picture, and only this user's: it's a
+    /// picture of a reply (`private_file`).
     fn write(path: &PathBuf, bytes: &[u8]) {
-        let fresh = path.with_extension("tmp");
-        if std::fs::write(&fresh, bytes).is_ok() {
-            let _ = std::fs::rename(&fresh, path);
-        }
+        let _ = threadbear_core::private_file::write(path, bytes);
     }
 
     pub(super) fn save(key: &str, id: &str, drawn: &threadbear_web::Drawn) {
@@ -501,7 +601,7 @@ fn orange(cx: &App) -> Hsla {
 
 /// The box (RichBlockCell): a header with the language, the switch, Copy and
 /// full size, and under it the picture or the source.
-fn rich_box(block: &RichBlock, _window: &mut Window, cx: &mut App) -> AnyElement {
+fn rich_box(block: &RichBlock, window: &mut Window, cx: &mut App) -> AnyElement {
     let Some(store) = store(cx) else { return div().child(block.source.clone()).into_any_element() };
     let zoom = style::zoom_percent();
     let key = block.key(zoom);
@@ -515,9 +615,18 @@ fn rich_box(block: &RichBlock, _window: &mut Window, cx: &mut App) -> AnyElement
         cx.defer(move |cx| store.update(cx, |s, cx| s.want(block, zoom, cx)));
     }
     let pictures = match (&state, shows_source) {
-        (Some(Drawing::Drawn { .. }), false) => store.update(cx, |s, _| s.pictures(&key)),
+        (Some(Drawing::Drawn { .. }), false) => store.update(cx, |s, cx| s.pictures(&key, cx)),
         _ => None,
     };
+    // Only as many as the frame's budget holds (`hand_out`); the rest show
+    // their source this frame.
+    let pictures = pictures.filter(|pair| store.update(cx, |s, _| s.hand_out(&key, pair)));
+    // The frame's end, once a frame has handed any out.
+    let hook = store.update(cx, |s, _| !s.in_frame.is_empty() && !std::mem::replace(&mut s.frame_hooked, true));
+    if hook {
+        let store = store.clone();
+        window.on_next_frame(move |_, cx| store.update(cx, |s, cx| s.end_frame(cx)));
+    }
     let (fill, edge, hairline, secondary) = (style::code_background(cx), style::card_border(cx), style::hairline(cx), style::secondary_label(cx));
     let id = block.id.clone();
     let header = h_flex()
@@ -541,6 +650,12 @@ fn rich_box(block: &RichBlock, _window: &mut Window, cx: &mut App) -> AnyElement
     let body = match (&state, pictures) {
         (Some(Drawing::Drawn { width, height, clipped }), Some((dark_picture, light_picture))) => {
             let picture = if dark(cx) { dark_picture } else { light_picture };
+            // Its texture, once decoded, for `release` to drop.
+            if !store.read(cx).textures.contains_key(&picture.id()) {
+                if let Some(texture) = picture.clone().get_render_image(window, cx) {
+                    store.update(cx, |s, _| s.textures.insert(picture.id(), texture));
+                }
+            }
             picture_body(block, (*width, *height), *clipped, picture, cx)
         }
         _ => source_body(block, &state, cx),

@@ -88,7 +88,7 @@ fn hook(info: &std::panic::PanicHookInfo<'_>) {
     let location = info.location().map(|l| format!("{}:{}:{}", report::clean_location(l.file()), l.line(), l.column())).unwrap_or_default();
     let main_thread = std::thread::current().name() == Some("main");
     let frames = report::backtrace_frames(&std::backtrace::Backtrace::force_capture().to_string());
-    let record = PanicRecord { at: threadbear_core::inbox::iso_time(crate::now_ms()), build: r.build.clone(), main_thread, message: report::scrub(&message), location, frames, reported: false };
+    let record = PanicRecord { at: threadbear_core::inbox::iso_time(crate::now_ms()), build: r.build.clone(), main_thread, message: report::safe_message(&message), location, frames, reported: false };
     let name = format!("panic-{}-{:03}", threadbear_core::chrono::Local::now().format("%Y-%m-%d-%H%M%S"), next_number());
     if write_record(&r.folder, &name, &record).is_ok() && !main_thread {
         // The app carries on: sent now rather than at the next launch.
@@ -106,11 +106,10 @@ fn next_number() -> u32 {
     COUNT.fetch_add(1, Ordering::Relaxed) % 1000
 }
 
+/// A panic's message can carry any text the app had, so it's this user's
+/// only (`private_file`).
 fn write_record(folder: &Path, name: &str, record: &PanicRecord) -> std::io::Result<()> {
-    std::fs::create_dir_all(folder)?;
-    let temp = folder.join(format!(".{name}.json.tmp"));
-    std::fs::write(&temp, serde_json::to_vec(record).map_err(std::io::Error::other)?)?;
-    std::fs::rename(temp, folder.join(format!("{name}.json")))
+    threadbear_core::private_file::write(&folder.join(format!("{name}.json")), &serde_json::to_vec(record).map_err(std::io::Error::other)?)
 }
 
 /// The sending thread: what's waiting at launch, a moment after the app's
@@ -151,7 +150,7 @@ fn pending_panics(r: &Reporting) {
         record.reported = true;
         let _ = write_record(&r.folder, name.trim_end_matches(".json"), &record);
         let event = report::panic_event(base(r, &record.at), &record);
-        send(r, &event, &format!("panic {}", record.message));
+        send(r, &event, &format!("panic {}", report::safe_message(&record.message)));
     }
 }
 
@@ -190,8 +189,7 @@ fn native_crashes(r: &Reporting) {
     // The newest few hundred names are plenty to remember.
     let from = names.len().saturating_sub(300);
     seen["names"] = Value::from(names[from..].to_vec());
-    let _ = std::fs::create_dir_all(&r.folder);
-    let _ = std::fs::write(&seen_file, seen.to_string());
+    let _ = threadbear_core::private_file::write(&seen_file, seen.to_string().as_bytes());
 }
 
 fn same_program(crash: &NativeCrash, exe: &Path) -> bool {

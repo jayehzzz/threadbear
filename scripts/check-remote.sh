@@ -350,11 +350,20 @@ changed="$(mktemp)"
 
 # Whether a Linux host can run this: only the runner's, Convex's and the
 # website's checks, so --quick, nothing changed under ios/ (ThreadbearKit's
-# tests), app/ or dock/ (the Mac app's release build) (and something
-# changed: with nothing, check.sh itself or --all, it runs everything), no
-# shots.
+# tests), app/ or dock/ (the Mac app's release build) beyond what the GPUI
+# app shares (scripts/swift-freeze.sh --gpui-shared: the mock runner,
+# fixtures, art, which the Swift app's build no longer runs for), and
+# something changed (with nothing, check.sh itself or --all, it runs
+# everything), no shots.
 linux_ok=0
-if [ "$QUICK" = 1 ] && [ "$ALL" = 0 ] && [ -z "$SHOTS" ] && [ -s "$changed" ] && ! grep -qE '^(ios|app|dock)/|^check\.sh$' "$changed"; then linux_ok=1; fi
+GPUI_SHARED="$("$ROOT/scripts/swift-freeze.sh" --gpui-shared 2>/dev/null)"
+# Without it, nothing counts as shared: an empty pattern would match every
+# line, and every change would look like none.
+[ -n "$GPUI_SHARED" ] || GPUI_SHARED='^$'
+if [ "$QUICK" = 1 ] && [ "$ALL" = 0 ] && [ -z "$SHOTS" ] && [ -s "$changed" ] \
+  && ! grep -qE '^ios/|^check\.sh$' "$changed" && ! grep -vE "$GPUI_SHARED" "$changed" | grep -E '^(app|dock)/' >/dev/null; then linux_ok=1; fi
+# (grep to /dev/null, not -q: -q closing the pipe early fails grep -v under
+# pipefail, and a big change would have looked like none.)
 # --runner is only Node, whatever changed: the runner's self-update sends
 # it from a clone on main, where nothing has, and with Tinker Desk away a
 # Linux host should still take it rather than this Mac (Codex, 9 Nov).
@@ -403,6 +412,24 @@ probe='mkdir -p ~/'"$BASE_REL"'/runs && chmod go-w ~/'"$BASE_REL"' ~/'"$BASE_REL
 # Hosts with no room, as "<host> has <n> GiB free": those this choosing passed
 # over, and those whose copy failed for lack of it, which aren't asked again.
 LOW="" LOW_COPY=""
+# A host short of room may only be short because of the GPUI build folders
+# desktop/scripts/remote.sh keeps there (63 GB of them on Tinker Desk, 12 Nov,
+# with 1.8 GiB free). Those idle get given back by the same script remote.sh
+# uses, and the disk read again: true if it now has room. $2 is the host's
+# folder: as its probe gave it, already checked as a plain path, or \$HOME's
+# when the probe couldn't run, for the host to expand. Sent in the command,
+# not on stdin, as watched runs ssh in the background, where stdin is empty.
+# Under a time limit of its own, so a host stuck deleting doesn't keep the
+# other hosts from being tried.
+TRIM="$ROOT/desktop/scripts/trim-remote-cache.sh"
+make_room() {
+  [ -f "$TRIM" ] || return 1
+  local kb
+  timed 600 "${SSH[@]}" "$1" "cd \"$2/gpui\" 2>/dev/null || exit 0; bash -c \"\$(printf %s '$(base64 <"$TRIM" | tr -d '\n')' | base64 -d)\" trim -" </dev/null || true
+  kb="$(watched "$1" "${SSH[@]}" "$1" "cd \"$2\" && $free_cmd" 2>/dev/null)" || return 1
+  low_on_room "$kb"
+  [ $? = 1 ]
+}
 pass_over() {
   echo "Passing over $1: it has $FREE_GIB GiB free, and this check wants $MIN_FREE_GIB GiB." >&2
   LOW+="${LOW:+, }$1 has $FREE_GIB GiB free"
@@ -415,9 +442,18 @@ choose() {
     case "$h" in -*|"") continue ;; esac
     # One that dropped out during a copy this run isn't tried again.
     case " $SKIP " in *" $h "*) continue ;; esac
-    out="$(watched "$h" "${SSH[@]}" "$h" "$probe" 2>/dev/null)"
-    rc=$?
-    [ "$rc" != 125 ] || over_time busy
+    # Probed again once if the first failed for want of room and giving back
+    # build folders made some.
+    tried_room=0
+    while :; do
+      out="$(watched "$h" "${SSH[@]}" "$h" "$probe" 2>/dev/null)"
+      rc=$?
+      [ "$rc" != 125 ] || over_time busy
+      [ "$rc" != 0 ] && [ "$rc" != 124 ] && [ "$rc" != 255 ] && [ "$tried_room" = 0 ] || break
+      tried_room=1
+      kb="$(watched "$h" "${SSH[@]}" "$h" "cd ~ && $free_cmd" 2>/dev/null)" && low_on_room "$kb" || break
+      make_room "$h" '$HOME/'"$BASE_REL" || break
+    done
     if [ "$rc" = 124 ]; then
       dropped "$h"
       continue
@@ -450,8 +486,10 @@ choose() {
     low_on_room "$kb"
     case $? in
       0)
-        pass_over "$h"
-        continue ;;
+        make_room "$h" "$b" && echo "$h was short of disk; idle GPUI build folders there were given back, and it has room now." >&2 || {
+          pass_over "$h"
+          continue
+        } ;;
       # Not knowing is no reason to stop checks; a failure there still says.
       2) echo "Couldn't read how much disk $h has free; trying it anyway." >&2 ;;
     esac

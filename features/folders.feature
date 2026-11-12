@@ -103,7 +103,8 @@ Feature: A folder in the side pane
 
   @folder.pathbar
   Scenario: The path bar's … is a menu of the folders above the ones it shows
-    Given the thread's folder is showing in the pane for "Rebuild the three landing pages"
+    Given the thread "Rebuild the three landing pages" works in a folder too deep for the path bar to show whole
+    And the thread's folder is showing in the pane for "Rebuild the three landing pages"
     Then the path bar's … menu starts with the folder above the first one it shows
     When I pick the last folder in the path bar's … menu
     Then the pane is browsing that folder

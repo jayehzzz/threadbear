@@ -19,6 +19,16 @@ Feature: Design reviews
     When I follow the link "review:review_account" in the agent's last reply
     Then the review window is open on option "A", one at a time
 
+  # An ask's link is followed from inside the composer's own update, and the
+  # transcript read the composer back to reach the app, which crashed the
+  # GPUI app ("Open the design options" on a card, 12 Nov).
+  @review.window @card.needsyou
+  Scenario: A review: link on an ask in the composer opens that review
+    When I send "Which one? Pick a design"
+    Then the card in the composer asks "Pick one of the account picker designs"
+    When I press link 1 of ask 1 on the card
+    Then the review window is open on option "A", one at a time
+
   @header.pendingreviews
   Scenario: The bar over the thread says how many reviews are waiting
     Then the bar over the thread says "Review design options (1)"
@@ -54,6 +64,22 @@ Feature: Design reviews
     And I close the review
     And I open the review
     Then the review has "B" ticked and the reply "Bigger, please"
+
+  # Voice Type puts what Mike says on the clipboard and presses ⌘V in the
+  # window in front. He ticks an option and talks straight away, before
+  # clicking the reply box, and the words went nowhere (12 Nov). The Swift
+  # app's `clipboard` can't be set from a script.
+  @review.picks @swift-pending
+  Scenario: Words pasted after ticking an option go in the reply box
+    When I open the review
+    And I tick "B" in the review
+    And I paste "Bigger, please" in the review with ⌘V
+    Then the review has "B" ticked and the reply "Bigger, please"
+    When I paste ". That one." in the review with ⌘V
+    Then the review has "B" ticked and the reply "Bigger, please. That one."
+    When I close the review
+    And I open the review
+    Then the review has "B" ticked and the reply "Bigger, please. That one."
 
   @review.picks
   Scenario: Sending answers the agent, and the review can't be changed after
@@ -143,14 +169,20 @@ Feature: Design reviews
     When I press "C. Account pools" in the review
     Then the caption offers "http://localhost:5190/c" to try live
 
-  # The GPUI window can't play a clip or show a page yet: it shows the still
-  # with a button that opens the clip in its own app or the page in the
-  # browser (docs/gpui-port/PARITY.md).
-  @review.media @gpui-pending
-  Scenario: A clip plays on the stage, and a page shows in place
+  @review.media @windows-pending @linux-pending
+  Scenario: A clip plays on the stage
     Given the agent shows options with several shots each
     When I open that review
     And I press "C. Account pools" in the review
     Then the stage plays the clip
-    When I press "B. One picker, shot 2" in the review
+
+  # The GPUI window can't show a page in place yet: it shows the still with
+  # a button that opens the page in the browser (docs/gpui-port/PARITY.md).
+  # It plays a clip on a Mac; on Windows and Linux a clip is the same still,
+  # with a button that opens it in its own app.
+  @review.media @gpui-pending
+  Scenario: A page shows in place on the stage
+    Given the agent shows options with several shots each
+    When I open that review
+    And I press "B. One picker, shot 2" in the review
     Then the stage shows the page

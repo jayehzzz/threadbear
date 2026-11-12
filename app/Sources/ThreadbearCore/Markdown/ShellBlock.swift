@@ -136,21 +136,26 @@ public enum TerminalPut {
     /// when the Terminal was busy, pasted there later, ran its first lines).
     /// SwiftTerm sees it too, then pastes it anyway (`pasteText`), so the
     /// app asks first, as Windows Terminal and iTerm do.
+    /// A Tab is asked about too: it's the Tab key there, and zsh's
+    /// completion with bracketed paste off expands a `$(...)` before it,
+    /// which runs it (Codex's review of the paste fix, 11 Nov).
     public static func pasteRuns(_ text: String) -> Bool {
-        text.contains("\n") || text.contains("\r")
+        text.unicodeScalars.contains { $0 == "\n" || $0 == "\r" || $0 == "\t" }
     }
 
     /// A paste as the terminal sends it (`paste_bytes` in the GPUI app): line
     /// breaks as Return, inside the brackets when the program asked for
-    /// them, with any ESC (and the one-character CSI) gone from inside so
-    /// nothing can end them early; without them, every control character
-    /// but Tab and Return goes too, as each would be a key pressed.
+    /// them, and every control character but Tab and Return gone, brackets
+    /// or not. Without them each would be a key pressed. Inside them an ESC
+    /// (or the one-character CSI) could end them early, and the pty's line
+    /// discipline takes ^C, ^\, ^Z, ^S and ^Q as signals before the shell
+    /// sees the brackets: a pasted ^\ quit bash's paste half way and the
+    /// line break after it ran the command (Daybreak, 11 Nov).
     public static func pasteBytes(_ text: String, bracketed: Bool) -> [UInt8] {
         let breaks = text.replacingOccurrences(of: "\r\n", with: "\r").replacingOccurrences(of: "\n", with: "\r")
         var kept = String.UnicodeScalarView()
         for scalar in breaks.unicodeScalars {
-            let control = scalar.properties.generalCategory == .control
-            if bracketed ? (scalar == "\u{1b}" || scalar == "\u{9b}") : (control && scalar != "\t" && scalar != "\r") { continue }
+            if scalar.properties.generalCategory == .control, scalar != "\t", scalar != "\r" { continue }
             kept.append(scalar)
         }
         let inner = Array(String(kept).utf8)
@@ -172,8 +177,11 @@ public enum TerminalPut {
         var lines = 0
         text.enumerateLines { _, _ in lines += 1 }
         lines = max(lines, 1)
-        return (lines == 1 ? "Paste this line?" : "Paste \(lines) lines?",
-                "The program in this terminal will take each line break as Return, so at a shell's prompt each line runs as soon as it's pasted.")
+        let title = lines == 1 ? "Paste this line?" : "Paste \(lines) lines?"
+        if !text.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) {
+            return (title, "The program in this terminal will take each Tab in it as the Tab key, which a shell can use to complete or expand what's before it.")
+        }
+        return (title, "The program in this terminal will take each line break as Return, so at a shell's prompt each line runs as soon as it's pasted.")
     }
 
     /// Whether the program in front of the terminal is the shell that was

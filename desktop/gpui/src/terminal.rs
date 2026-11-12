@@ -51,24 +51,48 @@ impl Global for TerminalsGlobal {}
 
 /// Made with the app (`Threadbear::new`), before anything can ask for a shell.
 pub(crate) fn install(app: &Entity<Threadbear>, cx: &mut App) {
-    // Tab and Shift-Tab move the keyboard between controls, and ⌘C copies a
-    // text selection, in the window's root (gpui-kit's own keys): in the
-    // terminal they're the shell's (completion, and ^C off the Mac), so they
-    // go no further than its key handler. ⌘V isn't bound anywhere above it.
-    let copy = if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-shift-c" };
-    let mut keys = vec![KeyBinding::new("tab", NoAction, Some(KEY_CONTEXT)), KeyBinding::new("shift-tab", NoAction, Some(KEY_CONTEXT)), KeyBinding::new(copy, NoAction, Some(KEY_CONTEXT))];
-    if !cfg!(target_os = "macos") {
-        keys.push(KeyBinding::new("ctrl-c", NoAction, Some(KEY_CONTEXT)));
-    }
-    cx.bind_keys(keys);
+    cx.bind_keys(own_keys());
     let terminals = cx.new(|cx| Terminals::new(app, cx));
     cx.set_global(TerminalsGlobal(terminals));
+}
+
+/// The keys that go no further than the terminal's own key handler. Tab and
+/// Shift-Tab move the keyboard between controls, and ⌘C copies a text
+/// selection, in the window's root (gpui-kit's own keys): in the terminal
+/// they're the shell's (completion, and ^C off the Mac). And its copy, paste
+/// and select-all keys off the Mac, Control-Shift C, V and A, are its own
+/// too: Control-Shift-C is also Copy Transcript as Markdown there, so in the
+/// terminal it copied the whole thread rather than what was selected (11
+/// Nov). The app's command keys have no context, which ties with these at
+/// the terminal's depth, and a tie goes to whichever was bound last, so
+/// `apply_shortcuts` binds these again after binding the commands.
+pub(crate) fn own_keys() -> Vec<KeyBinding> {
+    let mut chords = vec!["tab", "shift-tab"];
+    if cfg!(target_os = "macos") {
+        // ⌘V and ⌘A too, in case shortcuts.json gives a command one of them
+        // (Settings won't, but the file is anyone's to edit).
+        chords.extend(["cmd-c", "cmd-v", "cmd-a"]);
+    } else {
+        chords.extend(["ctrl-c", "ctrl-shift-c", "ctrl-shift-v", "ctrl-shift-a"]);
+    }
+    chords.into_iter().map(|chord| KeyBinding::new(chord, NoAction, Some(KEY_CONTEXT))).collect()
 }
 
 pub(crate) const KEY_CONTEXT: &str = "Terminal";
 
 fn terminals(cx: &App) -> Option<Entity<Terminals>> {
     cx.try_global::<TerminalsGlobal>().map(|g| g.0.clone())
+}
+
+/// Whether any shell has something an update's restart would lose, as
+/// quitting ends every shell: a program running in it, or words at its
+/// prompt (core's `holds_a_restart`). Asked once a second (app_update.rs).
+pub(crate) fn holds_a_restart(cx: &App) -> bool {
+    let Some(terminals) = terminals(cx) else { return false };
+    terminals.read(cx).sessions.values().any(|s| {
+        let s = s.read(cx);
+        rules::holds_a_restart(s.running(), s.shell_alone_in_front(), &s.line)
+    })
 }
 
 /// What the dock shows for the Terminal panel: the panel's own view, which
@@ -148,7 +172,7 @@ fn split_around<'a>(panel: &str, node: &'a DockNode) -> Option<&'a DockSplit> {
 fn target_of(app: &Threadbear) -> Target {
     let thread = app.open_thread();
     let runner = thread.and_then(|t| t.runner_id.as_deref()).map(|id| app.runner_name_of(id));
-    rules::target_for(thread, &crate::files::home_dir(), runner.as_deref(), |path| std::path::Path::new(path).is_dir())
+    rules::target_for(thread, &crate::files::home_dir(), runner.as_deref(), |path| threadbear_core::open_policy::local_metadata(std::path::Path::new(path)).is_ok_and(|m| m.is_dir()))
 }
 
 /// The runner said a thread changed (`thread.updated`): an archive it's agreed
@@ -291,7 +315,15 @@ impl Terminals {
                 end_shells_now(&shells);
             }
             #[cfg(not(unix))]
-            let _ = (this, cx);
+            {
+                let closing: Vec<_> = this.sessions.values().map(|s| s.update(cx, |s, _| { s.shut_down(); s.shared.clone() })).collect();
+                // GPUI gives returned quit futures only 200ms. Like the Unix
+                // branch, finish closing here before returning that future.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while closing.iter().any(|s| !s.reader_closed.load(Ordering::Acquire)) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             async {}
         });
         let home = crate::files::home_dir();
@@ -321,6 +353,7 @@ impl Terminals {
     fn focus(&self, session: &Entity<Session>, window: &mut Window, cx: &mut App) {
         let handle = session.read(cx).focus.clone();
         window.focus(&handle, cx);
+        crate::web_panels::keyboard_to_app(window);
     }
 
     /// Ends a thread's shell (it was archived or deleted). Never the shared
@@ -504,6 +537,8 @@ struct Shared {
     /// A redraw is on its way: the reader sends one wakeup per frame at most.
     dirty: AtomicBool,
     exited: AtomicBool,
+    #[cfg(not(unix))]
+    reader_closed: AtomicBool,
     sender: OnceLock<EventLoopSender>,
     size: Mutex<WindowSize>,
     notes: tokio::sync::mpsc::UnboundedSender<Note>,
@@ -609,7 +644,12 @@ enum Drag {
 impl Session {
     fn start(target: Target, size: GridSize, cx: &mut Context<Self>) -> Self {
         let (notes, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-        let shared = Arc::new(Shared { dirty: AtomicBool::new(false), exited: AtomicBool::new(false), sender: OnceLock::new(), size: Mutex::new(size.window_size()), notes });
+        let shared = Arc::new(Shared {
+            dirty: AtomicBool::new(false), exited: AtomicBool::new(false),
+            #[cfg(not(unix))]
+            reader_closed: AtomicBool::new(false),
+            sender: OnceLock::new(), size: Mutex::new(size.window_size()), notes
+        });
         // SwiftTerm keeps 500 lines back, which loses a build's errors, so
         // this keeps alacritty's 10,000. The cursor blinks, as SwiftTerm's
         // does, unless a program asks for a steady one.
@@ -670,6 +710,8 @@ impl Session {
         if let Err(e) = session.spawn_shell() {
             session.exited = true;
             session.failed = Some(e.to_string());
+            #[cfg(not(unix))]
+            session.shared.reader_closed.store(true, Ordering::Release);
         }
         session
     }
@@ -703,7 +745,17 @@ impl Session {
         let _ = self.shared.sender.set(event_loop.channel());
         // Its thread runs until the shell ends or is told to stop; nothing
         // waits for it.
-        drop(event_loop.spawn());
+        let reader = event_loop.spawn();
+        #[cfg(unix)]
+        drop(reader);
+        #[cfg(not(unix))]
+        {
+            let shared = self.shared.clone();
+            std::thread::spawn(move || {
+                drop(reader.join()); // drops ConPTY, including its shell
+                shared.reader_closed.store(true, Ordering::Release);
+            });
+        }
         Ok(())
     }
 
@@ -871,6 +923,43 @@ impl Session {
                 text.trim_end().to_owned()
             })
             .collect()
+    }
+
+    /// The screen as lines of text rather than rows: a row the text wrapped
+    /// from (the grid marks it) is joined to the next, and trailing spaces
+    /// go. For the specs, as a command after a long prompt wraps in a narrow
+    /// panel, and the rows alone can't say which of them are one line.
+    #[cfg(feature = "automation")]
+    pub(crate) fn screen_text_lines(&self) -> Vec<String> {
+        use alacritty_terminal::term::cell::Flags;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let offset = grid.display_offset() as i32;
+        let cols = term.columns();
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        for row in 0..term.screen_lines() as i32 {
+            let row = &grid[GridLine(row - offset)];
+            // As the screen draws them (terminal_element.rs): a wide
+            // character's spacer cells aren't characters, and an accent
+            // typed after its letter rides on that letter's cell.
+            for c in 0..cols {
+                let cell = &row[Column(c)];
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line.push(cell.c);
+                line.extend(cell.zerowidth().into_iter().flatten());
+            }
+            if cols == 0 || !row[Column(cols - 1)].flags.contains(Flags::WRAPLINE) {
+                lines.push(line.trim_end().to_owned());
+                line.clear();
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line.trim_end().to_owned());
+        }
+        lines
     }
 
     // ---- Keys and text ----
@@ -1079,6 +1168,7 @@ impl Session {
 
     pub(crate) fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        crate::web_panels::keyboard_to_app(window);
         let Some((col, row, side)) = self.cell_at(event.position, false) else { return };
         let button = match event.button {
             MouseButton::Left => rules::MouseButton::Left,
@@ -1220,7 +1310,10 @@ impl Render for Session {
             .track_focus(&self.focus)
             .key_context(KEY_CONTEXT)
             .on_key_down(cx.listener(Self::key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| window.focus(&this.focus, cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                window.focus(&this.focus, cx);
+                crate::web_panels::keyboard_to_app(window);
+            }))
             // A little in from the panel's edges, on the terminal's own
             // background (TerminalHost.Container.inset).
             .child(div().size_full().px(px(10.)).py(px(6.)).child(TerminalElement::new(me, focused, self.blink_shown)));
@@ -1361,6 +1454,7 @@ pub(crate) fn dump(app: &Threadbear, cx: &App) -> Value {
         "cols": session.map(|s| s.size.cols),
         "rows": session.map(|s| s.size.rows),
         "screen": session.map(|s| s.screen_lines()),
+        "lines": session.map(|s| s.screen_text_lines()),
         "shells": shells,
     })
 }
@@ -1551,6 +1645,7 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Win
         let session = terminals.update(cx, |t, cx| t.open(&target, cx));
         let handle = session.read(cx).focus.clone();
         window.focus(&handle, cx);
+        crate::web_panels::keyboard_to_app(window);
         window.render_frame(cx);
         if let Some(text) = cmd["keys"].as_str() {
             window.input(text, cx);
@@ -1571,17 +1666,23 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Win
         let handle = session.read(cx).focus.clone();
         if cmd["select"].as_str() == Some("all") || cmd["copy"].as_bool() == Some(true) || cmd["paste"].is_string() {
             window.focus(&handle, cx);
+            crate::web_panels::keyboard_to_app(window);
             window.render_frame(cx);
         }
+        // The terminal's own keys for them (`key_down`): ⌘ on the Mac, and
+        // Control-Shift elsewhere, as Control-C there is the shell's
+        // interrupt. `secondary-` is Control alone off the Mac, so on Linux
+        // the copy went to the shell as ^A and ^C and nothing was copied.
+        let key = |letter: &str| if cfg!(target_os = "macos") { format!("cmd-{letter}") } else { format!("ctrl-shift-{letter}") };
         if cmd["select"].as_str() == Some("all") {
-            window.press("secondary-a", cx);
+            window.press(&key("a"), cx);
         }
         if cmd["copy"].as_bool() == Some(true) {
-            window.press("secondary-c", cx);
+            window.press(&key("c"), cx);
         }
         if let Some(text) = cmd["paste"].as_str() {
             cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
-            window.press("secondary-v", cx);
+            window.press(&key("v"), cx);
         }
         if let Some(lines) = cmd["scroll"].as_f64() {
             // A real wheel turn over the middle of the grid, through hit testing.

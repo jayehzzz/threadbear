@@ -127,6 +127,13 @@ or an optional `mpv` download. The web engine avoids a second big extra, but
 stock Chromium builds usually leave out H.264, which most screen recordings
 use, so stage 0 checks that first. If it can't play them, it's `mpv`.
 
+On the Mac it's settled (12 Nov): the runtime's minimal Chromium has no
+H.264, so a video plays in AVKit's own player and a PDF shows in PDFKit's
+view, each a native view over the pane or the review window's stage, placed
+the way the web panels' pages are (`desktop/gpui/src/media_view.rs`,
+`desktop/gpui/native/media_views.m`). Windows and Linux still open them in
+their own app.
+
 ### Self-update and restart handover
 
 Today the installed app notices main has changed, rebuilds itself in a private
@@ -215,6 +222,14 @@ read, the way `desktop/test/auth-vector-*.txt` already works for sign-in.
 gpui-kit stock, pinned to exact versions, no fork. Ghostex forked both gpui and
 its component library and has had to re-merge them many times since. We take a
 fork only when a shim can't do the job, and write down why.
+
+The one so far (12 Nov): `desktop/vendor/gpui-component`, the components crate
+at the pinned version with its popup menus drawn as macOS draws its own. The
+kit draws every menu's rows itself (their height, padding and gaps, the tick
+in the icon's place) and nothing outside the crate reaches them, and every
+dropdown, context menu and the sidebar's menus go through it. Its first commit
+is the crate as published, so `git log -p desktop/vendor` is the whole fork;
+a gpui-kit bump copies the new version in and puts that back.
 
 ### Borrowed from Ghostex (MIT, notice kept)
 
@@ -333,12 +348,20 @@ Decided: **A, the daily driver first.**
    Settings in UserDefaults (dock layout, zoom, appearance) get imported once.
    Only one app posts notifications, and `threadbear-desktop` counts as being
    at the Mac.
-3. **Freeze new features in the Swift app.** Bug fixes only. New features go
-   in the GPUI app with a spec, so the list stops moving.
+3. **Freeze the Swift app** (since 12 Nov 2026). No more code in `app/` or
+   `dock/`: everything goes in the GPUI app, with a spec, so the list stops
+   moving. `scripts/swift-freeze.sh` refuses it in Mike's copy, as a Claude
+   Code hook on edits (`.claude/settings.json`) and git's pre-commit hook
+   (`worktree-setup.sh` puts it in).
+   **Releasing the GPUI app to other people starts the overlap**, with both
+   apps installed: that release turns on `WARN_FORKS` in the script, so their
+   agents get a warning (not a refusal) on Swift edits and commits, pointing
+   them at `desktop/`.
 4. **Cutover** once every Mac row in the parity table passes and Mike's used it
    for two weeks without going back. One last Swift build moves other people
    across: installs Rust if needed, builds the GPUI app, and swaps itself.
-   `app/` and `dock/` then go.
+   `app/` and `dock/` then go, once what the GPUI and iPhone apps still
+   use from `app/` (`scripts/swift-freeze.sh` lists it) has moved out.
 5. **Windows and Linux get it as releases** once their parity rows pass.
 
 The website and the iPhone app aren't touched. Later, Ghostex's GPUI-in-the-
@@ -458,9 +481,14 @@ for real browsing. I'd skip it: two engines means two sandboxes to prove.
   the Swift app's is; a tooltip from the panel's bar that falls over its
   page is hidden behind it, which Ghostex's small borderless windows (the
   spike) would fix. ⌘C, ⌘V, ⌘X, ⌘A and ⌘Z go to a page that has the
-  keyboard (GPUI's view answers key equivalents for the whole window, and
-  the app has no Edit menu yet). A panel moved into a window of its own
-  says its page shows in the main window, for now.
+  keyboard (GPUI's view answers key equivalents for the whole window). GPUI's own view never asks AppKit for the
+  keyboard back once a page's view has had it, so the app hands it over
+  whenever it asks GPUI to focus something (even the box that already had
+  GPUI's focus), on a click anywhere GPUI draws, and when the page goes out
+  of sight. Without that, a paste
+  landed in the composer while every letter beeped (12 Nov;
+  `features/tools/real-typing.ts` plays it with real keys). A panel moved
+  into a window of its own says its page shows in the main window, for now.
 
 ## Risks
 
@@ -485,7 +513,11 @@ What stage 0 found (9 Nov):
   root, the dock's bars and the thread pane above the list; caching those
   needs the dock to hand out its bars as views. Scroll anchoring and
   streaming with no jumps still have to prove themselves as the real rows
-  arrive.
+  arrive. The same held with nothing scrolling: a spinner in the sidebar
+  asked for a frame every frame, and each one laid the open thread out
+  again. With the spinners asking 30 times a second and the main panel
+  cached too, a thread at work in the background costs about 155 ms of the
+  main thread a second instead of 590 (`features/tools/idle-perf.ts`, 12 Nov).
 - **Web pages inside GPUI: works on the Mac.** A spike put a real Chromium page
   in a normal layout slot, resizing with it. GPUI's own menus can't draw over a
   page, so those popups open in small borderless windows of their own, as

@@ -60,6 +60,18 @@ pub struct Saved {
     pub completion_sound_volume: Option<f64>,
     /// `askBeforeQuitting` (QuitPrompt): None is yes.
     pub ask_before_quitting: Option<bool>,
+    /// `activityLog` (ActivityRecorder): Settings > General's Keep an
+    /// activity log (activity.rs). Off until it's turned on.
+    pub activity_log: Option<bool>,
+    /// When the Swift app's settings and drafts were brought across
+    /// (swift_import.rs): once, so none is.
+    pub swift_import: Option<String>,
+    /// The parts of that done so far ("settings", "drafts", "files"), each
+    /// once, while another is still to go after a failure.
+    pub swift_import_parts: Vec<String>,
+    /// `updateRestore`: the sidebar's view and the thread that were open
+    /// when the app restarted itself for an update, put back once (app_update.rs).
+    pub update_restore: Option<Value>,
     /// `runnersPanelOpen`: the runners whose details are open in the Runners
     /// panel, their ids with commas between.
     pub runners_panel_open: Option<String>,
@@ -115,16 +127,17 @@ impl Settings {
     }
 
     /// Written whole and renamed into place, so a crash mid-write can't leave
-    /// half a file (the same as shortcuts.json's atomic write in the Swift app).
+    /// half a file (the same as shortcuts.json's atomic write in the Swift app),
+    /// and only this user's, as everything in the data folder is.
     pub fn save(&self) {
-        let Ok(text) = serde_json::to_string_pretty(&self.saved) else { return };
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let temp = self.path.with_extension("json.tmp");
-        if std::fs::write(&temp, text).is_ok() {
-            let _ = std::fs::rename(&temp, &self.path);
-        }
+        let _ = self.save_checked();
+    }
+
+    /// `save`, saying whether it went, for a record that mustn't be lost
+    /// (swift_import.rs).
+    pub fn save_checked(&self) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(&self.saved).map_err(|e| e.to_string())?;
+        threadbear_core::private_file::write(&self.path, text.as_bytes()).map_err(|e| format!("couldn't save {}: {e}", self.path.display()))
     }
 
     pub fn zoom_percent(&self) -> u32 {

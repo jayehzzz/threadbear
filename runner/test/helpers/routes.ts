@@ -37,6 +37,8 @@ export type View = {
   looseEnds: string[];
   // Review by another lab's ledger on the last turn's card.
   review?: unknown;
+  // Plan first plans drawn as plan cards, "<first line> (waiting|go|revise)".
+  plans: string[];
   messages: { role: 'user' | 'assistant'; text: string; pictures: number }[];
 };
 
@@ -49,6 +51,8 @@ export type Play = {
   send(text: string, images?: ImageRef[]): void;
   /** Turns on Run on the card, for the next end_turn. */
   runAsks(): void;
+  /** Mike presses Go ahead on the last plan (plans.approve). */
+  approvePlan(): void;
   /** The agent puts a Plan first plan to Mike (plan.proposed). */
   proposePlan(text: string): void;
   /** Turns on the done card's loose ends, with a check-in booked for this thread. */
@@ -82,9 +86,10 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
 
   const id = thread.id;
   const at = new Date(h.clock.now()).toISOString();
+  const remote = () => ({ runners: [{ id: RUNNER, name: 'bruce', online: true, lastSeenAt: at }], threads: [{ runnerId: RUNNER, threadId: id, title: 't', cwd: '/x', accountId: 'a', provider: 'claude', status: 'idle', needsYou: false, unread: true, preview: '', createdAt: at, lastActivityAt: at }] });
   const relay = new Relay({
     source: () => ({ key: OWNER, post: post as never, apiVersion: 999 }),
-    remote: () => ({ runners: [{ id: RUNNER, name: 'bruce', online: true, lastSeenAt: at }], threads: [{ runnerId: RUNNER, threadId: id, title: 't', cwd: '/x', accountId: 'a', provider: 'claude', status: 'idle', needsYou: false, unread: true, preview: '', createdAt: at, lastActivityAt: at }] }),
+    remote,
     subscribed: () => false,
     publish: () => {},
     clock: h.clock,
@@ -96,7 +101,7 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
   const here = (): View => {
     const t = h.runner.get(id);
     const events = h.runner.events(id, {}).events as Record<string, any>[];
-    return { needs: t.needs, asks: (t.asks ?? []) as Ask[], next: lastNext(events), looseEnds: (t.looseEnds?.ends ?? []).map((e) => e.text), review: events.filter((e) => e.type === 'turn.completed').at(-1)?.review, messages: messagesOf(events) };
+    return { needs: t.needs, asks: (t.asks ?? []) as Ask[], next: lastNext(events), looseEnds: (t.looseEnds?.ends ?? []).map((e) => e.text), review: events.filter((e) => e.type === 'turn.completed').at(-1)?.review, plans: plansOf(events), messages: messagesOf(events) };
   };
   const viaRelay = async (): Promise<View> => {
     // A turn's end is held back until that runner's row has said so for 4 s.
@@ -104,11 +109,15 @@ export async function threeWays(play: (p: Play) => void | Promise<void>) {
     h.clock.advance(5000);
     const { events } = (await relay.call(id, 'threads.events', { threadId: id })) as { events: Record<string, any>[] };
     const end = events.filter((e) => e.type === 'turn.completed').at(-1);
-    return { needs: end?.needs, asks: (end?.asks ?? []) as Ask[], next: (end?.next ?? []) as string[], looseEnds: [], review: end?.review, messages: messagesOf(events) };
+    // The loose ends as the app gets them: on the thread's row in the
+    // sidebar's list, for the done card's own seq.
+    const listed = relay.overlay(remote()).threads.find((t) => t.threadId === id) as { looseEnds?: { seq: number; ends: { text: string }[] } } | undefined;
+    const ends = listed?.looseEnds && end && listed.looseEnds.seq === end.seq ? listed.looseEnds.ends.map((e) => e.text) : [];
+    return { needs: end?.needs, asks: (end?.asks ?? []) as Ask[], next: (end?.next ?? []) as string[], looseEnds: ends, review: end?.review, plans: plansOf(events), messages: messagesOf(events) };
   };
   const viaPhone = async (): Promise<View> => {
     const r = (await call(b.ctx, mods.phone.thread!, { token: TOKEN, threadId: id })) as { thread: Record<string, any>; messages: { role: 'user' | 'assistant'; text: string }[] };
-    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0 })) };
+    return { needs: r.thread.needs, asks: (r.thread.asks ?? []) as Ask[], next: (r.thread.next ?? []) as string[], looseEnds: ((r.thread.looseEnds ?? []) as { text: string }[]).map((e) => e.text), review: r.thread.review, plans: [], messages: r.messages.map((m) => ({ role: m.role, text: m.text, pictures: 0 })) };
   };
   const views = { here: here(), relay: await viaRelay(), phone: await viaPhone() };
   await sync.stop();
@@ -138,9 +147,17 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
     const s = h.adapter.last;
     s.init();
     let n = 0;
+    let lastPlan = '';
     await play({
       say: (text) => s.text(`m${++n}`, text),
-      proposePlan: (text) => s.out({ kind: 'planProposed', itemId: `p${++n}`, text }),
+      proposePlan: (text) => {
+        lastPlan = `p${++n}`;
+        s.out({ kind: 'planProposed', itemId: lastPlan, text });
+      },
+      approvePlan: () => {
+        h.runner.approvePlan({ threadId: thread.id, itemId: lastPlan });
+        h.adapter.last.init();
+      },
       endTurn: (input) => {
         const id = `e${++n}`;
         s.out({ kind: 'event', event: { type: 'tool.call', itemId: id, name: END_TURN, kind: 'mcp', title: 'threadbear: end_turn', input } });
@@ -185,6 +202,17 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
     await new Promise((r) => setTimeout(r, 20));
   }
   return { h, sync, ids };
+}
+
+// The Plan first plans drawn as plan cards (plan.proposed), and whether
+// each is still waiting, went ahead or was sent back (plan.resolved).
+function plansOf(events: Record<string, any>[]): string[] {
+  return events
+    .filter((e) => e.type === 'plan.proposed')
+    .map((p) => {
+      const r = events.find((e) => e.type === 'plan.resolved' && e.itemId === p.itemId);
+      return `${String(p.text).split('\n')[0]} (${r ? r.decision : 'waiting'})`;
+    });
 }
 
 // The done card's follow-ups: the last turn's end.

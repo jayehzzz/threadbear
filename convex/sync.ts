@@ -12,7 +12,7 @@ import { actAs, checkRunnerId, forbidden, hasLiveKey, pageLimit, readRunnerOrder
 import { scrubDoc, scrubEveryString, SCRUB_RULES_VERSION, HELD_BACK } from './redaction';
 import { dropHead, seedHeads, syncHead, syncHeads } from './projectHeads';
 import { dropNotes, putNotes, syncNotes } from './projectNotes';
-import { badRunnerStats, cutBytes, docBytes, fitUsage, impossibleUsage, isIsoTime, LOGIN_EMAIL, LOGIN_PROVIDER, loginKey, mayClaim, NAME_CHARS, mayFinish, mayTake, mayTouch, mayUseStorage, mayWrite, nameSkeleton, normalName, ownsCard, SCHEDULE_ID, utf8Bytes, wholeIn, type Caller, type UsageDoc } from './runnerAccess';
+import { badRunnerStats, cutBytes, docBytes, fitUsage, holdThreadTimes, impossibleUsage, isIsoTime, LOGIN_EMAIL, LOGIN_PROVIDER, loginKey, isThreadId, mayClaim, NAME_CHARS, mayFinish, mayTake, mayTouch, mayUseStorage, mayWrite, nameSkeleton, normalName, ownsCard, SCHEDULE_ID, utf8Bytes, wholeIn, type Caller, type UsageDoc } from './runnerAccess';
 import { dropWake, seedWakes, syncWake } from './wakes';
 import { pushFailing, pushOff } from './pushHealth';
 import { issueToken as makeToken, listTokens as allTokens, revokeToken as revokeOne, tokenInfo, tokenKind, MAX_DAYS } from './tokens';
@@ -79,6 +79,8 @@ async function ownThread(ctx: QueryCtx | MutationCtx, caller: Caller, threadId: 
 // (runnerAccess.ts mayClaim).
 async function claimable(ctx: QueryCtx | MutationCtx, caller: Caller, threadId: string): Promise<boolean> {
   if (caller.owner) return true;
+  // Only an id of a thread id's shape (runnerAccess.ts isThreadId).
+  if (!isThreadId(threadId)) return false;
   const row = await threadRow(ctx, threadId);
   if (row) return row.runnerId === caller.runnerId;
   const claimedBy: string[] = [];
@@ -458,9 +460,25 @@ function fitThread<T extends Record<string, any>>(t: T): T | undefined {
   // Never in the future: lists are by activity, and a far-off time would
   // push every other Mac's threads off them.
   if (typeof out.lastActivityMs === 'number') out.lastActivityMs = Math.min(out.lastActivityMs, Date.now());
+  holdThreadTimes(out);
   for (const f of ['title', 'preview', 'cwd', 'working', 'asked']) if (typeof out[f] === 'string') out[f] = cutBytes(out[f], f === 'title' ? 300 : CAP.threadText);
   if (typeof out.recap === 'string') out.recap = cutBytes(out.recap, CAP.recap);
   if (Array.isArray(out.looseEnds)) out.looseEnds = out.looseEnds.slice(0, 10).map((e: any) => ({ ...e, text: cutBytes(String(e.text ?? ''), 300) }));
+  if (out.review && Array.isArray(out.review.findings)) {
+    const cut = (s: unknown, n: number) => (typeof s === 'string' ? cutBytes(s, n) : undefined);
+    out.review = {
+      ...out.review,
+      reviewer: cutBytes(String(out.review.reviewer ?? ''), 100),
+      findings: out.review.findings.slice(0, 20).map((f: any) => {
+        const o: Record<string, unknown> = { ...f, claim: cutBytes(String(f.claim ?? ''), 300) };
+        for (const [k, n] of [['where', 200], ['case', 300], ['note', 300]] as const) {
+          if (o[k] === undefined) continue;
+          o[k] = cut(o[k], n);
+        }
+        return o;
+      }),
+    };
+  }
   if (typeof out.keywords === 'string') out.keywords = cutBytes(out.keywords, CAP.keywords);
   if (out.startedBy) out.startedBy = { ...out.startedBy, label: cutBytes(String(out.startedBy.label ?? ''), 100), ...(out.startedBy.why !== undefined ? { why: cutBytes(String(out.startedBy.why), 300) } : {}) };
   // The card waiting on Mike is cut, never dropped: the phone shows the
@@ -472,9 +490,9 @@ function fitThread<T extends Record<string, any>>(t: T): T | undefined {
   if (docBytes(out) > CAP.threadDoc && Array.isArray(out.asks) && out.asks.some((a: any) => a?.optionNotes)) {
     out.asks = out.asks.map(({ optionNotes: _notes, ...a }: any) => a);
   }
-  // The done card's loose ends go first: the Mac has them, and the card
-  // still says Done without them.
-  for (const f of ['looseEnds', 'asks', 'next', 'links', 'projects']) {
+  // Another lab's review goes first, then the done card's loose ends: the
+  // Mac has both, and the card still says Done without them.
+  for (const f of ['review', 'looseEnds', 'asks', 'next', 'links', 'projects']) {
     if (docBytes(out) <= CAP.threadDoc) break;
     delete out[f];
   }
@@ -1318,6 +1336,7 @@ const messageDoc = v.object({
   toolKind: v.optional(v.string()),
   summary: v.optional(v.boolean()), // API 14
   plan: v.optional(v.boolean()), // API 72
+  planDecision: v.optional(v.union(v.literal('go'), v.literal('revise'))), // API 76
   turn: v.optional(v.string()), // API 26
   wokeBy: v.optional(v.array(v.object({ kind: v.string(), description: v.string() }))), // API 33
   buttons: v.optional(v.array(messageButton)), // API 59
@@ -1388,6 +1407,8 @@ export const appendMessages = mutation({
         if (m.pagedAt && !existing.pagedAt) patch.pagedAt = m.pagedAt;
         const buttons = keepPresses(existing.buttons, m.buttons);
         if (!sameButtons(existing.buttons, buttons)) patch.buttons = buttons;
+        // A plan's row sent again once it's resolved (API 76): only on a plan.
+        if (m.planDecision && existing.plan && existing.planDecision !== m.planDecision) patch.planDecision = m.planDecision;
         if (!Object.keys(patch).length) continue;
         // A runner key's row growing (bigger buttons sent again) is counted
         // against its budget like a new one, and waits when there's no room;
@@ -2254,11 +2275,15 @@ export const pools = query({
     const caller = await runnerAuth(ctx, key, 'pools');
     const rows = await ctx.db.query('pools').collect();
     rows.sort((a, b) => a.order - b.order);
-    // A member named by runner id (a login with no email known) only counts
-    // on that runner, so a runner key has no use for another runner's, and
-    // its id is the owner's to know (runnersList).
-    const seen = (m: { runnerId?: string }) => caller.owner || m.runnerId === undefined || m.runnerId === caller.runnerId;
-    return rows.map(({ id, title, members, folders, icon }) => ({ id, title, members: members.filter(seen), ...(folders ? { folders } : {}), ...(icon ? { icon } : {}) }));
+    // A member named by runner id alone (a login with no email known) only
+    // counts on that runner, so a runner key has no use for another
+    // runner's, and its id is the owner's to know (runnersList). One with an
+    // email too (API 75: two logins on its runner share that email) goes to
+    // every runner, without the id for another runner's key.
+    const mine = (m: { runnerId?: string }) => caller.owner || m.runnerId === undefined || m.runnerId === caller.runnerId;
+    const forCaller = (members: { provider: string; email?: string; runnerId?: string; accountId?: string }[]) =>
+      members.flatMap((m) => (mine(m) ? [m] : m.email ? [{ provider: m.provider, email: m.email }] : []));
+    return rows.map(({ id, title, members, folders, icon }) => ({ id, title, members: forCaller(members), ...(folders ? { folders } : {}), ...(icon ? { icon } : {}) }));
   },
 });
 

@@ -24,7 +24,11 @@ pub(crate) fn install(app: WeakEntity<Threadbear>, cx: &mut App) {
 
 fn refuse(message: String, cx: &mut App) {
     let Some(app) = cx.try_global::<GateNotices>().and_then(|n| n.0.upgrade()) else { return };
-    app.update(cx, |app, cx| app.show_error(message, cx));
+    // Said once the click's update is over: the gate is opened from inside
+    // the app's own updates too (the row's Open on Web, the Connectors
+    // panel, a project page's links), and updating the app from inside one
+    // of those is a double lease, which crashes the app.
+    cx.defer(move |cx| app.update(cx, |app, cx| app.show_error(message, cx)));
 }
 
 /// The system's own opener. Only this file reaches it.
@@ -207,12 +211,6 @@ pub(crate) fn text_view(state: &Entity<gpui_kit::base::TextViewState>, origin: O
     gpui_kit::base::TextView::new(state).on_link_click(move |url: &SharedString, event: &ClickEvent, _: &mut Window, cx: &mut App| clicked(url, event, origin, &base, cx))
 }
 
-/// The same for the kit's markdown text made from a string.
-pub(crate) fn markdown_view(id: impl Into<ElementId>, text: impl Into<SharedString>, origin: Origin, base: &str) -> gpui_kit::component::text::TextView {
-    let base = base.to_owned();
-    gpui_kit::component::text::TextView::markdown(id, text).on_link_click(move |url: &SharedString, event: &ClickEvent, _: &mut Window, cx: &mut App| clicked(url, event, origin, &base, cx))
-}
-
 /// The base kit's markdown text made from a string, for text that takes the
 /// reading column's style (`rows::reading_style`), as the asks card's
 /// paragraphs do.
@@ -255,6 +253,61 @@ pub(crate) fn open_file(path: &str, origin: Origin, cx: &mut App) {
     }
 }
 
+// ---------------------------------------------------------------- shown in the app
+
+/// A video or a PDF in the Mac's own view (media_view.rs), in `opening`'s
+/// window view: only this Mac's own file, and only a real one of the kind
+/// the view is for, after its symlinks are followed (`decide_media`). The
+/// view is handed the file the rules opened and checked, and reads that,
+/// never the path again (Codex's review, 12 Nov: a file swapped in at the
+/// path after the check was what played). The only maker of those views, so
+/// nothing reads a film or a PDF any other way, and a PDF's links come back
+/// here (`open_link`) rather than going to the system
+/// (desktop/core/tests/open_gate_source.rs).
+pub(crate) fn show_media(path: &str, origin: Origin, kind: crate::media_view::Kind, opening: crate::media_view::Opening) -> Result<crate::media_view::Media, String> {
+    use crate::media_view::Kind;
+    use policy::{Media, MediaVerdict};
+    let wants = if kind == Kind::PaneDocument { Media::Pdf } else { Media::Video };
+    let name = threadbear_core::highlights::last_component(path).to_owned();
+    if policy::media_kind(path) != Some(wants) {
+        return Err(format!("{name} isn't {}, so Threadbear didn't open it.", if wants == Media::Pdf { "a PDF" } else { "a video" }));
+    }
+    match policy::decide_media(path, origin) {
+        MediaVerdict::Refuse(why) => Err(why),
+        MediaVerdict::Show(checked) => open_media(checked, kind, opening).ok_or_else(|| format!("{name} couldn't be read, so it isn't showing.")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_media(checked: policy::CheckedFile, kind: crate::media_view::Kind, opening: crate::media_view::Opening) -> Option<crate::media_view::Media> {
+    use std::os::fd::IntoRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    extern "C" {
+        fn tb_media_open(parent: *mut std::ffi::c_void, file: i32, length: i64, path: *const std::ffi::c_char, kind: i32, muted: bool, volume: f32) -> *mut std::ffi::c_void;
+    }
+    let path = std::ffi::CString::new(checked.real.as_os_str().as_bytes()).ok()?;
+    // Among them all they're muted, as they all play at once; on the stage,
+    // where the last clip was left; in the pane, with its sound.
+    let (muted, volume) = match kind {
+        crate::media_view::Kind::CellVideo => (true, 1.),
+        crate::media_view::Kind::StageVideo => opening.audio.unwrap_or((false, 1.)),
+        _ => (false, 1.),
+    };
+    let length = i64::try_from(checked.len).ok()?;
+    // The view owns the open file from here, and closes it, whether or not
+    // it's made.
+    let file = checked.file.into_raw_fd();
+    let view = unsafe { tb_media_open(opening.parent, file, length, path.as_ptr(), kind as i32, muted, volume) };
+    // Safety: a view tb_media_open just made, owned by nothing else.
+    unsafe { crate::media_view::Media::from_native(view, kind) }
+}
+
+/// Elsewhere there's no view for them: they open in their own app.
+#[cfg(not(target_os = "macos"))]
+fn open_media(_checked: policy::CheckedFile, _kind: crate::media_view::Kind, _opening: crate::media_view::Opening) -> Option<crate::media_view::Media> {
+    None
+}
+
 /// A file shown in its folder (Finder, or the system's file browser), which
 /// shows it without opening it. Another Mac's file isn't on this one.
 pub(crate) fn reveal(path: &str, origin: Origin, cx: &mut App) {
@@ -262,10 +315,21 @@ pub(crate) fn reveal(path: &str, origin: Origin, cx: &mut App) {
         refuse(format!("{} is on another Mac.", threadbear_core::highlights::last_component(path)), cx);
         return;
     }
-    if scripted_opens(&format!("reveal {path}")) {
-        return;
+    let result = policy::with_local_path(Path::new(path), |_| {
+        if !scripted_opens(&format!("reveal {path}")) {
+            #[cfg(windows)]
+            let real = policy::real_path(Path::new(path))?;
+            #[cfg(windows)]
+            if real.to_string_lossy().starts_with(r"\\") { return Err(std::io::Error::other("That path can't be shown by the Windows shell.")); }
+            #[cfg(not(windows))]
+            let real = Path::new(path).to_path_buf();
+            cx.reveal_path(policy::system_path(&real));
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        refuse(format!("Couldn't show that file: {error}"), cx);
     }
-    cx.reveal_path(Path::new(path));
 }
 
 // ---------------------------------------------------------------- asking

@@ -43,7 +43,10 @@ impl RemoteRunner {
 /// unread one gets 1 and 0, which is all the rows look at.
 fn summary(row: &Value) -> Option<ThreadSummary> {
     let runner_id = row["runnerId"].as_str().filter(|s| !s.is_empty())?.to_owned();
-    let id = row["threadId"].as_str().filter(|s| !s.is_empty())?.to_owned();
+    // The backend takes any string a runner writes, and an extra Mac may be
+    // compromised: a row whose id isn't a thread id's shape is left out, as
+    // the id goes into shell lines and links (thread_link::is_thread_id).
+    let id = row["threadId"].as_str().filter(|s| crate::thread_link::is_thread_id(s))?.to_owned();
     let text = |key: &str| row[key].as_str().unwrap_or("").to_owned();
     let unread = row["unread"].as_bool().unwrap_or(false);
     let created = row["createdAt"].as_str().and_then(parse_ms).unwrap_or(0);
@@ -75,6 +78,10 @@ fn summary(row: &Value) -> Option<ThreadSummary> {
         last_seen_seq: 0,
         runner_id: Some(runner_id),
         permission_mode: "full".to_owned(),
+        // The done card's loose ends, which this Mac's runner adds to the row
+        // of a thread it's watching (relay.ts `overlay`): the sidebar's own
+        // rows don't carry them, and this summary replaces the last one.
+        loose_ends: row.get("looseEnds").filter(|v| v.is_object()).cloned(),
         ..Default::default()
     })
 }
@@ -233,6 +240,24 @@ mod tests {
         // No activity time falls back to its creation.
         assert_eq!(list.threads[1].last_activity_at, "2026-11-09T01:00:00.000Z");
         assert!(list.threads[1].busy());
+    }
+
+    // The relay puts a watched thread's done-card loose ends on its row
+    // (relay.ts `overlay`): they reach the done card, for the seq it's on.
+    #[test]
+    fn a_rows_loose_ends_reach_the_summary() {
+        let list = decode_remote_threads(&json!({
+            "runners": [{ "id": "r", "name": "bruce" }],
+            "threads": [
+                { "runnerId": "r", "threadId": "t1", "status": "idle", "createdAt": "2026-11-09T01:00:00.000Z",
+                  "looseEnds": { "seq": 47, "ends": [{ "kind": "scheduled", "text": "Look at how the experiment went", "at": "2026-11-15T01:30:00.000Z" }] } },
+                { "runnerId": "r", "threadId": "t2", "status": "idle", "createdAt": "2026-11-09T01:00:00.000Z", "looseEnds": "junk" },
+            ],
+        }));
+        let check = list.threads[0].loose_ends_check().expect("its loose ends");
+        assert_eq!(check.seq, 47);
+        assert_eq!(check.ends[0].text, "Look at how the experiment went");
+        assert!(list.threads[1].loose_ends.is_none(), "one that isn't an object is left off");
     }
 
     #[test]

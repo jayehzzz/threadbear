@@ -336,4 +336,19 @@
 //    phone:search matches them too, and with `everywhere` every view's
 //    threads and every message's text, so a newer phone finds a thread by a
 //    word said anywhere in it. An older phone's search is as before.
-export const API_VERSION = 74;
+// 75: a shared pool member can carry an email and a runner id and login id
+//    together, when two logins of one provider on its runner share that
+//    email (issue 18): that runner takes it by id, the rest by email.
+//    sync:pools gives such a member to every runner key, without the ids
+//    for another runner's. A runner sends the ids only from 75, as an
+//    older backend hides the member from the other runners' keys.
+// 76: threads rows carry `review`, another lab's review ledger from the
+//    last turn's turn.completed (docs/protocol.md, "Review by another
+//    lab"), and `cardTurn`, the turn it and `looseEnds` are from, so
+//    another Mac draws them as this runner's own Mac does. A plan's message
+//    row can carry `planDecision` (go or revise), sent again once it's
+//    resolved, and relay:remoteMessages says which rows are a Plan first
+//    plan and what became of it, so another Mac draws its plan card rather
+//    than folding the plan into the turn's work. A runner sends `review`,
+//    `cardTurn` and `planDecision` only from 76.
+export const API_VERSION = 76;

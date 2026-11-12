@@ -375,6 +375,7 @@ impl Threadbear {
         });
         let handle = field.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        crate::web_panels::keyboard_to_app(window);
     }
 
     /// Makes it, then opens its page. Its thread's folder goes in too, unless
@@ -564,6 +565,7 @@ impl Threadbear {
         });
         let handle = field.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        crate::web_panels::keyboard_to_app(window);
     }
 
     // ---- A thread's projects ----
@@ -776,9 +778,15 @@ impl Threadbear {
                 let title = project.title.clone();
                 input.update(cx, |s, cx| s.set_value(title, window, cx));
             }
+            // Not being typed in, it shows the project's title as it is.
+            if !focused {
+                crate::unsent::saved(&input, cx);
+            }
             return input;
         }
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Title").default_value(project.title.clone()));
+        // A new title typed and not yet saved: an update's restart waits for it.
+        crate::unsent::watch(&input, cx);
         let id = project.id.clone();
         let events = cx.subscribe_in(&input, window, move |this, input, ev: &InputEvent, window, cx| match ev {
             InputEvent::PressEnter { .. } => {
@@ -825,6 +833,9 @@ impl Threadbear {
         let Some(text) = self.project(id).map(|p| field.text(p).to_owned()) else { return };
         let rows = if field == TextField::Notes { (10, 30) } else { (4, 20) };
         let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(rows.0, rows.1).default_value(text));
+        // Changes not yet saved (they're saved with Save, not as typed): an
+        // update's restart waits for them.
+        crate::unsent::watch(&input, cx);
         let events = cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
             // ⌘Return saves, as the Swift box's Save shortcut does.
             if let InputEvent::PressEnter { secondary: true, .. } = ev {
@@ -832,6 +843,7 @@ impl Threadbear {
             }
         });
         input.update(cx, |s, cx| s.focus(window, cx));
+        crate::web_panels::keyboard_to_app(window);
         self.projects.editing = Some(Editing { project: id.to_owned(), field, input, _events: events });
         cx.notify();
     }

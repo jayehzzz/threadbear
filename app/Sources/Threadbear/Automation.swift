@@ -329,11 +329,34 @@ enum Automation {
                 return "ok sent again for \(account.id)"
             }
             return "ok \(account.id) \(account.provider)"
+        case "message-words":
+            // The words one of Mike's messages draws in its bubble, scrolled
+            // on screen first ({"row": its id or start}): "ok a | b", its
+            // lines joined, as an answer is one line. For what a bubble shows
+            // rather than what its message holds.
+            guard let row = displayedRow(c["row"] as? String, app), let index = app.transcript.session?.displayIndex(of: row.id) else { return "error no such row" }
+            app.transcript.scroll(toRow: index, offset: 120)
+            guard let cell = app.transcript.tableView.view(atColumn: 0, row: index, makeIfNecessary: true) as? TextRowCell else { return "error row isn't drawn" }
+            let lines = cell.textView.string.components(separatedBy: CharacterSet(charactersIn: "\n\u{2028}")).filter { !$0.isEmpty }
+            return "ok \(lines.joined(separator: " | "))"
         case "edit-message":
             // The pencil by one of Mike's messages, as a click on it does:
-            // {"row": the row's id or its start}.
+            // {"row": the row's id or its start}. `"click": true` clicks the
+            // pencil itself through the window, the row hovered first as it
+            // shows on hover, so a pencil that's drawn but doesn't answer
+            // fails (thread 3fdaaeec, 12 Nov), as calling the handler can't.
+            // `{"cmd":"edit-message","cancel":true}` leaves the edit.
+            if c["cancel"] as? Bool == true {
+                guard let id = app.selection else { return "error no thread open" }
+                app.cancelEditing(threadId: id)
+                return "ok"
+            }
             guard let row = displayedRow(c["row"] as? String, app) else { return "error no such row" }
-            app.transcript.editMessage(rowId: row.id)
+            if c["click"] as? Bool == true {
+                if let failed = await clickPencil(row, app: app) { return failed }
+            } else {
+                app.transcript.editMessage(rowId: row.id)
+            }
             return app.selection.flatMap { app.editing[$0] } != nil ? "ok editing" : "error that message can't be edited"
         case "subagent":
             // Show a sub-agent's transcript, as a click on its sidebar row
@@ -365,7 +388,29 @@ enum Automation {
             // A thread in a panel of its own, as the row's Open in New Panel.
             let match = thread(c["id"], app)
             guard let id = match.id else { return match.error }
-            app.openThreadInPanel(id)
+            if c["keepSelected"] as? Bool == true {
+                // The state OpenElsewhereNote is there for, which no click
+                // reaches: the thread selected in the main panel as its own
+                // panel opens.
+                app.select(id)
+                let panel = WindowDock.threadPanel(id)
+                if let main = app.dock.layout.group(containing: WindowDock.main) {
+                    app.dock.open(panel, .edge(group: main.id, .right))
+                } else {
+                    app.dock.open(panel, .window(.right))
+                }
+            } else {
+                app.openThreadInPanel(id)
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+            return "ok \(id)"
+        case "move-to-main":
+            // A thread's own panel closed and the thread in the main panel,
+            // as the row's Move to Main Panel.
+            let match = thread(c["id"], app)
+            guard let id = match.id else { return match.error }
+            app.dock.close(WindowDock.threadPanel(id))
+            app.select(id)
             try? await Task.sleep(for: .milliseconds(300))
             return "ok \(id)"
         case "dock-move":
@@ -377,6 +422,20 @@ enum Automation {
             guard let edge = DockEdge(rawValue: c["edge"] as? String ?? "right") else { return "error edge is left, right, top or bottom" }
             app.dock.layout.move(panel, .window(edge))
             return "ok " + app.dock.layout.summary
+        case "label-point":
+            // Where the control whose tooltip is exactly `label` sits: "ok x y",
+            // its middle in points from the window's top left, as the GPUI
+            // app's command says it. For tools that click it with the real
+            // pointer (features/tools/menu-shot.ts).
+            guard let window, let content = window.contentView else { return "error no window" }
+            let label = c["label"] as? String ?? ""
+            // `prefix`: a control whose tooltip starts so (a row's is its title, then a newline).
+            let prefix = c["prefix"] as? Bool == true
+            guard let anchor = all(TipAnchorView.self, in: content).last(where: { (prefix ? $0.text.hasPrefix(label) : $0.text == label) && !$0.isHiddenOrHasHiddenAncestor }) else {
+                return "error nothing labelled \(label) on screen"
+            }
+            let middle = anchor.convert(NSPoint(x: anchor.bounds.midX, y: anchor.bounds.midY), to: nil)
+            return "ok \(Int(middle.x.rounded())) \(Int((window.frame.height - middle.y).rounded()))"
         case "point":
             // Real events at a spot in the window, for SwiftUI controls with
             // nothing to find them by: {"cmd":"point","x":956,"y":265} clicks
@@ -542,6 +601,9 @@ enum Automation {
             default:
                 return "error composer-clip takes copy, cut or paste"
             }
+        case "beeps":
+            // How many times Return on the card had nowhere to go and beeped.
+            return "ok \(TranscriptController.returnBeeps)"
         case "composer-chips":
             // The chips in the box, in order: "picture: Picture 1",
             // "card: Fix the button", "thread: Morning brief".
@@ -897,6 +959,11 @@ enum Automation {
                 guard view.copyImage(to: board), let types = board.pasteboardItems?.first?.types else { return "error nothing copied" }
                 return "ok copied " + types.map(\.rawValue).joined(separator: ",")
             }
+            if c["play"] as? Bool == true {
+                // The film's play button, for a picture of it playing.
+                guard FilePreviewView.current?.debugPlay() == true else { return "error no video is showing" }
+                return "ok playing"
+            }
             if c["close"] as? Bool == true {
                 app.closePreview(in: thread.id)
             } else if c["back"] as? Bool == true {
@@ -936,6 +1003,8 @@ enum Automation {
             return await highlightCommand(c, app: app)
         case "tile":
             return tile(c, app: app)
+        case "tiles":
+            return tiles(c, app: app)
         case "viewer":
             return viewer(c)
         case "folder":
@@ -1287,31 +1356,23 @@ enum Automation {
             return hover(c, app: app)
         case "activity":
             return await activity(c, app: app)
-        case "edit-message":
-            // Clicks the pencil by one of Mike's messages (`row`: its row id
-            // or a prefix), as he would, which loads it into the composer
-            // to edit. `{"cmd":"edit-message","cancel":true}` leaves the edit.
-            if c["cancel"] as? Bool == true {
-                guard let id = app.selection else { return "error no thread open" }
-                app.cancelEditing(threadId: id)
-                return "ok"
-            }
-            guard let prefix = c["row"] as? String, let row = displayedRow(prefix, app),
-                  let index = app.transcript.session?.displayIndex(of: row.id) else { return "error no such row" }
-            app.transcript.scroll(toRow: index, offset: 120)
-            guard let cell = app.transcript.tableView.view(atColumn: 0, row: index, makeIfNecessary: true) as? TextRowCell else { return "error row isn't drawn" }
-            guard !cell.edit.isHidden || cell.debugHover(true) else { return "error \(row.id) can't be edited" }
-            cell.edit.performClick(nil)
-            _ = cell.debugHover(false)
-            try? await Task.sleep(for: .milliseconds(100))
-            guard let id = app.selection, let edit = app.editing[id] else { return "error the edit didn't start" }
-            return "ok editing seq \(edit.seq)"
         case "swipe":
             return await swipe(c, app: app)
         case "page-swipe":
             return await pageSwipe(c, app: app)
         case "decide":
             return decide(c, app: app)
+        case "projectTab":
+            // {"cmd":"projectTab","tab":"decisions"|"project"} picks a tab on
+            // the open project's page as a click does; {"step": 1 or -1} is
+            // ⇧⌘] or ⇧⌘[. Says the tab showing after.
+            guard app.projectTabsShowing, let id = app.openProjectId else { return "error no project page in tabs open" }
+            if let raw = c["tab"] as? String {
+                guard let tab = ProjectTab(rawValue: raw) else { return "error tab is decisions or project" }
+                app.pickProjectTab(id, tab)
+            }
+            if let step = c["step"] as? Int { app.stepProjectTab(by: step) }
+            return "ok " + app.projectTab(id).rawValue
         case "projectParent":
             // {"cmd":"projectParent","title":"<project>","parent":"<project>"}
             // makes it a part of that one, as the ... menu's Make a Part of

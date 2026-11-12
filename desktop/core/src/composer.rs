@@ -582,6 +582,25 @@ pub fn filled_picks(picks: &BTreeMap<i64, i64>, notes: &BTreeMap<i64, AskNote>) 
         .collect()
 }
 
+/// What a picked answer reads as on its chip under a folded card
+/// (AnswerChips): the option's words, or for Something else the words
+/// written (the pictures' marks left out), "Your answer above" before
+/// anything's written, or how many pictures there are. None for a pick that
+/// names no option.
+pub fn picked_answer_label(ask: &Ask, pick: i64, note: Option<&AskNote>) -> Option<String> {
+    if pick == OWN_ANSWER {
+        let note = note.cloned().unwrap_or_default();
+        let words = draft_words(&note.text).trim().to_owned();
+        return Some(match note.images.len() {
+            _ if !words.is_empty() => words,
+            0 => "Your answer above".to_owned(),
+            1 => "1 picture".to_owned(),
+            n => format!("{n} pictures"),
+        });
+    }
+    usize::try_from(pick).ok().and_then(|i| choices(ask).get(i).cloned())
+}
+
 /// Decisions.answers: the picked asks as answers, in the card's order, each
 /// with its index on the card.
 pub fn answers(asks: &[Ask], picks: &BTreeMap<i64, i64>, notes: &BTreeMap<i64, AskNote>) -> Vec<(usize, AskAnswer)> {
@@ -620,6 +639,30 @@ fn answer_block(answer: &AskAnswer, number: Option<usize>) -> String {
         None => format!("{}\n{}", answer.action, answer.answer),
         Some(n) => format!("{n}. {}\n   {}", answer.action, answer.answer.replace('\n', "\n   ")),
     }
+}
+
+/// Decisions.extra: what Mike wrote himself in a message that answered asks,
+/// the text after the answers `answers_message` put first (empty when he
+/// wrote nothing), or None when the text doesn't start with them, so the
+/// bubble shows it all as it is. The GPUI bubble showed the questions and
+/// picks and dropped his words (thread 3fdaaeec, 12 Nov).
+pub fn answers_extra(text: &str, answers: &[AskAnswer]) -> Option<String> {
+    if answers.is_empty() {
+        return None;
+    }
+    let mut rest = text;
+    for answer in answers {
+        // Numbered or not, as `answers_message` wrote it.
+        let number = rest.find('.').and_then(|dot| rest[..dot].parse::<usize>().ok().filter(|_| rest[dot + 1..].starts_with(' ')));
+        let expected = answer_block(answer, number);
+        rest = rest.strip_prefix(expected.as_str())?;
+        if let Some(after) = rest.strip_prefix("\n\n") {
+            rest = after;
+        } else if !rest.is_empty() {
+            return None;
+        }
+    }
+    Some(rest.trim().to_owned())
 }
 
 /// Decisions.message: one ordinary message, each picked ask's question then
@@ -682,6 +725,21 @@ mod tests {
         assert_eq!(text, "\u{FFFC} no pictures, [Picture 9] stays");
         assert_eq!(order, vec![0]);
         assert!(can_rewind("codex") && !can_rewind("opencode"));
+    }
+
+    #[test]
+    fn an_answer_keeps_the_words_written_under_it() {
+        let felt = AskAnswer { action: "How did yesterday feel?".into(), answer: "Good".into() };
+        assert_eq!(answers_extra("How did yesterday feel?\nGood\n\nIt was good.\n\nAnd busy.", std::slice::from_ref(&felt)).as_deref(), Some("It was good.\n\nAnd busy."));
+        assert_eq!(answers_extra("How did yesterday feel?\nGood", std::slice::from_ref(&felt)).as_deref(), Some(""));
+        // Numbered, as a card of several asks sends them.
+        let ship = AskAnswer { action: "Ship it?".into(), answer: "Yes\ntoday".into() };
+        let text = "1. How did yesterday feel?\n   Good\n\n2. Ship it?\n   Yes\n   today\n\nThanks";
+        assert_eq!(answers_extra(text, &[felt.clone(), ship]).as_deref(), Some("Thanks"));
+        // Text that doesn't start with its answers is shown as it is.
+        assert_eq!(answers_extra("Something else entirely", std::slice::from_ref(&felt)), None);
+        assert_eq!(answers_extra("How did yesterday feel?\nGoodish", std::slice::from_ref(&felt)), None);
+        assert_eq!(answers_extra("anything", &[]), None);
     }
 
     #[test]
@@ -807,5 +865,19 @@ mod tests {
         assert_eq!(next_unanswered(0, 3, &picks, false), Some(1));
         assert_eq!(next_unanswered(1, 3, &BTreeMap::from([(0, 0), (1, 0), (2, 0)]), true), None);
         assert_eq!(next_unanswered(1, 3, &BTreeMap::from([(0, 0), (2, 0)]), true), Some(1));
+    }
+
+    #[test]
+    fn a_picked_answers_chip_reads_as_its_answer() {
+        let mut ask = Ask::new("Check who gets the beta");
+        ask.options = vec!["Everyone".into(), "Just us".into()];
+        assert_eq!(picked_answer_label(&ask, 1, None).as_deref(), Some("Just us"));
+        assert_eq!(picked_answer_label(&ask, 5, None), None);
+        let picture = crate::reducer::ImageRef::new("/media/a.png", "image/png");
+        let note = |text: &str, images: usize| AskNote { text: text.into(), images: vec![picture.clone(); images] };
+        assert_eq!(picked_answer_label(&ask, OWN_ANSWER, None).as_deref(), Some("Your answer above"));
+        assert_eq!(picked_answer_label(&ask, OWN_ANSWER, Some(&note("  The testers \u{FFFC} ", 1))).as_deref(), Some("The testers"));
+        assert_eq!(picked_answer_label(&ask, OWN_ANSWER, Some(&note("\u{FFFC}", 1))).as_deref(), Some("1 picture"));
+        assert_eq!(picked_answer_label(&ask, OWN_ANSWER, Some(&note("", 3))).as_deref(), Some("3 pictures"));
     }
 }

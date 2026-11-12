@@ -78,6 +78,9 @@ export type ThreadControl = {
   sandboxed?: (cwd: string) => boolean;
   // cross-runner.ts: a new thread on another runner (undefined: it's this one).
   startOn?: (threadId: string, req: StartRequest) => Promise<string | undefined>;
+  // list, but failing when the other runner of a handover can't be asked
+  // rather than leaving its threads out (handover.ts, ThreadRouter).
+  listEverywhere?: (include: ('inbox' | 'snoozed' | 'archived')[]) => Promise<ThreadSummary[]>;
 } & Async<Runner, 'list' | 'search' | 'get' | 'events' | 'create' | 'send' | 'update' | 'interrupt' | 'delete'>;
 
 // Messages a thread when the Mac app restarts onto a new build (app-restarts.ts).
@@ -206,6 +209,27 @@ export function approvalTitle(name: string, input: Record<string, unknown>, find
 export const LAND_WAIT_MS = 1000;
 const LAND_POLL_MS = 50;
 
+// Looking a thread id up during a handover (find, below): tries a second
+// apart, each waiting at most ID_LIST_TIMEOUT_MS for the other runner, so
+// a lookup that fails says so within seconds.
+const ID_LIST_TRIES = 3;
+const ID_LIST_RETRY_MS = 1000;
+const ID_LIST_TIMEOUT_MS = 2000;
+// Other Macs' threads come from the backend, which can take longer.
+const ID_REMOTE_TIMEOUT_MS = 5000;
+
+// A promise that fails with `why` if it hasn't settled within `ms`. What it
+// waits on isn't stopped: a request to a runner stays pending until that
+// connection answers or closes (RunnerClient.call has no time limit).
+function inTime<T>(p: Promise<T>, ms: number, why: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(why)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
 export function buildThreadbearTools(
   control: ThreadControl,
   selfId: string,
@@ -254,6 +278,18 @@ export function buildThreadbearTools(
   const oneReply = opts.oneReply?.() === true;
   const all = async (): Promise<ThreadSummary[]> => control.list(['inbox', 'snoozed', 'archived']);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  // Every thread here, for matching a short id: one try. In a handover the
+  // list comes partly from the other runner, and a plain list leaves its
+  // threads out when it can't be asked. A turn kept on a draining runner
+  // sent to df5c7153 half a minute into a handover, before the new runner's
+  // link answered, and was told "No thread" for a thread that was there
+  // (12 Nov). So this one fails instead, and doesn't wait on a link that
+  // never answers (RunnerClient.call has no time limit of its own).
+  const listForIds = async (): Promise<ThreadSummary[]> => {
+    if (!control.listEverywhere) return all();
+    return inTime(control.listEverywhere(['inbox', 'snoozed', 'archived']), ID_LIST_TIMEOUT_MS, "the other runner didn't answer");
+  };
 
   // The current turn's events, oldest first: back a page at a time until
   // its turn.started.
@@ -307,25 +343,45 @@ export function buildThreadbearTools(
     // a whole one), so this runner's list isn't fetched for it either: on a
     // draining runner that's the same list from the primary, per call.
     const whole = id.length >= 36;
-    if (whole) {
-      // In an async function so a get that throws rather than rejects is caught
-      // too. Only "not found" means look elsewhere: anything else (the
-      // primary's link failing) says so, rather than "No thread".
-      const t = await (async () => control.get(id))().catch((e: unknown) => {
-        if (e instanceof RpcError && e.code === ErrorCode.threadNotFound) return undefined;
-        throw e;
-      });
-      if (t?.id === id) return { id };
+    // In a handover a thread can be in neither runner's list for a few
+    // seconds (the other runner's link not answering yet, or a thread a
+    // draining runner left that isn't taken in yet), so a miss or a failed
+    // list is tried again, a second apart, before it's said.
+    const again = Boolean(control.listEverywhere);
+    for (let tries = 1; ; tries++) {
+      const last = !again || tries >= ID_LIST_TRIES;
+      if (whole) {
+        // In an async function so a get that throws rather than rejects is caught
+        // too. Only "not found" means look elsewhere: anything else (the
+        // primary's link failing) says so, rather than "No thread".
+        const t = await (async () => control.get(id))().catch((e: unknown) => {
+          if (e instanceof RpcError && e.code === ErrorCode.threadNotFound) return undefined;
+          throw e;
+        });
+        if (t?.id === id) return { id };
+      }
+      let hits: ThreadSummary[] = [];
+      if (!whole) {
+        try {
+          hits = (await listForIds()).filter((t) => t.id === id || t.id.startsWith(id));
+        } catch (e) {
+          if (last) throw new Error(`Couldn't look ${id} up just now (${e instanceof Error ? e.message : String(e)}). Try again in a moment, or use the whole id.`);
+          await sleep(ID_LIST_RETRY_MS);
+          continue;
+        }
+      }
+      // A whole id here needs nothing from the backend.
+      if (hits.some((t) => t.id === id)) return { id };
+      // Other Macs' threads, given a few seconds: on a draining runner this
+      // goes through the new runner too, and could wait on it forever.
+      const rt = await inTime(others(), ID_REMOTE_TIMEOUT_MS, '').catch((): RemoteThreads => ({ runners: [], threads: [] }));
+      const far = rt.threads.filter((t) => (t.threadId === id || t.threadId.startsWith(id)) && !hits.some((h) => h.id === t.threadId));
+      if (hits.length + far.length > 1) throw new Error(`${id} matches ${hits.length + far.length} threads; use more of the id.`);
+      if (hits.length === 1) return { id: hits[0].id };
+      if (far.length === 1) return { id: far[0].threadId, other: { t: far[0], runner: runnerName(rt, far[0].runnerId) } };
+      if (last) throw new Error(`No thread with id ${id}. list_threads shows them.`);
+      await sleep(ID_LIST_RETRY_MS);
     }
-    const hits = whole ? [] : (await all()).filter((t) => t.id === id || t.id.startsWith(id));
-    // A whole id here needs nothing from the backend.
-    if (hits.some((t) => t.id === id)) return { id };
-    const rt = await others();
-    const far = rt.threads.filter((t) => (t.threadId === id || t.threadId.startsWith(id)) && !hits.some((h) => h.id === t.threadId));
-    if (hits.length + far.length > 1) throw new Error(`${id} matches ${hits.length + far.length} threads; use more of the id.`);
-    if (hits.length === 1) return { id: hits[0].id };
-    if (far.length === 1) return { id: far[0].threadId, other: { t: far[0], runner: runnerName(rt, far[0].runnerId) } };
-    throw new Error(`No thread with id ${id}. list_threads shows them.`);
   };
 
   // This runner's threads only: the tools that change a thread's settings,
@@ -904,6 +960,9 @@ export function buildThreadbearTools(
         // Renaming and pausing never do.
         const caller = await restricted();
         const newFolder = f === undefined ? undefined : await folder(f);
+        // The check a new folder takes along (Scheduler.update approves
+        // nothing for a folder alone).
+        const carried = check === undefined && newFolder !== undefined && current.check && !current.threadId ? current.check : undefined;
         let card: { checkCard?: CheckCard } = {};
         if (caller) {
           // What its runs reach: the thread it sends to, or new threads the
@@ -924,16 +983,19 @@ export function buildThreadbearTools(
             // Longer to run is more that command can do (Codex review, 6 Nov).
             ...(checkTimeoutSecs !== undefined && current.check && check === undefined && !changes ? [`Change how long the schedule "${current.title}"'s shell command may run`] : []),
             ...checkReason(check, caller),
+            // A new folder takes the check along (below), approved there as
+            // the card shows it: so the card says what it runs, and where.
+            ...(check === undefined && carried ? checkReason(carried, caller).map((r) => `${r}, in ${newFolder}`) : []),
           ];
           // Setting the mode it already has is left out, so a write that
           // lands after someone else lowers it can't raise it back.
           // Only a mode it has itself: one it inherits is set, so the runs keep
           // it if the default changes.
           if (permissionMode !== undefined && !current.threadId && permissionMode === current.permissionMode) permissionMode = undefined;
-          // Moving it re-approves its check there too (Scheduler.update).
+          // Moving it re-approves its check there too (passed along below).
           const checkNow = typeof check === 'string' ? check : newFolder !== undefined ? current.check : undefined;
           card = checkGuard(checkNow, current.threadId ? await threadFolder(current.threadId) : (newFolder ?? (current.cwd ? path.resolve(expandHome(current.cwd)) : undefined)), caller);
-          await confirm('update_schedule', reasons, { scheduleId: current.id, ...Object.fromEntries(Object.entries({ text, title, when, cron, timezone, paused, folder: newFolder, account: acc, pool: pl, model, effort, permissionMode, check, checkTimeoutSecs }).filter(([, v]) => v !== undefined)) }, extra?.signal);
+          await confirm('update_schedule', reasons, { scheduleId: current.id, ...Object.fromEntries(Object.entries({ text, title, when, cron, timezone, paused, folder: newFolder, account: acc, pool: pl, model, effort, permissionMode, check: check ?? carried, checkTimeoutSecs }).filter(([, v]) => v !== undefined)) }, extra?.signal);
           if (reasons.length && f !== undefined) await sameFolder(f, newFolder!);
         }
         // A schedule on another runner checks its account and pool there, so
@@ -963,7 +1025,14 @@ export function buildThreadbearTools(
           model,
           effort,
           permissionMode,
-          ...(check !== undefined ? { check } : {}),
+          // Moving it to another folder takes its check along, approved
+          // there as this call's card showed it (from a thread that asks
+          // first) or as it is (Full): the Scheduler approves nothing for a
+          // folder alone, so an app's save can't (security review, 11 Nov
+          // 2026, finding 89).
+          // It must still be the schedule's as this saves (ifCheck): one
+          // changed or taken off while the card was up isn't put back.
+          ...(check !== undefined ? { check } : carried ? { check: carried, ifCheck: carried } : {}),
           ...card,
           ...(checkTimeoutSecs !== undefined ? { checkTimeoutSecs } : {}),
         });
@@ -1394,9 +1463,13 @@ export function buildThreadbearTools(
           .describe('With needs "nothing": follow-ups worth doing next, in the user\'s voice, which they read later with this thread forgotten: which app or thing, and what they\'d see change or get, in their words, 8 to 15 words. See the description. Only ones that really came up; usually none.'),
         // The agent's own "anything else?" before Mike has to type it
         // (experiment looseEnds; docs/protocol.md, "Loose ends"): the
-        // runner sees git and threads, not a reply worth sending.
+        // runner sees git and threads, not a decision waiting on someone.
+        // Not Mike's own steps, nor the agent's for later: a "Reply to
+        // Gautam" line sat on a card he couldn't click or clear, after
+        // he'd sent it, and "I'll rebuild at 5:27" came back to his inbox
+        // unrun (12 Nov 2026).
         ...(opts.looseEnds?.() === true
-          ? { open: z.array(z.string()).max(3).optional().describe('With needs "nothing": what\'s still open that git and Threadbear can\'t see (a reply worth sending, a decision waiting elsewhere, a job still running), a short line each; [] when nothing is. The done card lists them.') }
+          ? { open: z.array(z.string()).max(3).optional().describe('With needs "nothing": what\'s still open that git and Threadbear can\'t see and that waits on someone else or runs elsewhere (a colleague\'s decision, a job still running), a short line each; [] when nothing is. Never a step for the user (that\'s an ask) or one you\'ll do yourself later (book it with schedule_message). The done card lists them.') }
           : {}),
         byline: z
           .string()
@@ -1409,7 +1482,7 @@ export function buildThreadbearTools(
         snooze: z
           .string()
           .optional()
-          .describe('Hibernates this thread once the turn is over, until 2h, 1d, tomorrow, an ISO time with its offset, "restart" (the runner next starting), "release" (it starting on a new release) or words saying when ("when the phone arrives"), with needs "nothing": when the user asked for that, or when the rest waits on a message (one wakes it), until it should have come. Asked after you called end_turn? Call it again with this.'),
+          .describe('Hibernates this thread once the turn is over, until 2h, 1d, tomorrow, an ISO time with its offset, "restart" (the runner next starting), "release" (it starting on a new release) or words saying when ("when the phone arrives"), with needs "nothing": when the user asked for that, or when the rest waits on a message (one wakes it), until it should have come. It only brings the thread back, it doesn\'t run you: for a step of your own later, use schedule_message. Asked after you called end_turn? Call it again with this.'),
         waitFor: waitForArg,
         findings: findingsArg,
       },
@@ -1511,7 +1584,7 @@ export function buildThreadbearTools(
         snooze: z
           .string()
           .optional()
-          .describe('Hibernate this thread once the turn is over, until 30m, 2h, 1d, tomorrow, an ISO time with its offset, "restart" (until the runner next starts), "release" (until it starts on a new release), or words saying when ("when the phone arrives"). Only with needs "nothing": when the user has asked for this thread to be snoozed or hibernated, or when the rest waits on a message (one wakes it), until it should have come. If they ask after you have called end_turn, call it again with this.'),
+          .describe('Hibernate this thread once the turn is over, until 30m, 2h, 1d, tomorrow, an ISO time with its offset, "restart" (until the runner next starts), "release" (until it starts on a new release), or words saying when ("when the phone arrives"). Only with needs "nothing": when the user has asked for this thread to be snoozed or hibernated, or when the rest waits on a message (one wakes it), until it should have come. It only brings the thread back, it doesn\'t run you: for a step of your own later, use schedule_message. If they ask after you have called end_turn, call it again with this.'),
         waitFor: waitForArg,
         findings: findingsArg,
       },
@@ -1956,7 +2029,7 @@ export function buildThreadbearTools(
         if (to?.trim()) {
           const remote = opts.remote?.();
           const mover = remote?.move;
-          if (!mover || !remote.runners) throw new Error("Moving a thread to another machine needs the main Mac's runner, connected to Threadbear's backend, with the moveToRunner experiment on.");
+          if (!mover || !remote.runners) throw new Error("Moving a thread to another machine needs the main Mac's runner, connected to Threadbear's backend.");
           if (then?.trim()) throw new Error('`then` only goes with a folder move. Send the message after: it waits and moves with the thread.');
           // The runner is picked now, before any card, and the move goes to
           // that one by id: a name is another Mac's own word and can change

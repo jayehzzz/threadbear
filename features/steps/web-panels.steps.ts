@@ -3,6 +3,9 @@
 // opening outside it, the bar's Back, Reload and Open in browser, and the
 // Convex dashboard given its deploy key.
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { ThreadbearWorld } from '../support/world.ts';
 import { okValue, type Dump } from '../support/driver.ts';
@@ -66,10 +69,11 @@ Then('the panel shows the page {string} without loading it again', async functio
   assert.equal(web(d)?.page?.loads, loadsBefore, 'the page kept between visits loads once');
 });
 
-When("I click the panel page's link {string}", async function (this: ThreadbearWorld, selector: string) {
-  // A real press through DevTools' Input domain: the page sees a person's
-  // gesture, which is what decides whether a link leaves the panel.
-  await this.app.do({ cmd: 'webPanel', do: 'click', selector }, 30);
+When("I click the panel page's link/button {string}", async function (this: ThreadbearWorld, selector: string) {
+  // With a person's gesture behind it (DevTools' userGesture), which is
+  // what decides whether a link leaves the panel.
+  const out = await this.app.do({ cmd: 'webPanel', do: 'click', selector }, 30);
+  assert.ok(!out.startsWith('error'), out);
 });
 
 /** What the app would have opened this scenario: a scripted app opens
@@ -99,6 +103,77 @@ Then('the link to the other site opened in the browser', async function (this: T
 Then("the page server's page opened in the browser", async function (this: ThreadbearWorld) {
   await waitOpened(this, sites().home);
 });
+
+/** A script in the panel's page, run with no click behind it, as a
+ * page's own timer or a compromised script would run it. */
+async function pageScript(world: ThreadbearWorld, js: string) {
+  const out = await world.app.do({ cmd: 'webPanel', do: 'eval', js: `void (${js})` });
+  assert.ok(!out.startsWith('error'), out);
+}
+
+When('the panel\'s page opens a window to the other site by itself', async function (this: ThreadbearWorld) {
+  await pageScript(this, `window.open(${JSON.stringify(`${sites().other}/by-itself`)})`);
+});
+
+When('the panel\'s page opens a window on its own site by itself', async function (this: ThreadbearWorld) {
+  await pageScript(this, "window.open(location.origin + '/second')");
+});
+
+When("the panel's page clicks its own link {string} by itself", async function (this: ThreadbearWorld, selector: string) {
+  // A script's click is a click event, not a person's: Chromium's gesture
+  // flag says so, which is what decides.
+  await pageScript(this, `document.querySelector(${JSON.stringify(selector)}).click()`);
+});
+
+When('the panel\'s page sends itself to the other site by itself', async function (this: ThreadbearWorld) {
+  await pageScript(this, `location.href = ${JSON.stringify(`${sites().other}/by-itself`)}`);
+});
+
+When("I click the panel page's link {string} twice in a moment", async function (this: ThreadbearWorld, selector: string) {
+  const out = await this.app.do({ cmd: 'webPanel', do: 'click', selector, times: 2 }, 30);
+  assert.ok(!out.startsWith('error'), out);
+});
+
+When("I drop a file from the Finder on the panel's page", async function (this: ThreadbearWorld) {
+  // A page of its own, so if it loaded the panel's title would say so.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-dropped-'));
+  const file = path.join(dir, 'dropped.html');
+  fs.writeFileSync(file, '<!doctype html><title>Dropped</title><p>A file from this Mac.</p>');
+  const out = await this.app.do({ cmd: 'webPanel', do: 'drop', file });
+  assert.ok(!out.startsWith('error'), out);
+});
+
+/** Everything the app would have opened over the next two seconds (or
+ * `ms`), on top of what it already had: long enough for a page's own timers
+ * and a drop to have done whatever they'd do. */
+async function openedAfterAMoment(world: ThreadbearWorld, ms = 2000): Promise<string[]> {
+  const until = Date.now() + ms;
+  let seen: string[] = [];
+  while (Date.now() < until) {
+    seen = await openedSoFar(world);
+    await new Promise((done) => setTimeout(done, 200));
+  }
+  return seen;
+}
+
+Then('nothing was opened in the browser', async function (this: ThreadbearWorld) {
+  const seen = await openedAfterAMoment(this);
+  assert.deepEqual(seen, [], `it opened ${JSON.stringify(seen)}`);
+});
+
+Then('only the first of them went to the browser', async function (this: ThreadbearWorld) {
+  // The page's last try is a timer's, a few seconds after the click.
+  const seen = await openedAfterAMoment(this, 4000);
+  assert.deepEqual(seen, [`${sites().other}/video?0`], `it opened ${JSON.stringify(seen)}`);
+});
+
+for (const [times, count] of [['once', 1], ['twice', 2]] as const) {
+  Then(`the link to the other site opened in the browser ${times}`, async function (this: ThreadbearWorld) {
+    const seen = await openedAfterAMoment(this);
+    const want = `${sites().other}/video`;
+    assert.equal(seen.filter((u) => u === want).length, count, `it opened ${JSON.stringify(seen)}`);
+  });
+}
 
 Then('{string} opened in the browser', async function (this: ThreadbearWorld, url: string) {
   await waitOpened(this, url);
@@ -166,6 +241,41 @@ When('I choose the deployment {string} in the Convex panel', async function (thi
 When("the panel's page has the keyboard", async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'webPanel', do: 'focus' });
   await this.until('the page with the keyboard', (d) => (web(d)?.page as { hasKeyboard?: boolean } | undefined)?.hasKeyboard === true);
+});
+
+// Through AppKit, to whoever has the window's keyboard, as a person's keys
+// go (the app's `native-keys`); a script's own keystrokes would go straight
+// into the app and never meet a page.
+When('I type {string} on the keyboard', async function (this: ThreadbearWorld, text: string) {
+  await this.app.do({ cmd: 'native-keys', text });
+});
+
+// A text box of its own at the top of the page, with the page's focus, and
+// the page given the keyboard as a click in that box gives it.
+When("a box in the panel's page has the keyboard", async function (this: ThreadbearWorld) {
+  const js = "(() => { const box = document.createElement('input'); box.id = 'typed-here'; document.body.prepend(box); box.focus(); return true; })()";
+  const out = await this.app.do({ cmd: 'webPanel', do: 'eval', js });
+  assert.ok(!out.startsWith('error'), out);
+  await this.app.do({ cmd: 'webPanel', do: 'focus' });
+  await this.until('the page with the keyboard', (d) => (web(d)?.page as { hasKeyboard?: boolean } | undefined)?.hasKeyboard === true);
+});
+
+Then("the box in the panel's page says {string}", async function (this: ThreadbearWorld, text: string) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const out = await this.app.do({ cmd: 'webPanel', do: 'eval', js: "document.getElementById('typed-here').value" });
+    const value = (JSON.parse(okValue(out)) as { value?: string }).value ?? '';
+    if (value === text) return;
+    if (Date.now() > deadline) {
+      const d = await this.app.dump();
+      assert.fail(`the page's box says ${JSON.stringify(value)}; the keyboard is with ${String((d as { keyboard?: string }).keyboard)}; the composer says ${JSON.stringify(d.composer.text)}`);
+    }
+    await new Promise((done) => setTimeout(done, 200));
+  }
+});
+
+Then('the app has the keyboard', async function (this: ThreadbearWorld) {
+  await this.until("the app's own view with the keyboard", (d) => (d as { keyboard?: string }).keyboard === 'app');
 });
 
 When('I press ⌘A', async function (this: ThreadbearWorld) {

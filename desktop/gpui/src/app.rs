@@ -33,7 +33,10 @@ pub struct Threadbear {
     pub(crate) selected: Option<String>,
     pub(crate) pane: Option<Entity<ThreadPane>>,
     /// The open pane's requests to the app (a thread: link was clicked).
-    pane_events: Option<Subscription>,
+    pub(crate) pane_events: Option<Subscription>,
+    /// The threads opened lately, kept loaded so switching back is at once
+    /// (pane_cache.rs).
+    pub(crate) kept: crate::pane_cache::PaneCache,
     pub(crate) search: Entity<InputState>,
     /// The sections folded away under their headings, by key.
     pub(crate) folded: HashSet<&'static str>,
@@ -80,12 +83,19 @@ pub struct Threadbear {
     /// (`failedOnAccount`), so the limit line blames that login only while
     /// the thread's still on it, not the one it's just been switched to.
     pub(crate) failed_on_account: HashMap<String, String>,
+    /// The login each thread's limit box has picked in its Continue now on
+    /// menu, when it isn't the first.
+    pub(crate) limit_pick: HashMap<String, String>,
     /// The Threads button's badge, kept until the app next changes (the same
     /// observer clears it), as working it out sorts every thread.
     pub(crate) inbox_count_cache: std::cell::Cell<Option<usize>>,
     pub(crate) last_window_title: String,
     pub(crate) archived_note: Option<ArchivedNote>,
     pub(crate) inbox_end_note: Option<InboxEndNote>,
+    /// What came across from the Swift app, while its note's up (swift_import.rs).
+    pub(crate) import_note: Option<String>,
+    /// Following main: what's running, staged, building (app_update.rs).
+    pub(crate) updater: crate::app_update::AppUpdater,
     pub(crate) note_counter: u64,
     pub(crate) note_task: Option<Task<()>>,
     pub(crate) archived_task: Option<Task<()>>,
@@ -93,17 +103,37 @@ pub struct Threadbear {
     pub(crate) toast_hovered: bool,
     /// The error bar's text (`errorMessage`).
     pub(crate) error_message: Option<String>,
+    /// The error bar's text when it's about not being connected, so it goes
+    /// once the app is again (`connectionErrorMessage`).
+    pub(crate) connection_error: Option<String>,
+    /// What clicks from a menu are doing, by their key, newest last, and
+    /// what's just been done, for the banner (`busyNotes`, `doneNote`).
+    pub(crate) busy_notes: Vec<(String, String)>,
+    pub(crate) done_note: Option<String>,
+    pub(crate) done_task: Option<Task<()>>,
+    /// CLI updates that failed and were dismissed from the banner, by
+    /// `cli_failure_key` (`dismissedCliFailures`).
+    pub(crate) dismissed_cli_failures: HashSet<String>,
+    /// Asks `runner.status` which threads a pending restart waits for, as
+    /// they finish, once for a burst of updates (`refreshRunnerStatus`).
+    pub(crate) restart_status_task: Option<Task<()>>,
+    /// Redraws the banner when a restart has gone on so long that the runner
+    /// looks down (`restartExpiry`).
+    pub(crate) restart_expiry: Option<Task<()>>,
     pub(crate) creating_investigation: bool,
     /// The title being renamed in the header, and its field.
     pub(crate) renaming: Option<String>,
     pub(crate) rename_field: Option<(Entity<InputState>, Subscription)>,
     pub(crate) share_popover: Option<String>,
     pub(crate) share_busy: bool,
+    /// Threads whose login, pool ("moving/<id>") or folder
+    /// ("movingFolder/<id>") change hasn't landed: those can't be guessed,
+    /// so the composer's chips that show them spin until the runner answers
+    /// (`BusyKey.moving`, `BusyKey.movingFolder`).
+    pub(crate) chip_busy: std::collections::HashSet<String>,
     pub(crate) continuing_refusal: Option<String>,
     /// The runner's website, from `runner.status` (`websiteURL`).
     pub(crate) website_url: Option<String>,
-    /// When the runner last said it was restarting.
-    pub(crate) restart_notice_ms: Option<i64>,
     pub(crate) schedules_supported: bool,
     /// The Scheduled view: the list, its folded headings, what's on the way
     /// (scheduled.rs).
@@ -137,6 +167,13 @@ pub struct Threadbear {
     /// A thread a notification's click asked for before the list had
     /// loaded: opened once it has (`linkedThread`).
     pub(crate) pending_open: Option<String>,
+    /// The thread that was open when the app restarted itself onto an
+    /// update, opened once the list has loaded, in the list that was showing
+    /// and without bringing the window in front (app_update.rs).
+    pub(crate) pending_restore: Option<String>,
+    /// A `threadbear://` link's thread waiting for the lists it could be in,
+    /// and since when (deep_links.rs).
+    pub(crate) waiting_link: Option<(String, std::time::Instant)>,
     /// What the Dock badge says now (notify.rs), so it's only set when that changes.
     pub(crate) dock_badge: Option<String>,
     /// The sub-agent whose transcript is in the main panel, by its thread and
@@ -153,6 +190,11 @@ pub struct Threadbear {
     /// says what's wrong rather than flicking to "Connecting" on each try
     /// (`connection()`). Cleared when it's back, and by Try again.
     pub(crate) last_drop: Option<(threadbear_client::runner::Disconnect, String)>,
+    /// When it stopped being connected (or the app started), for the grace
+    /// before the banner says anything about an unexpected drop
+    /// (`DROP_GRACE`), and the redraw at its end.
+    pub(crate) dropped_at: Option<std::time::Instant>,
+    pub(crate) drop_grace_task: Option<Task<()>>,
     /// Start runner is under way (runner_launcher.rs): its button spins.
     pub(crate) starting_runner: bool,
     /// The checkout the runner follows main in (`runner.status`'s
@@ -197,6 +239,15 @@ pub struct Threadbear {
     /// The Threads panel's view, made the first time the dock asks for it
     /// (sidebar.rs, `SidebarView`).
     pub(crate) sidebar_view: Option<Entity<crate::sidebar::SidebarView>>,
+    /// The main panel's view, cached as the Threads panel's is (shell.rs).
+    pub(crate) main_view: Option<Entity<crate::shell::MainPanelView>>,
+    /// Threads open in panels of their own, and the tabs opened beside the
+    /// main panel for what it shows (thread_panels.rs).
+    pub(crate) thread_panels: crate::thread_panels::ThreadPanels,
+    /// Two fingers across the window going back or forward (swipe_nav.rs).
+    pub(crate) swipe_nav: crate::swipe_nav::SwipeNav,
+    /// Pages on their way to the Archived and Hibernating headings (archive_flight.rs).
+    pub(crate) flight: crate::archive_flight::Flights,
     _events: Task<()>,
     _subs: Vec<Subscription>,
 }
@@ -237,6 +288,8 @@ impl Threadbear {
         crate::viewer::viewer_handle_global(side.downgrade(), cx);
         crate::open_gate::install(cx.entity().downgrade(), cx);
         crate::terminal::install(&cx.entity(), cx);
+        // A key with ⌘ held puts the keys shown beside the buttons away.
+        crate::key_hints::install(cx.entity().downgrade(), cx);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads"));
         // The filter is worked out at render, so a change only needs a redraw.
         let searching = cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
@@ -281,12 +334,19 @@ impl Threadbear {
         let frame = cx.observe_window_bounds(window, |this, window, cx| this.window_frame_changed(window, cx));
         // What's typed and not sent is written as the app quits (drafts.rs).
         let quitting = cx.on_app_quit(|this, cx| {
+            // Messages still held for a restarting runner stay held, so the
+            // drafts written next can keep them without one also going.
+            this.client.stop_holding();
             this.save_drafts(cx);
             // A setting changed in the last moment waits for the throttled
             // save (`save_settings_soon`), which a quit would otherwise lose.
             if std::mem::take(&mut this.settings_dirty) {
                 this.settings.save();
             }
+            // The activity log's last line (activity.rs).
+            crate::activity::quit();
+            // A staged build into the installed one's place (app_update.rs).
+            this.apply_update_at_quit();
             async {}
         });
         // A thread is read once Mike's looking at it (AppModel.isLooking,
@@ -307,6 +367,9 @@ impl Threadbear {
             this.inbox_count_cache.set(None);
             this.projects.pane_cache.take();
         });
+        // Tabs opened beside the main panel for what it showed go when it
+        // moves on (thread_panels.rs, `mainContextChanged`).
+        let main_context = cx.observe(&cx.entity(), |this: &mut Threadbear, _, cx| this.main_context_maybe_changed(cx));
 
         let mut sidebar = crate::sidebar::SidebarState::new(cx);
         sidebar.order = settings.inbox_order();
@@ -326,6 +389,7 @@ impl Threadbear {
             selected: None,
             pane: None,
             pane_events: None,
+            kept: Default::default(),
             search,
             folded,
             composers: HashMap::new(),
@@ -351,23 +415,35 @@ impl Threadbear {
             menu_signature: String::new(),
             menus_stale: true,
             failed_on_account: HashMap::new(),
+            limit_pick: HashMap::new(),
             inbox_count_cache: Default::default(),
             last_window_title: String::new(),
             archived_note: None,
             inbox_end_note: None,
+            import_note: None,
+            updater: Default::default(),
             note_counter: 0,
             note_task: None,
             archived_task: None,
             toast_hovered: false,
             error_message: None,
+            connection_error: None,
+            busy_notes: Vec::new(),
+            done_note: None,
+            done_task: None,
+            dismissed_cli_failures: HashSet::new(),
+            restart_status_task: None,
+            restart_expiry: None,
+            dropped_at: Some(std::time::Instant::now()),
+            drop_grace_task: None,
             creating_investigation: false,
             renaming: None,
             rename_field: None,
             share_popover: None,
             share_busy: false,
+            chip_busy: Default::default(),
             continuing_refusal: None,
             website_url: None,
-            restart_notice_ms: None,
             schedules_supported: false,
             scheduled,
             schedule_editor: None,
@@ -381,6 +457,8 @@ impl Threadbear {
             settings_window: None,
             main_window: window.window_handle(),
             pending_open: None,
+            pending_restore: None,
+            waiting_link: None,
             dock_badge: None,
             panel_gate: Default::default(),
             subagent: None,
@@ -408,9 +486,20 @@ impl Threadbear {
             move_sheet: None,
             side,
             sidebar_view: None,
+            main_view: None,
+            thread_panels: Default::default(),
+            swipe_nav: Default::default(),
+            flight: Default::default(),
             _events: events,
-            _subs: vec![appearance, searching, frame, menus, looking, quitting, side_changed],
+            _subs: vec![appearance, searching, frame, menus, looking, quitting, side_changed, main_context],
         };
+        // Records nothing unless it's switched on in Settings (activity.rs).
+        let showing = crate::activity::showing(this.dock.read(cx).layout());
+        crate::activity::install(cx.entity().downgrade(), window.window_handle(), &RunnerConfig::from_env().home, this.settings.saved.activity_log == Some(true), showing, cx);
+        // Following main, and back to where it was after a restart the app
+        // made itself for an update (app_update.rs).
+        this.start_updater(cx);
+        this.restore_after_update(cx);
         // The window starts on the Inbox with nothing open (`noteNavigation`
         // on launch), so Back from the first thread comes back here.
         this.note_navigation();
@@ -426,8 +515,9 @@ impl Threadbear {
         let Some((thread_id, button)) = crate::reply_buttons::known(&id) else { return };
         // Only from the transcript of the thread that made it: ids are the
         // runner's per thread, and a link copied into another thread's reply
-        // mustn't press this one.
-        if self.selected.as_deref() != Some(thread_id.as_str()) {
+        // mustn't press this one. A thread in a panel of its own has its
+        // transcript there (thread_panels.rs).
+        if self.selected.as_deref() != Some(thread_id.as_str()) && self.thread_panel_pane(&thread_id).is_none() {
             self.show_error("That button belongs to another thread, so it can't be pressed from here.".into(), cx);
             return;
         }
@@ -466,7 +556,7 @@ impl Threadbear {
 
     /// The open thread draws again: its pills read the buttons as they draw.
     fn redraw_pane(&self, cx: &mut Context<Self>) {
-        if let Some(pane) = &self.pane {
+        for pane in self.pane.iter().chain(self.thread_panels.panes()) {
             pane.update(cx, |_, cx| cx.notify());
         }
         cx.notify();
@@ -477,9 +567,19 @@ impl Threadbear {
     /// front, the open thread is read.
     pub(crate) fn looking_changed(&mut self, window: u64, active: bool, cx: &mut Context<Self>) {
         crate::thread::set_looking(window, active);
+        // ⌘-Tab away lets ⌘ go in the other app, so this one never hears it.
+        if !active {
+            self.hints_reset(cx);
+            // A swipe's lift goes to the app in front now (swipe_nav.rs, row_swipe.rs).
+            self.cancel_page_swipe(cx);
+            self.cancel_row_swipe(cx);
+        }
+        crate::activity::window_active(window, active, cx);
         if let (true, Some(pane)) = (crate::thread::is_looking(), self.pane.clone()) {
             pane.read(cx).mark_seen();
         }
+        // And the threads in panels of their own that are in front.
+        self.mark_thread_panels_seen(cx);
         self.serve_panel_request(cx);
     }
 
@@ -506,8 +606,12 @@ impl Threadbear {
             // Only the pane: an agent showing a file never starts its app.
             // One unpinned since still opens Highlights.
             if let Some((path, title)) = item.and_then(|i| i.path.clone().map(|p| (p, i.title.clone()))) {
-                let shown = thread.clone();
-                self.side.update(cx, |side, cx| side.preview_path(&path, Some(title), &shown, cx));
+                let (shown, side) = (thread.clone(), self.side.clone());
+                // Once this update is over: the pane reads the app to know its
+                // thread, which GPUI refuses while the app is the one being
+                // updated. Opening a thread whose agent had shown a pin
+                // crashed the app (Mike, 12 Nov).
+                cx.defer(move |cx| side.update(cx, |side, cx| side.preview_path(&path, Some(title), &shown, cx)));
             }
             self.tell_panel_shown(&request, &thread);
             return;
@@ -515,6 +619,17 @@ impl Threadbear {
         // One the thread hasn't got is left for the runner to clear with
         // Mike's next message.
         let Some(panel) = requests::panel(&request, &thread) else { return };
+        if request.reload == Some(true) {
+            crate::web_panels::reload_requested(&thread, &request.panel, cx);
+            // A file opened over the panel from its page would still cover
+            // what the agent changed.
+            let (thread_id, from) = (thread.id.clone(), request.panel.clone());
+            self.side.update(cx, |side, cx| {
+                if side.previews.get(&thread_id).is_some_and(|pv| pv.from == from) {
+                    side.close_preview(&thread_id, cx);
+                }
+            });
+        }
         self.show_requested(&panel, &requests::place(&request), &thread, cx);
         self.tell_panel_shown(&request, &thread);
     }
@@ -544,7 +659,9 @@ impl Threadbear {
                 RequestedPanel::Section(_) => self.show_pane(&id, cx),
                 _ => self.toggle_under_threads(&id, cx),
             },
-            RequestedPlace::Tab => self.dock.update(cx, |m, cx| m.show(&id, &[shell::MAIN], DockDrop::window(DockEdge::Right), cx)),
+            // Beside the main panel, for what it shows: it goes when the main
+            // panel moves on, unless it's dragged away (thread_panels.rs).
+            RequestedPlace::Tab => self.open_main_tab(&id, cx),
             RequestedPlace::Side(side) => {
                 let edge = match side.as_str() {
                     "left" => DockEdge::Left,
@@ -583,15 +700,23 @@ impl Threadbear {
                     self.updates_from_hello(hello);
                 }
                 match &status {
-                    Status::Connected { .. } => self.last_drop = None,
-                    Status::Disconnected { kind, reason, .. } => self.last_drop = Some((*kind, reason.clone())),
-                    Status::Connecting { .. } => {}
+                    Status::Connected { .. } => {
+                        self.last_drop = None;
+                        self.dropped_at = None;
+                        self.drop_grace_task = None;
+                        self.clear_connection_error();
+                    }
+                    Status::Disconnected { kind, reason, .. } => {
+                        self.last_drop = Some((*kind, reason.clone()));
+                        self.watch_restart_expiry(cx);
+                        self.start_drop_grace(cx);
+                    }
+                    Status::Connecting { .. } => self.start_drop_grace(cx),
                 }
                 self.status = status;
                 // Each time it's connected, the whole list again, and the
                 // open thread read again: thread.updated only says what changed.
                 if connected {
-                    self.restart_notice_ms = None;
                     self.load_list(cx);
                     self.refresh_restart(cx);
                     self.load_projects(cx);
@@ -601,8 +726,12 @@ impl Threadbear {
                     self.load_clis(cx);
                     self.load_connectors(cx);
                     self.side.update(cx, |side, cx| side.connected(cx));
-                    if let Some(pane) = &self.pane {
+                    for pane in self.pane.iter().chain(self.thread_panels.panes()) {
                         pane.update(cx, |p, cx| p.load(cx));
+                    }
+                    // Kept ones catch up from their last seq when next shown.
+                    for pane in self.kept.panes() {
+                        pane.update(cx, |p, _| p.connection_back());
                     }
                 }
             }
@@ -618,6 +747,12 @@ impl Threadbear {
                         if let Some(pane) = &self.subagent_pane {
                             pane.update(cx, |p, cx| p.summary_changed(&t, cx));
                         }
+                        if let Some(pane) = self.thread_panel_pane(&t.id) {
+                            pane.update(cx, |p, cx| p.summary_changed(&t, cx));
+                        }
+                        if let Some(pane) = self.kept.get(&t.id, cx) {
+                            pane.update(cx, |p, cx| p.summary_changed(&t, cx));
+                        }
                         let before = self.threads.insert(t.id.clone(), t.clone());
                         self.note_failed_account(before.as_ref(), &t);
                         self.thread_changed_outside(before.as_ref(), &t, cx);
@@ -625,22 +760,35 @@ impl Threadbear {
                             self.serve_panel_request(cx);
                         }
                         crate::terminal::thread_updated(&t, cx);
+                        // A thread a pending restart waits for may have just
+                        // finished: the banner's count and list follow.
+                        if self.client.restart().is_pending() {
+                            self.refresh_restart_soon(cx);
+                        }
                     }
                 }
                 "thread.deleted" => {
                     let id = params["threadId"].as_str().unwrap_or("");
                     crate::terminal::thread_deleted(id, cx);
+                    self.kept.forget(id, cx);
+                    // Its panel of its own goes with it (`forget`).
+                    self.close_thread_panel(id, cx);
                     self.threads.remove(id);
                     self.failed_on_account.remove(id);
                     self.refresh_dock_badge();
                 }
                 "runner.notice" => {
-                    // The runner said it's restarting: the connection going
-                    // away is expected for a while (`RunnerRestart.notice`).
-                    if params["message"].as_str().is_some_and(|m| m.contains("restart")) {
-                        self.restart_notice_ms = Some(now_ms());
+                    // A restart notice moves the quiet banner along (the
+                    // connection has already noted it, restart.rs), and asks
+                    // which threads it waits for; other warnings and errors
+                    // go in the error bar (`notice`).
+                    let message = params["message"].as_str().unwrap_or("");
+                    if threadbear_client::restart::RunnerRestart::parse(message).is_some() {
+                        self.refresh_restart(cx);
+                        self.watch_restart_expiry(cx);
+                    } else if params["level"].as_str().is_some_and(|l| l != "info") && !message.is_empty() {
+                        self.show_error(message.to_owned(), cx);
                     }
-                    self.refresh_restart(cx);
                 }
                 "librarian.updated" => self.librarian.status = Some(threadbear_core::librarian::Status::decode(&params["librarian"])),
                 "settings.updated" => self.runner_settings = Some(params["settings"].clone()),
@@ -671,7 +819,13 @@ impl Threadbear {
                     // An open review window hears its review change whichever
                     // thread is open here (review_window.rs).
                     crate::review_window::receive_event(&params, cx);
-                    if let Some(pane) = &self.pane {
+                    // Each pane takes its own thread's events only: the open
+                    // ones, and those kept loaded, which stay subscribed.
+                    let id = params["threadId"].as_str().unwrap_or("");
+                    for pane in self.pane.iter().chain(self.thread_panels.panes()) {
+                        pane.update(cx, |p, cx| p.event(&params, cx));
+                    }
+                    if let Some(pane) = self.kept.get(id, cx) {
                         pane.update(cx, |p, cx| p.event(&params, cx));
                     }
                 }
@@ -717,7 +871,21 @@ impl Threadbear {
         self.open(id, window, cx);
     }
 
-    fn open_pending(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_pending(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.pending_restore.take() {
+            // Back where it was after an update's restart: not
+            // `open_from_outside`, which brings the window in front (taking
+            // it from the app Mike's in) and goes to the Inbox, losing the
+            // list that was showing (Codex's review, 12 Nov).
+            let (me, window) = (cx.entity().downgrade(), self.main_window);
+            cx.defer(move |cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        me.update(cx, |this, cx| this.open(id, window, cx)).ok();
+                    })
+                    .ok();
+            });
+        }
         let Some(id) = self.pending_open.take() else { return };
         let (me, window) = (cx.entity().downgrade(), self.main_window);
         // Not from inside this update: opening needs the window, and the
@@ -741,14 +909,27 @@ impl Threadbear {
                         let list: Vec<ThreadSummary> = serde_json::from_value(v["threads"].clone()).unwrap_or_default();
                         let before = std::mem::take(&mut this.threads);
                         this.threads = list.into_iter().map(|t| (t.id.clone(), t)).collect();
+                        // Open panes take the summaries as they are now: on
+                        // a reconnect this list is the only word of what
+                        // changed while it was away (a loose-ends check that
+                        // finished then isn't sent again), and each pane's
+                        // reload reads its own summary (Codex's review, 12 Nov).
+                        let panes: Vec<_> = this.pane.iter().chain(this.subagent_pane.iter()).chain(this.thread_panels.panes()).chain(this.kept.panes()).cloned().collect();
+                        for pane in panes {
+                            let Some(mut t) = this.threads.get(&pane.read(cx).summary.id).cloned() else { continue };
+                            t.runner_id = pane.read(cx).summary.runner_id.clone();
+                            pane.update(cx, |p, cx| p.summary_changed(&t, cx));
+                        }
                         crate::terminal::list_loaded(&this.threads, cx);
                         this.note_failed_accounts(&before);
-                        // Other runners' rows stay listed beside these.
+                        // Other runners' rows stay listed beside these (and
+                        // kept threads no longer listed go, remote.rs).
                         this.apply_remote_index(cx);
                         this.list_error = None;
                         this.sidebar.loaded = true;
                         this.refresh_dock_badge();
                         this.open_pending(cx);
+                        this.try_waiting_link(cx);
                     }
                     Err(e) => this.list_error = Some(e.message),
                 }
@@ -856,8 +1037,18 @@ impl Threadbear {
     }
 
     pub(crate) fn open(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_with(id, None, window, cx);
+    }
+
+    /// `open`, with the pane of a thread brought back from a panel of its own
+    /// (thread_panels.rs), which goes on reading it rather than reading it again.
+    pub(crate) fn open_with(&mut self, id: String, moved: Option<Entity<ThreadPane>>, window: &mut Window, cx: &mut Context<Self>) {
         // A thread (its own row, say) in place of one of its sub-agents.
         self.close_subagent(cx);
+        // A thread open in a panel of its own is shown there.
+        if moved.is_none() && self.open_in_its_panel(&id, cx) {
+            return;
+        }
         if self.selected.as_deref() == Some(id.as_str()) {
             // Open already, behind a page (a schedule's target was clicked,
             // or a project's page): the page goes.
@@ -875,40 +1066,84 @@ impl Threadbear {
         if let Some(runner) = summary.runner_id.clone() {
             self.load_remote_logins(runner, cx);
         }
-        if let Some(old) = &self.pane {
-            old.read(cx).unsubscribe();
-        }
+        // Kept loaded since it was last open: shown as it was at once, and
+        // caught up if it needs to be (pane_cache.rs). Taken out before the
+        // open one goes in, which could otherwise push it out. A pane brought
+        // from a panel is the thread's one, and a kept one can't be too.
+        let kept = self.kept.take(&id, cx).filter(|_| moved.is_none());
+        // The thread that was open stays loaded, for switching back.
+        self.leave_pane(cx);
         let client = self.client.clone();
-        let app = cx.entity().downgrade();
-        let made = !self.composers.contains_key(&id);
-        let composer = self
-            .composers
-            .entry(id.clone())
-            .or_insert_with(|| cx.new(|cx| Composer::new(Some(id.clone()), client.clone(), app, window, cx)))
-            .clone();
-        // Its words from before a quit, the first time its box is made.
-        if made {
-            self.restore_saved_draft(&id, &composer, cx);
-        }
+        let composer = self.composer_for(&id, window, cx);
         self.selected = Some(id);
         self.shows_home = false;
         self.projects.open = None;
-        let pane = cx.new(|cx| ThreadPane::new(client, summary, composer.clone(), cx));
+        let pane = match (moved, kept) {
+            (Some(pane), _) => pane,
+            (None, Some(pane)) => {
+                pane.update(cx, |p, cx| {
+                    p.summary_changed(&summary, cx);
+                    p.shown_again(cx);
+                });
+                pane
+            }
+            (None, None) => cx.new(|cx| ThreadPane::new(client, summary, composer.clone(), cx)),
+        };
         composer.update(cx, |c, cx| {
             c.attach(pane.downgrade());
             c.focus(window, cx);
+            crate::web_panels::keyboard_to_app(window);
             cx.notify();
         });
         // A thread: link in the transcript opens that thread.
-        self.pane_events = Some(cx.subscribe_in(&pane, window, |this, _, event: &crate::rows::OpenThreadRequest, window, cx| {
-            let matches: Vec<String> = this.threads.keys().filter(|k| **k == event.0 || k.starts_with(&event.0)).cloned().collect();
-            if let [only] = matches.as_slice() {
-                this.open(only.clone(), window, cx);
-            }
-        }));
+        self.pane_events = Some(cx.subscribe_in(&pane, window, |this, _, event: &crate::rows::OpenThreadRequest, window, cx| this.open_thread_link(&event.0, window, cx)));
         self.pane = Some(pane);
         self.note_navigation();
         cx.notify();
+    }
+
+    /// A `thread:` link (its id or a unique start of one) opens that thread.
+    /// One that matches none, or several, beeps and says why: a beep alone
+    /// left Mike clicking a link to a thread archived on bruce (another
+    /// machine's archived threads aren't listed here) and wondering why
+    /// nothing opened (6 Nov; `openThreadLink`).
+    pub(crate) fn open_thread_link(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let matches: Vec<String> = self.threads.keys().filter(|k| *k == id || k.starts_with(id)).cloned().collect();
+        if let [only] = matches.as_slice() {
+            // In the Inbox view, its section unfolded and its row in view,
+            // as Swift's `openThread` has it.
+            self.reveal_thread(only, cx);
+            return self.open(only.clone(), window, cx);
+        }
+        crate::composer_answers::beep();
+        self.show_error(threadbear_core::thread_link::unopened_link_message(matches.len()), cx);
+    }
+
+    /// The pane holding a thread now, if one does: the main panel's, the
+    /// thread's own panel, or one kept loaded. Not a sub-agent's, which shows
+    /// another transcript.
+    pub(crate) fn pane_for(&self, id: &str, cx: &App) -> Option<Entity<ThreadPane>> {
+        let main = self.pane.clone().filter(|p| {
+            let p = p.read(cx);
+            p.summary.id == id && p.subagent_id.is_none()
+        });
+        // A thread kept loaded (pane_cache.rs) hears too, so it's right
+        // when it's shown again.
+        main.or_else(|| self.thread_panel_pane(id)).or_else(|| self.kept.get(id, cx))
+    }
+
+    /// A thread's message box, kept while others are open so what's typed
+    /// stays with it, and made (with its words from before a quit) the first
+    /// time it's wanted.
+    pub(crate) fn composer_for(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) -> Entity<Composer> {
+        if let Some(composer) = self.composers.get(id) {
+            return composer.clone();
+        }
+        let (client, app) = (self.client.clone(), cx.entity().downgrade());
+        let composer = cx.new(|cx| Composer::new(Some(id.to_owned()), client, app, window, cx));
+        self.composers.insert(id.to_owned(), composer.clone());
+        self.restore_saved_draft(id, &composer, cx);
+        composer
     }
 
     /// Nothing open: the new-thread screen's place in the history. For going
@@ -925,12 +1160,7 @@ impl Threadbear {
         let client = self.client.clone();
         let pane = cx.new(|cx| ThreadPane::new_subagent(client, summary, subagent_id.clone(), composer, cx));
         // A thread: link in its transcript opens that thread, as in a thread's.
-        self.subagent_events = Some(cx.subscribe_in(&pane, window, |this, _, event: &crate::rows::OpenThreadRequest, window, cx| {
-            let matches: Vec<String> = this.threads.keys().filter(|k| **k == event.0 || k.starts_with(&event.0)).cloned().collect();
-            if let [only] = matches.as_slice() {
-                this.open(only.clone(), window, cx);
-            }
-        }));
+        self.subagent_events = Some(cx.subscribe_in(&pane, window, |this, _, event: &crate::rows::OpenThreadRequest, window, cx| this.open_thread_link(&event.0, window, cx)));
         self.subagent = Some((thread_id, subagent_id));
         self.subagent_pane = Some(pane);
         cx.notify();
@@ -947,14 +1177,21 @@ impl Threadbear {
 
     pub(crate) fn select_none(&mut self, cx: &mut Context<Self>) {
         self.close_subagent(cx);
-        if let Some(old) = self.pane.take() {
-            old.read(cx).unsubscribe();
-        }
+        self.leave_pane(cx);
         self.selected = None;
         self.shows_home = false;
         self.projects.open = None;
         self.note_navigation();
         cx.notify();
+    }
+
+    /// The main panel's thread stops being shown there: it's kept loaded
+    /// (pane_cache.rs), still subscribed, for switching back to it.
+    pub(crate) fn leave_pane(&mut self, cx: &mut Context<Self>) {
+        self.pane_events = None;
+        if let Some(old) = self.pane.take() {
+            self.kept.keep(old, cx);
+        }
     }
 
     /// `threads.update` for the open thread, with the summary changed here
@@ -966,12 +1203,28 @@ impl Threadbear {
         if let Some(t) = self.threads.get_mut(&id) {
             change(t);
         }
+        // A folder, login or pool change isn't guessed, so its chip spins.
+        let busy = if params.get("cwd").is_some() {
+            Some(format!("movingFolder/{id}"))
+        } else if params.get("accountId").is_some() || params.get("poolId").is_some() {
+            Some(format!("moving/{id}"))
+        } else {
+            None
+        };
+        if let Some(key) = &busy {
+            self.chip_busy.insert(key.clone());
+        }
         let mut params = params;
         params["threadId"] = json!(id);
         let client = self.client.clone();
+        let remote = before.as_ref().is_some_and(|t| t.runner_id.is_some());
+        let going = crate::call_for_thread(client, remote, "threads.update", params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "threads.update", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
+                if let Some(key) = &busy {
+                    this.chip_busy.remove(key);
+                }
                 if let Err(e) = res {
                     this.list_error = Some(e.message);
                     if let Some(before) = before {
@@ -1063,7 +1316,7 @@ impl Threadbear {
         if self.mode == SidebarMode::Projects {
             sidebar["sections"] = self.projects_sidebar_dump();
         }
-        json!({
+        let mut dump = json!({
             "connection": connection,
             "selection": self.selection_dump(),
             "sidebar": sidebar,
@@ -1100,6 +1353,12 @@ impl Threadbear {
             "dock": dock,
             // Folded away with ⌘/ or closed, it isn't on screen (thread_panels.rs).
             "threadsShowing": self.threads_showing(cx),
+            // Threads in panels of their own, and the one the main panel says
+            // is open in its own panel (`OpenElsewhereNote`).
+            "threadPanels": self.thread_panels_dump(cx),
+            "openElsewhere": self.open_elsewhere(cx),
+            // The keys shown beside the buttons while ⌘ is held (key_hints.rs).
+            "keyHints": self.key_hints_dump(cx),
             "zoom": crate::style::zoom_percent(),
             "archivedNote": self.archived_note.as_ref().map(|n| n.thread.clone()),
             "inboxEndNote": self.inbox_end_note.as_ref().map(|n| if n.empty { "empty" } else { "end" }),
@@ -1119,7 +1378,39 @@ impl Threadbear {
             "webPanels": crate::web_panels::dump(cx),
             "actions": self.side.read(cx).thread(cx).map(|t| crate::patches::actions_dump(self.side.read(cx), &t)).unwrap_or_else(|| json!([])),
             "terminal": crate::terminal::dump(self, cx),
-        })
+        });
+        // Any other note the window shows outside the banner and the error
+        // bar: the sidebar's, when the list couldn't be read. Never the
+        // connection's (Mike, 12 Nov: the raw error mid-restart).
+        dump["notes"] = json!(self.list_error.iter().collect::<Vec<_>>());
+        // What came across from the Swift app, while its note's up. Set
+        // after, as the literal above is as long as serde_json's macro goes.
+        dump["importNote"] = json!(self.import_note);
+        // Videos and PDFs up in the system's views, in any window (media_view.rs).
+        dump["media"] = crate::media_view::dump();
+        // The card a page swipe shows while it's under way (swipe_nav.rs).
+        dump["pageSwipe"] = self.page_swipe_dump();
+        // The last archive or hibernate flight: where it started and aimed,
+        // and once it's landed, where the heading's box was (archive_flight.rs).
+        dump["flight"] = self.flight.dump();
+        // Whether motion is reduced (automation.rs): no flights or glides then.
+        dump["reduceMotion"] = json!(cx.reduce_motion());
+        // The last time the panels moved (a panel opened or closed): where
+        // each panel was and went, and whether they're still on their way.
+        dump["panelMotion"] = self.dock_view.read(cx).last_motion().map_or(Value::Null, |(from, to, moving)| {
+            let rects = |frames: &std::collections::HashMap<String, threadbear_dock::Rect>| -> Value {
+                frames.iter().map(|(panel, r)| (panel.replace("threadbear.", ""), json!({ "x": r.x.round(), "y": r.y.round(), "width": r.width.round(), "height": r.height.round() }))).collect::<serde_json::Map<_, _>>().into()
+            };
+            json!({ "from": rects(from), "to": rects(to), "moving": moving })
+        });
+        dump
+    }
+
+    /// Whether the panels are gliding or an archive flight is under way
+    /// (automation's `motion`).
+    #[cfg(feature = "automation")]
+    pub(crate) fn moving(&self, cx: &App) -> bool {
+        self.dock_view.read(cx).last_motion().is_some_and(|(_, _, moving)| moving) || self.flight.in_flight()
     }
 
     /// The composer's part of the dump (AppDump.composer).
@@ -1147,8 +1438,24 @@ impl Threadbear {
             // The seq of the message being edited, as the Swift dump has it.
             out["editing"] = json!(composer.editing.as_ref().map(|e| e.seq));
             out["chipBadge"] = json!(crate::composer_chips::model_chip_badge_text(&data));
+            // The box and its card locked while the thread moves, with what
+            // the box says in place of its words.
+            out["moving"] = json!(composer.moving_line(cx));
+            // The refusal offer the box has over it (RefusalOffer), as its
+            // button reads.
+            let refused = composer.thread_id.is_some() && self.open_thread().and_then(|t| self.refusal_target(t, cx)).is_some();
+            out["offerAbove"] = json!(refused.then_some(if self.continuing_refusal.is_some() { "Continuing…" } else { "Continue with Codex Sol" }));
+            // Whether the chips and the send button fit inside the box.
+            let (row, send) = composer.controls_fit.get();
+            out["chipsFit"] = json!(send <= row + 0.5);
+            // The chips spinning while a login, pool or folder change lands.
+            out["busy"] = json!(composer.busy_chips(cx));
             if let Some(card) = composer.card_lines(cx) {
                 out["card"] = json!(card);
+            }
+            // The picks shown as chips under a folded card (composer_answers.rs).
+            if let Some(answers) = composer.answer_chip_lines(cx) {
+                out["answers"] = json!(answers);
             }
             if let Some(runs) = crate::card_run::composer_lines(composer, cx) {
                 out["cardRuns"] = json!(runs);
@@ -1216,13 +1523,6 @@ impl Threadbear {
         .detach();
     }
 
-    pub(crate) fn connection_note(&self) -> Option<String> {
-        match &self.status {
-            Status::Connected { .. } => None,
-            Status::Connecting { .. } => Some("Connecting to the runner…".into()),
-            Status::Disconnected { reason, retry_in_ms, .. } => Some(format!("Can't reach the runner: {reason}. Trying again in {}s.", retry_in_ms.div_ceil(1000))),
-        }
-    }
 }
 
 /// `Threadbear::connection`: the Swift app's `ConnectionState`, each drop
@@ -1269,6 +1569,15 @@ impl Render for Threadbear {
         // The web panels' pages are native views: shown and placed once the
         // window's laid out, where their panels were drawn (web_panels.rs).
         let pages = crate::web_panels::sweeper(self.open_menu_at(), self.share_popover.is_some());
-        self.render_shell(window, cx).children(open_menu).child(pages)
+        // Videos and PDFs in the system's views the same way (media_view.rs),
+        // hidden under the picture viewer and the pane's own menus too.
+        let media = {
+            let side = self.side.read(cx);
+            let everything = self.share_popover.is_some() || side.viewer.is_open();
+            let menus = self.open_menu_at().into_iter().chain(side.menu.as_ref().map(|m| m.position)).collect();
+            crate::media_view::sweeper(window, crate::media_view::Cover { everything, menus })
+        };
+        // Last: every press in the window, for the activity log (tips.rs).
+        self.render_shell(window, cx).children(open_menu).child(pages).child(media).child(crate::tips::window_presses())
     }
 }

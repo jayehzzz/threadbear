@@ -148,6 +148,10 @@ export type CreateScheduleParams = {
 
 export type UpdateScheduleParams = {
   scheduleId: string;
+  // The check it must still have, compared as it saves (update_schedule
+  // carrying a check to a new folder, whose card showed this one). Not
+  // from a client.
+  ifCheck?: string;
   title?: string;
   text?: string;
   at?: string;
@@ -648,6 +652,7 @@ export class Scheduler {
   private async updateNow(p: UpdateScheduleParams): Promise<Schedule> {
     // A copy, so a write the backend turns down changes nothing here.
     const rec: ScheduleRecord = structuredClone(this.mustGet(p.scheduleId));
+    if (p.ifCheck !== undefined && rec.check !== p.ifCheck) throw bad("The schedule's check changed while the approval card was up, so nothing changed. Look at it again and ask again.");
     const away = !this.mine(rec);
     let replan = false;
     if (p.title !== undefined) rec.title = p.title.trim() ? cutSafely(p.title.trim(), 200) : firstLine(rec.text);
@@ -688,7 +693,6 @@ export class Scheduler {
       if (p.checkTimeoutSecs === null) delete rec.checkTimeoutSecs;
       else rec.checkTimeoutSecs = checkedTimeout(p.checkTimeoutSecs);
     }
-    const moved = !rec.threadId && p.cwd !== undefined;
     if (!rec.threadId) {
       if (p.cwd !== undefined) rec.cwd = away ? p.cwd.trim() || undefined : this.checkedFolder(p.cwd);
       if (rec.cwd === undefined) delete rec.cwd;
@@ -712,9 +716,14 @@ export class Scheduler {
     }
     rec.updatedAt = this.iso();
     if (replan) this.plan(rec);
-    // Passing the check again, or moving it, approves it as it is now. Any
-    // other change leaves its approval alone.
-    if (!away && (p.check !== undefined || moved)) this.approveCheck(rec, p.checkCard);
+    // Passing the check again approves it as it is now. Nothing else does,
+    // a new folder included: approval is bound to the folder, so one moved
+    // is held there until the check is passed again (from a thread that
+    // asks first, a card). The apps' editors send the folder with every
+    // save and show no check, so a save meant to change the title once
+    // approved whatever a pull had changed the check's scripts to
+    // (security review, 11 Nov 2026).
+    if (!away && p.check !== undefined) this.approveCheck(rec, p.checkCard);
     await this.put(rec);
     this.tick();
     return this.view(rec);
@@ -1541,6 +1550,8 @@ export function scheduleMethods(s: Scheduler): Record<string, (p: Record<string,
       if (p.paused !== undefined) upd.paused = bool(p, 'paused');
       if (p.check !== undefined) upd.check = p.check === null ? null : str(p, 'check');
       Object.assign(upd, checkCardOf(p));
+      // Like the card, it can only refuse.
+      if (p.ifCheck !== undefined) upd.ifCheck = reqStr(p, 'ifCheck');
       if (p.checkTimeoutSecs !== undefined) upd.checkTimeoutSecs = p.checkTimeoutSecs === null ? null : num(p, 'checkTimeoutSecs');
       return { schedule: await s.update(upd) };
     },

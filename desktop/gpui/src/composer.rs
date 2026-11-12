@@ -15,7 +15,6 @@ use crate::thread::ThreadPane;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Copy, Cut, Enter, Escape, IndentInline, InlineToken, InlineTokenContext, InlineTokenHoverEvent, InputEvent, MoveDown, MoveUp, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -32,6 +31,7 @@ use threadbear_core::reducer::ImageRef;
 use threadbear_core::slash::{PaletteKey, PaletteState};
 use std::cell::Cell;
 use std::rc::Rc;
+use crate::tips::Tip as _;
 
 /// A picture in the box: the token that draws its chip, what it came from,
 /// and what the runner made of it (`media.import`).
@@ -65,6 +65,10 @@ pub struct Composer {
     hovered_chip: Option<(SharedString, Bounds<Pixels>)>,
     peek_shown: Option<(SharedString, Bounds<Pixels>)>,
     hover_serial: u64,
+    /// What the last click on a picture opened in the viewer (its paths and
+    /// the place of the one clicked), for `composer-peek` to say.
+    #[cfg(feature = "automation")]
+    pub(crate) debug_opened: Option<(Vec<String>, usize)>,
     /// Stop was pressed and the turn hasn't ended yet: a spinner in its place.
     stopping: bool,
     /// A refused send's draft, to put back at the next render.
@@ -75,15 +79,22 @@ pub struct Composer {
     pub(crate) card: CardState,
     /// The card's text style, one per appearance (`card_reading_style`).
     pub(crate) card_style: Option<((bool, u32), gpui_kit::base::TextViewStyle)>,
-    shown_placeholder: &'static str,
-    /// The slash palette's own state (`PaletteState`), and whether this
-    /// opening of it has asked for the thread's commands yet.
+    shown_placeholder: SharedString,
+    /// The slash palette's own state (`PaletteState`), and the list this
+    /// opening of it has asked for (the thread's, or a new thread's login
+    /// and folder's, which the chips can change while it's open).
     pub(crate) palette: PaletteState,
-    pub(crate) palette_asked: bool,
+    pub(crate) palette_asked: Option<String>,
     /// The palette's list, kept so the arrows can scroll the pick into sight.
     pub(crate) palette_scroll: ScrollHandle,
     /// The box's width at the last paint, for the palette's columns.
     pub(crate) card_width: Rc<Cell<f32>>,
+    /// The chip row's right edge and the send button's, at the last paint:
+    /// the button past the row would be chips running past the box.
+    pub(crate) controls_fit: Rc<Cell<(f32, f32)>>,
+    /// The box's top edge in the window at the last paint: the room the
+    /// slash palette has over it (high up on the new-thread page).
+    pub(crate) box_top: Rc<Cell<f32>>,
     /// One of Mike's messages being edited (`AppModel.editing`): sending
     /// replaces it and carries on from there.
     pub(crate) editing: Option<MessageEdit>,
@@ -103,10 +114,49 @@ pub(crate) struct MessageEdit {
 
 /// What a refused send gives back: the words and pictures, and the picks that
 /// went with them (AppModel.restoreDraft and the `failed` closure in `send`).
+#[derive(Clone)]
 pub struct RestoreDraft {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageRef>,
     pub(crate) card: Option<SavedPicks>,
+    /// With a card's picks: the message as it went, in the box's form, for
+    /// the drafts file, which keeps only words and pictures (a quit with
+    /// this still waiting to be given back keeps the answers as words).
+    pub(crate) as_sent: Option<(String, Vec<ImageRef>)>,
+}
+
+impl RestoreDraft {
+    pub(crate) fn plain(text: String, images: Vec<ImageRef>) -> RestoreDraft {
+        RestoreDraft { text, images, card: None, as_sent: None }
+    }
+
+    /// Its words and pictures for the drafts file.
+    pub(crate) fn for_saving(&self) -> (String, Vec<ImageRef>) {
+        match (&self.card, &self.as_sent) {
+            (Some(_), Some(sent)) => sent.clone(),
+            _ => (self.text.clone(), self.images.clone()),
+        }
+    }
+
+    fn join_parts(first: (String, Vec<ImageRef>), then: (String, Vec<ImageRef>)) -> (String, Vec<ImageRef>) {
+        let text = match (first.0.trim().is_empty(), then.0.trim().is_empty()) {
+            (_, true) => first.0,
+            (true, false) => then.0,
+            (false, false) => format!("{}\n\n{}", first.0, then.0),
+        };
+        let mut images = first.1;
+        images.extend(then.1);
+        (text, images)
+    }
+
+    /// `first`'s words and pictures, then `then`'s, a blank line between
+    /// (`restoreDraft`: what's given back goes before anything typed since).
+    /// Pictures are marks in the words, in order, so their lists join too.
+    pub(crate) fn joined(first: RestoreDraft, then: RestoreDraft) -> RestoreDraft {
+        let as_sent = (first.card.is_some() || then.card.is_some()).then(|| Self::join_parts(first.for_saving(), then.for_saving()));
+        let (text, images) = Self::join_parts((first.text, first.images), (then.text, then.images));
+        RestoreDraft { text, images, card: first.card.or(then.card), as_sent }
+    }
 }
 
 #[derive(Clone)]
@@ -149,24 +199,38 @@ impl Composer {
             hovered_chip: None,
             peek_shown: None,
             hover_serial: 0,
+            #[cfg(feature = "automation")]
+            debug_opened: None,
             stopping: false,
             restore: None,
             model_picker: None,
             card: CardState::default(),
             card_style: None,
-            shown_placeholder: "Message",
+            shown_placeholder: "Message".into(),
             editing: None,
             pending_box: None,
             palette: PaletteState::default(),
-            palette_asked: false,
+            palette_asked: None,
             palette_scroll: ScrollHandle::new(),
             card_width: Rc::new(Cell::new(style::MAX_CONTENT_WIDTH)),
+            controls_fit: Rc::new(Cell::new((0., 0.))),
+            box_top: Rc::new(Cell::new(f32::MAX)),
             _subs: vec![sub],
         }
     }
 
     pub fn attach(&mut self, pane: WeakEntity<ThreadPane>) {
         self.pane = pane;
+    }
+
+    /// On its way to another machine: "Moving to bruce…" in the box, which
+    /// and whose card are locked until it's there (ComposerView's `moving`).
+    /// Cancel Move, or a failed move, gives them back.
+    pub(crate) fn moving_line(&self, cx: &App) -> Option<String> {
+        let id = self.thread_id.as_ref()?;
+        let app = self.app.upgrade()?;
+        let t = app.read(cx);
+        t.threads.get(id).and_then(|t| t.moving_line())
     }
 
     /// A new thread is on its way from this box (`AppModel.creatingThread`).
@@ -203,12 +267,14 @@ impl Composer {
         }
     }
 
-    /// `LimitBox`: the thread's login is at its limit, or its last turn
-    /// stopped on it. At the top of the box, over a line like the card of
-    /// asks: what happened, Switch to (a pool thread's Pin to) the login with
-    /// the most room, and whether it carries on by itself once the limit
-    /// resets. Mike asked for it here on 10 Nov, in place of a bar across the
-    /// top of the thread that read as an error and offered only the switch.
+    /// `LimitBox`: the thread's login is at its limit (a pool thread's whole
+    /// pool, as the runner moves it between the pool's logins by itself),
+    /// or its last turn stopped on it. At the top of the box, over a line
+    /// like the card of asks: what happened, Continue now on with a menu of
+    /// the logins with room (12 Nov, in place of a single Switch to / Pin
+    /// to), and whether it carries on by itself once the limit resets. Mike
+    /// asked for it here on 10 Nov, in place of a bar across the top of the
+    /// thread that read as an error and offered only the switch.
     fn render_limit_box(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use gpui_kit::base::TestSupportExt as _;
         use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -244,17 +310,40 @@ impl Composer {
             .text_size(px(style::size::LABEL))
             .line_height(px(16.))
             .child(h_flex().items_start().gap(px(8.)).child(div().flex_none().pt(px(1.)).child(mark)).child(crate::highlights::tipped(div().id("limit-text").flex_1().min_w_0(), text.clone()).child(text)));
-        if advice.target.is_some() || advice.stopped {
-            let mut row = h_flex().gap(px(10.)).items_center();
-            if let Some((account, title)) = advice.target.clone() {
-                let title = crate::header::limit_button_title(title, advice.pool);
-                let tip = "Carry on this thread on that login now, from where it is";
-                let (app, id) = (self.app.clone(), thread.id.clone());
+        if !advice.targets.is_empty() || advice.stopped {
+            // Wraps in a narrow window rather than running past the box's edge.
+            let mut row = h_flex().flex_wrap().gap(px(10.)).items_center();
+            if let Some(first) = advice.targets.first() {
+                // Continue now on, and a menu of the logins with room to pick
+                // which (Mike, 12 Nov). It pins the thread there and carries
+                // on at once; the first is the one with the most room.
+                let picked = app.read(cx).limit_pick.get(&thread.id).and_then(|id| advice.targets.iter().find(|(t, _)| t == id)).unwrap_or(first).clone();
+                let tip = "Pin this thread to that login and carry on there now, from where it stopped";
+                let (account, title) = picked.clone();
+                let (app_c, id) = (self.app.clone(), thread.id.clone());
+                let carry_on = advice.stopped;
                 row = row.child(
-                    div().id("limit-switch").test_support().aria_label(tip).child(Button::new("limit-switch-button").label(title).small().secondary().tooltip(tip).on_click(move |_, _, cx| {
-                        app.update(cx, |a, cx| a.switch_account(&id, account.clone(), cx)).ok();
+                    div().id("limit-switch").test_support().aria_label(tip).child(Button::new("limit-switch-button").label("Continue now on").small().secondary().tooltip(tip).on_click(move |_, _, cx| {
+                        app_c.update(cx, |a, cx| a.continue_now_on(&id, account.clone(), carry_on, cx)).ok();
                     })),
                 );
+                let targets = advice.targets.clone();
+                let (app_m, id) = (self.app.clone(), thread.id.clone());
+                let menu = Button::new("limit-login-button").label(title).small().secondary().dropdown_caret(true).tooltip("Which login to carry on with").dropdown_menu(move |menu: PopupMenu, _, _| {
+                    let mut menu = menu;
+                    for (account, title) in &targets {
+                        let (app, id, account) = (app_m.clone(), id.clone(), account.clone());
+                        menu = menu.item(PopupMenuItem::new(title.clone()).checked(account == picked.0).on_click(move |_, _, cx| {
+                            app.update(cx, |a, cx| {
+                                a.limit_pick.insert(id.clone(), account.clone());
+                                cx.notify();
+                            })
+                            .ok();
+                        }));
+                    }
+                    menu
+                });
+                row = row.child(div().id("limit-login").test_support().child(menu));
             }
             if advice.stopped {
                 let on = thread.carry_on_at_reset;
@@ -283,6 +372,7 @@ impl Composer {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         self.input.update(cx, |s, cx| s.focus(window, cx));
+        crate::web_panels::keyboard_to_app(window);
     }
 
     /// What the box holds as a draft (ComposerTextView.draftNow): the words,
@@ -290,8 +380,27 @@ impl Composer {
     /// A chip still being copied in isn't part of it yet, nor is a stray
     /// U+FFFC pasted as text.
     /// The words and pictures in the box, for drafts.rs to keep.
+    /// What to keep through a quit: what's waiting to be given back (not
+    /// drawn yet), messages still held for a restarting runner, then the box.
     pub(crate) fn draft_for_saving(&self, cx: &App) -> (String, Vec<ImageRef>) {
-        self.draft(cx)
+        let (text, images) = self.draft(cx);
+        let mut all = RestoreDraft::plain(text, images);
+        if let Some(id) = &self.thread_id {
+            for held in crate::thread::held_drafts(id).into_iter().rev() {
+                all = RestoreDraft::joined(held, all);
+            }
+        }
+        if let Some(restore) = &self.restore {
+            all = RestoreDraft::joined(restore.clone(), all);
+        }
+        all.for_saving()
+    }
+
+    /// Whether the box holds anything a restart would lose: words, or a
+    /// picture, one still being copied in included (app_update.rs).
+    pub(crate) fn holds_anything(&self, cx: &App) -> bool {
+        let text = self.input.read(cx).value().to_string();
+        threadbear_core::inline_chips::holds_anything(&text, &self.box_chips(cx))
     }
 
     /// A card's or thread's chip is its link in the draft (composer_inline.rs).
@@ -330,8 +439,16 @@ impl Composer {
     }
 
     /// ComposerView.returnWhenEmpty: Return with nothing typed allows the
-    /// sole waiting approval (the ⏎ its Allow button shows).
+    /// sole waiting approval (the ⏎ its Allow button shows). Not while a
+    /// message is being edited: the box is the edit then, an empty one
+    /// sends nothing, and Return there is about that message, never a card
+    /// that may be off screen (Daybreak, 11 Nov: pencil, clear, Return
+    /// allowed a waiting tool). Pictures are chips in the text, so an edit
+    /// with only pictures left isn't empty and goes to `send`.
     fn return_when_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_some() {
+            return true;
+        }
         if self.return_with_picks(window, cx) {
             return true;
         }
@@ -370,6 +487,10 @@ impl Composer {
     /// at the end of the transcript until the runner has it; it comes back
     /// if the runner doesn't take it.
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Return still reaches here with the box locked for a move.
+        if self.moving_line(cx).is_some() {
+            return;
+        }
         if self.thread_id.is_none() {
             return self.send_new_thread(window, cx);
         }
@@ -392,13 +513,21 @@ impl Composer {
             return;
         }
         let Some(pane) = self.pane() else { return };
+        // No runner and no restart to wait for: the words stay in the box,
+        // and the error bar says why (`send`'s guard).
+        if let Some(why) = pane.read(cx).cant_send_now() {
+            if let Some(app) = self.app.upgrade() {
+                app.update(cx, |app, cx| app.show_connection_error(why, cx));
+            }
+            return;
+        }
         let picks = self.saved_picks();
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
         self.pictures.clear();
         self.mentions.clear();
         self.clear_picks(cx);
         let composer = cx.entity().downgrade();
-        let restore = RestoreDraft { text: draft_text, images, card: picks };
+        let restore = RestoreDraft { text: draft_text, images, card: picks, as_sent: None };
         pane.update(cx, |p, cx| p.send_message(text, images_to_send, answers, Some(restore), composer, cx));
         cx.notify();
     }
@@ -450,6 +579,7 @@ impl Composer {
         self.set_box(words, pictures, window, cx);
         self.editing = Some(MessageEdit { seq, before, sending: false });
         self.focus(window, cx);
+        crate::web_panels::keyboard_to_app(window);
         cx.notify();
     }
 
@@ -466,7 +596,7 @@ impl Composer {
         self.input.update(cx, |s, cx| s.set_value("", window, cx));
         self.pictures.clear();
         self.mentions.clear();
-        self.apply_restore(RestoreDraft { text, images, card: None }, window, cx);
+        self.apply_restore(RestoreDraft::plain(text, images), window, cx);
     }
 
     /// Sends the edited message (`sendEdit`): the box keeps it, its banner
@@ -484,6 +614,7 @@ impl Composer {
         if let Some(edit) = self.editing.as_mut() {
             edit.sending = true;
         }
+        crate::activity::sent(Some(&thread_id), images.len(), 0, true);
         cx.notify();
         let client = self.client.clone();
         let images_json: Vec<Value> = images.iter().map(image_ref_json).collect();
@@ -567,13 +698,25 @@ impl Composer {
         )
     }
 
+    /// Puts words back in the box, once it's next drawn. Two given back
+    /// before then are both kept, the older first (a held message and
+    /// another, while this thread wasn't open).
     pub fn restore_draft(&mut self, draft: RestoreDraft, cx: &mut Context<Self>) {
-        self.restore = Some(draft);
+        self.restore = Some(match self.restore.take() {
+            Some(earlier) => RestoreDraft::joined(earlier, draft),
+            None => draft,
+        });
         cx.notify();
     }
 
     fn apply_restore(&mut self, restore: RestoreDraft, window: &mut Window, cx: &mut Context<Self>) {
-        let RestoreDraft { text: draft, images, card } = restore;
+        // A picture still on its way into the box would drop out of the
+        // words joined below: wait for it, and put these back after.
+        if self.box_chips(cx).iter().any(|(_, chip)| matches!(chip, threadbear_core::inline_chips::BoxChip::Picture(None))) {
+            self.restore = Some(restore);
+            return;
+        }
+        let RestoreDraft { text: draft, images, card, .. } = restore;
         if let Some(saved) = card {
             if self.card.seq == Some(saved.seq) {
                 self.card.picks = saved.picks;
@@ -583,9 +726,10 @@ impl Composer {
                 self.push_card_state(cx);
             }
         }
-        if !self.input.read(cx).value().is_empty() {
-            return;
-        }
+        // Anything typed since stays, after what's given back
+        // (`restoreDraft`), rather than the words given back being lost.
+        let (now_text, now_images) = self.draft(cx);
+        let RestoreDraft { text: draft, images, .. } = RestoreDraft::joined(RestoreDraft::plain(draft, images), RestoreDraft::plain(now_text, now_images));
         // Chips again where the marks are, each picture back in place, and
         // the cards and threads linked in the words as theirs.
         let content = self.content_for(&draft, &images);
@@ -602,6 +746,13 @@ impl Composer {
     /// Paste: pictures and files first, as ComposerTextView.takeImages takes
     /// them. Returns whether it took the paste; words paste as words.
     pub(crate) fn take_clipboard(&mut self, item: &ClipboardItem, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let target = self.input.clone();
+        self.take_clipboard_in(&target, item, window, cx)
+    }
+
+    /// A paste into `target`: the box, or one of the card's Something else
+    /// boxes, which takes pictures as chips just the same (AskAnswerBox).
+    pub(crate) fn take_clipboard_in(&mut self, target: &Entity<TextareaState>, item: &ClipboardItem, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut paths = Vec::new();
         let mut images = Vec::new();
         let mut has_text = false;
@@ -613,12 +764,12 @@ impl Composer {
             }
         }
         if !paths.is_empty() {
-            self.take_paths(paths, window, cx);
+            self.take_paths_in(target, paths, window, cx);
             return true;
         }
         // A copy of the box's own chips with its pictures, a thread's id, a
         // card's link: chips (composer_inline.rs). Other words are words.
-        if has_text && self.take_clipboard_chips(item, window, cx) {
+        if has_text && self.take_clipboard_chips(target, item, window, cx) {
             return true;
         }
         // Text with an image flavour (rich text from a browser) stays text.
@@ -629,7 +780,7 @@ impl Composer {
         if saved.is_empty() {
             return false;
         }
-        self.insert_pictures(saved, window, cx);
+        self.insert_pictures_in(target, saved, window, cx);
         true
     }
 
@@ -637,18 +788,23 @@ impl Composer {
     /// anything else goes in as its full path in backticks, for the agent to
     /// open where it is (ComposerTextView.takeImages).
     pub(crate) fn take_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.input.clone();
+        self.take_paths_in(&target, paths, window, cx);
+    }
+
+    pub(crate) fn take_paths_in(&mut self, target: &Entity<TextareaState>, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let (images, others): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| is_picture(p));
         if !others.is_empty() {
-            self.insert_paths(others, window, cx);
+            Self::insert_paths(target, others, window, cx);
         }
         if !images.is_empty() {
-            self.insert_pictures(images, window, cx);
+            self.insert_pictures_in(target, images, window, cx);
         }
     }
 
     /// ComposerTextView.insertPaths: the paths with a space either side.
-    fn insert_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
-        let (text, selection) = self.text_and_selection(cx);
+    fn insert_paths(target: &Entity<TextareaState>, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, selection) = Self::text_and_selection(target, cx);
         let mut piece = composer::path_text(&paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>());
         if text[..selection.start].chars().next_back().is_some_and(|c| !c.is_whitespace()) {
             piece.insert(0, ' ');
@@ -656,27 +812,29 @@ impl Composer {
         if !text[selection.end..].chars().next().is_some_and(char::is_whitespace) {
             piece.push(' ');
         }
-        self.input.update(cx, |s, cx| {
+        target.update(cx, |s, cx| {
             s.replace(piece, window, cx);
             s.focus(window, cx);
+            crate::web_panels::keyboard_to_app(window);
         });
     }
 
-    fn text_and_selection(&self, cx: &App) -> (String, Range<usize>) {
-        let state = self.input.read(cx);
+    fn text_and_selection(target: &Entity<TextareaState>, cx: &App) -> (String, Range<usize>) {
+        let state = target.read(cx);
         (state.value().to_string(), state.selected_range())
     }
 
-    /// ComposerTextView.insertPictures: chips where the cursor is, with a
-    /// space either side, each copied in through the runner as it shows,
-    /// dimmed until it's in; one that can't be read goes again.
-    pub(crate) fn insert_pictures(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+    /// ComposerTextView.insertPictures: chips where the cursor is in
+    /// `target` (the box, or a Something else box), with a space either
+    /// side, each copied in through the runner as it shows, dimmed until it's
+    /// in; one that can't be read goes again.
+    pub(crate) fn insert_pictures_in(&mut self, target: &Entity<TextareaState>, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         let ids: Vec<SharedString> = paths.iter().map(|_| self.fresh_picture_id()).collect();
         let tokens: Vec<InlineToken> = ids.iter().map(picture_token).collect();
-        let (text, selection) = self.text_and_selection(cx);
+        let (text, selection) = Self::text_and_selection(target, cx);
         let prev_is_space = text[..selection.start].chars().next_back().map_or(true, char::is_whitespace);
         let next_is_space = text[selection.end..].chars().next().is_some_and(char::is_whitespace);
-        self.input.update(cx, |s, cx| {
+        target.update(cx, |s, cx| {
             if !selection.is_empty() {
                 s.replace("", window, cx);
             }
@@ -693,15 +851,16 @@ impl Composer {
                 s.insert(" ", window, cx);
             }
             s.focus(window, cx);
+            crate::web_panels::keyboard_to_app(window);
         });
         for (id, path) in ids.into_iter().zip(paths) {
             self.pictures.insert(id.clone(), PictureChip { source: path.clone(), image: None });
-            self.import_picture(id, path, window, cx);
+            self.import_picture(id, path, target.downgrade(), window, cx);
         }
         cx.notify();
     }
 
-    fn import_picture(&mut self, id: SharedString, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn import_picture(&mut self, id: SharedString, path: PathBuf, target: WeakEntity<TextareaState>, window: &mut Window, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let params = json!({ "path": path.to_string_lossy() });
         cx.spawn_in(window, async move |this, cx| {
@@ -709,15 +868,20 @@ impl Composer {
             // The runner keeps its own copy (or said no): a pasted picture's
             // staged file goes now, whatever happens to the chip.
             unstage(&path);
-            this.update_in(cx, |this, window, cx| this.settle_picture(id, result, window, cx)).ok();
+            this.update_in(cx, |this, window, cx| this.settle_picture(id, result, target, window, cx)).ok();
         })
         .detach();
     }
 
     /// ComposerTextView.settle: a chip's picture is in, or couldn't be read.
-    /// Gone from the words by then (undone, deleted), it's dropped.
-    fn settle_picture(&mut self, id: SharedString, result: Result<Value, threadbear_client::runner::RpcError>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(range) = self.chip_range(&id, cx) else {
+    /// Gone from the words by then (undone, deleted, its box gone), it's
+    /// dropped.
+    fn settle_picture(&mut self, id: SharedString, result: Result<Value, threadbear_client::runner::RpcError>, target: WeakEntity<TextareaState>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = target.upgrade() else {
+            self.pictures.remove(&id);
+            return;
+        };
+        let Some(range) = Self::chip_range(&target, &id, cx) else {
             self.pictures.remove(&id);
             return;
         };
@@ -727,10 +891,14 @@ impl Composer {
                 if let (Some(chip), Some(image)) = (self.pictures.get_mut(&id), image) {
                     chip.image = Some(image);
                 }
+                // A Something else box's answer takes it now.
+                if target != self.input {
+                    self.answer_box_changed(&target, cx);
+                }
             }
             Err(e) => {
                 // Taken out, with the space that came with it.
-                self.remove_chip_range(range, window, cx);
+                Self::remove_chip_range(&target, range, window, cx);
                 self.pictures.remove(&id);
                 if let Some(pane) = self.pane() {
                     pane.update(cx, |p, cx| p.show_error(format!("Couldn't add that picture: {}", e.message), cx));
@@ -743,17 +911,21 @@ impl Composer {
     /// The token ranges of the picture chips in the box, in order: a card's
     /// or thread's chip isn't one of them.
     fn chips(&self, cx: &App) -> Vec<(Range<usize>, SharedString)> {
-        self.input.read(cx).tokens().iter().filter(|span| !Self::is_mention_token(span.token().id())).map(|span| (span.range(), span.token().id().clone())).collect()
+        Self::chips_in(&self.input, cx)
     }
 
-    fn chip_range(&self, id: &SharedString, cx: &App) -> Option<Range<usize>> {
-        self.chips(cx).into_iter().find(|(_, chip)| chip == id).map(|(r, _)| r)
+    pub(crate) fn chips_in(target: &Entity<TextareaState>, cx: &App) -> Vec<(Range<usize>, SharedString)> {
+        target.read(cx).tokens().iter().filter(|span| !Self::is_mention_token(span.token().id())).map(|span| (span.range(), span.token().id().clone())).collect()
+    }
+
+    fn chip_range(target: &Entity<TextareaState>, id: &SharedString, cx: &App) -> Option<Range<usize>> {
+        Self::chips_in(target, cx).into_iter().find(|(_, chip)| chip == id).map(|(r, _)| r)
     }
 
     /// Takes a chip out with one space beside it (ComposerTextView.withSpace),
     /// keeping the cursor where it was as far as it can.
-    fn remove_chip_range(&mut self, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
-        let (text, selection) = self.text_and_selection(cx);
+    fn remove_chip_range(target: &Entity<TextareaState>, range: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, selection) = Self::text_and_selection(target, cx);
         let bytes = text.as_bytes();
         let gone = if bytes.get(range.end) == Some(&b' ') {
             range.start..range.end + 1
@@ -764,7 +936,7 @@ impl Composer {
         };
         let shift = |at: usize| if at <= gone.start { at } else { at.saturating_sub(gone.len()).max(gone.start) };
         let caret = shift(selection.start)..shift(selection.end);
-        self.input.update(cx, |s, cx| {
+        target.update(cx, |s, cx| {
             s.set_selected_range(gone.clone(), cx);
             s.replace("", window, cx);
             s.set_selected_range(caret.clone(), cx);
@@ -774,8 +946,13 @@ impl Composer {
     /// The strip's × (ComposerView.removePicture): the chip goes too, and the
     /// cursor stays where it was.
     fn remove_picture(&mut self, id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(range) = self.chip_range(&id, cx) {
-            self.remove_chip_range(range, window, cx);
+        let target = self.input.clone();
+        self.remove_picture_in(&target, id, window, cx);
+    }
+
+    pub(crate) fn remove_picture_in(&mut self, target: &Entity<TextareaState>, id: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(range) = Self::chip_range(target, &id, cx) {
+            Self::remove_chip_range(target, range, window, cx);
         }
         self.pictures.remove(&id);
         cx.notify();
@@ -783,6 +960,12 @@ impl Composer {
 
     fn renumber_chips(&mut self, cx: &App) {
         self.chip_numbers = self.chips(cx).into_iter().enumerate().map(|(i, (_, id))| (id, i + 1)).collect();
+        // A Something else box's chips count from 1 in each box.
+        for input in self.card.answer_inputs() {
+            for (i, (_, id)) in Self::chips_in(&input, cx).into_iter().enumerate() {
+                self.chip_numbers.insert(id, i + 1);
+            }
+        }
     }
 
     /// The hover card over a chip, after a beat, as ComposerTextView.hoverChip
@@ -829,6 +1012,87 @@ impl Composer {
         Ok(())
     }
 
+    /// A plain click on a picture's chip among the words, or on its thumbnail
+    /// over them: the app's picture viewer on it, stepping through the other
+    /// pictures in the same box (ComposerTextView.previewPicture, where it's
+    /// Quick Look; Mike, 11 Nov). One still being copied in shows from the
+    /// file it came from. False when it isn't a picture that opens here.
+    pub(crate) fn open_picture(&mut self, target: &Entity<TextareaState>, id: &SharedString, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(chosen) = self.picture_path(id).map(|p| p.to_string_lossy().into_owned()) else { return false };
+        // The hover card goes, as Swift's mouseDown ends it: the viewer
+        // comes up over everything.
+        self.hover_serial += 1;
+        self.hovered_chip = None;
+        self.peek_shown = None;
+        let paths = Self::chips_in(target, cx).iter().filter_map(|(_, chip)| self.picture_path(chip)).map(|p| p.to_string_lossy().into_owned()).collect();
+        let opened = crate::viewer::open_from_composer(paths, &chosen, window, cx);
+        let ok = opened.is_some();
+        #[cfg(feature = "automation")]
+        {
+            self.debug_opened = opened;
+        }
+        cx.notify();
+        ok
+    }
+
+    /// `composer-peek` with `press` or `strip`, as the Swift app's
+    /// debugOpenPicture: a real click (pointer events through hit testing) on
+    /// chip `number` among the words, or on the strip's thumbnail `strip`
+    /// (0-based), and what the viewer was handed: `(paths, index)`.
+    ///
+    /// The thumbnail is hovered first, and its × has to be inside the
+    /// thumbnail's top right corner (it was drawn at the bottom edge over the
+    /// chip under it, where it couldn't be clicked; Mike, 12 Nov). With
+    /// `remove`, the × is clicked instead: the picture has to go and nothing
+    /// open.
+    #[cfg(feature = "automation")]
+    pub(crate) fn debug_click_picture(this: &Entity<Self>, number: Option<usize>, strip: Option<usize>, remove: bool, window: &mut Window, cx: &mut App) -> Result<serde_json::Value, String> {
+        use gpui_kit::test::{TestEventExt as _, TestQueryExt as _, TestWindowExt as _};
+        let click = |at: Point<Pixels>, window: &mut Window, cx: &mut App| {
+            window.pointer_move(at, None, cx);
+            window.render_frame(cx);
+            window.pointer_down(at, MouseButton::Left, cx);
+            window.pointer_up(at, MouseButton::Left, cx);
+            window.render_frame(cx);
+        };
+        this.update(cx, |c, _| c.debug_opened = None);
+        window.render_frame(cx);
+        let at = match strip {
+            Some(index) => {
+                let label = format!("Picture {}", index + 1);
+                let found = |label: &str, window: &Window| window.elements().into_iter().filter(|e| e.visible() && e.label() == Some(label)).last().map(|e| e.bounds());
+                let tile = found(&label, &*window).ok_or_else(|| format!("no thumbnail {} over the box", index + 1))?;
+                window.pointer_move(tile.center(), None, cx);
+                window.render_frame(cx);
+                let x = found(REMOVE_LABEL, &*window).ok_or("no × on the thumbnail while it's hovered")?;
+                let corner = Bounds::from_corners(point(tile.center().x, tile.origin.y), point(tile.right(), tile.center().y));
+                if !(corner.contains(&x.origin) && corner.contains(&point(x.right() - gpui_kit::px(1.), x.bottom() - gpui_kit::px(1.)))) {
+                    return Err(format!("the × is at {x:?}, not in the top right corner of the thumbnail at {tile:?}"));
+                }
+                if remove {
+                    let before = this.read(cx).chips(cx).len();
+                    click(x.center(), window, cx);
+                    let (after, opened) = (this.read(cx).chips(cx).len(), this.read(cx).debug_opened.clone());
+                    if let Some((paths, _)) = opened {
+                        return Err(format!("the × opened the viewer on {paths:?}"));
+                    }
+                    return if after + 1 == before { Ok(json!("ok removed")) } else { Err(format!("{before} pictures before the × and {after} after")) };
+                }
+                // Away from the × in the corner.
+                point(tile.origin.x + tile.size.width / 4., tile.bottom() - tile.size.height / 4.)
+            }
+            None => {
+                let number = number.ok_or("press needs a number")?;
+                let composer = this.read(cx);
+                let range = composer.chips(cx).get(number.saturating_sub(1)).map(|(r, _)| r.clone()).ok_or_else(|| format!("no chip {number}"))?;
+                composer.input.read(cx).range_to_bounds(&range).ok_or("the chip isn't on screen")?.center()
+            }
+        };
+        click(at, window, cx);
+        let (paths, index) = this.read(cx).debug_opened.clone().ok_or("nothing opened")?;
+        Ok(json!(format!("ok quicklook {index} of {}", serde_json::to_string(&paths).unwrap_or_default())))
+    }
+
     // ---- Drawing ----
 
     fn picture_path(&self, id: &SharedString) -> Option<PathBuf> {
@@ -838,7 +1102,7 @@ impl Composer {
     /// A picture's chip among the words: a small rounded tag with the
     /// thumbnail and "Picture N" (PictureChip.draw), its sizes from the font
     /// of the words around it. Dimmed until the picture's in.
-    fn render_chip(&self, ctx: &InlineTokenContext, cx: &App) -> AnyElement {
+    pub(crate) fn render_chip(&self, ctx: &InlineTokenContext, cx: &App) -> AnyElement {
         let id = ctx.token().id();
         if Self::is_mention_token(id) {
             return self.render_mention_chip(ctx, cx);
@@ -866,6 +1130,8 @@ impl Composer {
                     .bg(fill)
                     .border(gpui_kit::px(0.5))
                     .border_color(edge)
+                    // A click opens the picture (`open_picture`).
+                    .when(path.is_some(), |s| s.cursor_pointer())
                     .when_some(path, |s, path| s.child(img(path).size(px(14.)).rounded(px(3.)).object_fit(ObjectFit::Cover).when(dimmed, |s| s.opacity(0.5))))
                     .child(div().text_size(px(13.)).text_color(label_color).child(format!("Picture {number}"))),
             )
@@ -892,23 +1158,36 @@ impl Composer {
                 Some(image) => tile.child(img(PathBuf::from(&image.path)).size(side).rounded(radius).object_fit(ObjectFit::Cover)),
                 None => tile.flex().items_center().justify_center().child(Spinner::new().color(style::quiet_text(cx)).with_size(px(14.))),
             };
-            let remove_id = id.clone();
-            let remove = div()
-                .id(("remove-picture", index))
-                .absolute()
-                .top(px(4.))
-                .right(px(4.))
-                .size(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(hsla(0., 0., 0., 0.72))
+            let (remove_id, open_id) = (id.clone(), id.clone());
+            let remove = remove_badge(("remove-picture", index)).on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                // Not the thumbnail's click under it, which opens the picture.
+                cx.stop_propagation();
+                this.remove_picture(remove_id.clone(), window, cx);
+            }));
+            use gpui_kit::base::TestSupportExt as _;
+            let tile = div()
+                .id(("strip-tile", index))
+                .test_support()
+                // "Picture N", as its chip among the words says, for VoiceOver
+                // and for scripts (`composer-peek` with `strip`).
+                .aria_label(SharedString::from(format!("Picture {}", index + 1)))
+                .group("tile")
+                .relative()
                 .cursor_pointer()
-                .child(Icon::from(IconName::X).with_size(px(9.)).text_color(gpui_kit::white()))
-                .tooltip(|window, cx| Tooltip::new("Remove").build(window, cx))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.remove_picture(remove_id.clone(), window, cx)));
-            row = row.child(div().id(("strip-tile", index)).group("tile").relative().child(tile).child(div().invisible().group_hover("tile", |s| s.visible()).child(remove)));
+                .child(tile)
+                // Over the thumbnail's top right corner, 4 in, while the
+                // pointer's on it (AttachmentThumbnail's overlay). The
+                // layer is placed itself: placed inside a layer that sat
+                // in the flow, the × came out at the thumbnail's bottom
+                // edge over the chip under it, where it couldn't be clicked
+                // (Mike, 12 Nov).
+                .child(div().absolute().top(px(4.)).right(px(4.)).invisible().group_hover("tile", |s| s.visible()).child(remove))
+                .tip(crate::viewer::TILE_TIP)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    let input = this.input.clone();
+                    this.open_picture(&input, &open_id, window, cx);
+                }));
+            row = row.child(tile);
         }
         Some(row.into_any_element())
     }
@@ -929,7 +1208,7 @@ impl Composer {
                 .aria_label("Starting the thread")
                 .bg(style::send_faint_fill(cx))
                 .child(Spinner::new().color(style::quiet_text(cx)).with_size(px(14.)))
-                .tooltip(|window, cx| Tooltip::new("Starting the thread").build(window, cx))
+                .tip("Starting the thread")
                 .into_any_element();
         }
         if running && !can_send && self.stopping {
@@ -939,7 +1218,7 @@ impl Composer {
                 .aria_label("Stopping")
                 .bg(style::send_faint_fill(cx))
                 .child(Spinner::new().color(style::quiet_text(cx)).with_size(px(14.)))
-                .tooltip(|window, cx| Tooltip::new("Stopping").build(window, cx))
+                .tip("Stopping")
                 .into_any_element();
         }
         if running && !can_send {
@@ -950,9 +1229,15 @@ impl Composer {
                 .aria_label("Stop")
                 .cursor_pointer()
                 .bg(bg)
-                .child(Icon::from(IconName::Square).with_size(px(10.)).text_color(fg))
+                // A filled square, as the Swift app's `stop.fill` at 9 pt bold:
+                // Lucide's Square is only an outline (12 Nov, Mike: "This stop
+                // button doesn't look quite right").
+                .child(div().size(px(9.)).rounded(px(2.)).bg(fg))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.stop(cx)))
-                .tooltip(|window, cx| Tooltip::new(if cfg!(target_os = "macos") { "Stop (⌘.)" } else { "Stop (Ctrl+.)" }).build(window, cx))
+                .tip(if cfg!(target_os = "macos") { "Stop (⌘.)" } else { "Stop (Ctrl+.)" })
+                // Its key to the left while ⌘ is held (key_hints.rs).
+                .relative()
+                .children(crate::key_hints::hint(self.app.upgrade().and_then(|a| a.read(cx).shortcut_display(threadbear_core::shortcuts::ShortcutCommand::Stop)), crate::key_hints::Placement::Before))
                 .into_any_element();
         }
         let tip = if running { "Send (into this turn)" } else { "Send (Return)" };
@@ -965,7 +1250,7 @@ impl Composer {
             .bg(bg)
             .child(Icon::from(IconName::ArrowUp).with_size(px(14.)).text_color(fg))
             .when(can_send, |s| s.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.send(window, cx))))
-            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .tip(tip)
             .into_any_element()
     }
 
@@ -975,12 +1260,15 @@ impl Composer {
         let this = cx.entity().downgrade();
         let paste_target = this.clone();
         let hover_target = this.clone();
+        let click_target = this.clone();
         let token_owner = this.clone();
         let thread_drop = this.clone();
+        let file_drop = this.clone();
         let drop_target = this;
         div()
             .w_full()
-            // Greyed and locked while a new thread is being made from it.
+            // Greyed and locked while a new thread is being made from it, or
+            // while its thread moves to another machine.
             .when(creating, |s| s.opacity(0.5))
             .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                 if action.shift && this.shift_return(window, cx) {
@@ -1037,6 +1325,12 @@ impl Composer {
                     this.update(cx, |this, cx| this.take_thread_drop(drag, window, cx));
                 }
             })
+            // A file or picture dragged from inside the app (file_drag.rs).
+            .on_drop(move |file: &crate::file_drag::DraggedFile, window, cx| {
+                if let (Some(this), Some(real)) = (file_drop.upgrade(), file.still_grabbed()) {
+                    this.update(cx, |this, cx| this.take_paths(vec![real], window, cx));
+                }
+            })
             .child(
                 bare_textarea(Textarea::new(&self.input))
                     .disabled(creating)
@@ -1050,6 +1344,18 @@ impl Composer {
                     .on_token_hover(move |event, _window, cx| {
                         if let Some(this) = hover_target.upgrade() {
                             this.update(cx, |this, cx| this.hover_chip(event, cx));
+                        }
+                    })
+                    // A plain click on a picture's chip opens it (the kit
+                    // only calls this for one, a press and a let go on the
+                    // same chip; a drag from it or a Shift-click selects).
+                    // A card's or thread's chip has no picture, so nothing.
+                    .on_token_click(move |event, window, cx| {
+                        if let Some(this) = click_target.upgrade() {
+                            this.update(cx, |this, cx| {
+                                let input = this.input.clone();
+                                this.open_picture(&input, event.token().id(), window, cx);
+                            });
                         }
                     }),
             )
@@ -1074,18 +1380,30 @@ impl Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(restore) = self.restore.take() {
-            self.apply_restore(restore, window, cx);
-        }
+        // The box as it was before an edit that's just gone, first: it
+        // replaces what's there, so anything given back goes after it.
         if let Some((text, images)) = self.pending_box.take() {
             self.set_box(text, images, window, cx);
+        }
+        // While an older message is being edited, what's given back waits
+        // for the edit to end, rather than join it and go with it, or be
+        // lost with it on Cancel (Codex's review, 12 Nov).
+        if self.editing.is_none() {
+            if let Some(restore) = self.restore.take() {
+                self.apply_restore(restore, window, cx);
+            }
         }
         self.renumber_chips(cx);
         // With answers picked the box is for anything else; under asks with
         // none picked it's the way to answer in other words.
-        let placeholder = if self.editing.is_some() { "Your message…" } else { self.card_placeholder(cx) };
+        let moving = self.moving_line(cx);
+        let placeholder: SharedString = match &moving {
+            Some(line) => line.clone().into(),
+            None if self.editing.is_some() => "Your message…".into(),
+            None => self.card_placeholder(cx).into(),
+        };
         if self.shown_placeholder != placeholder {
-            self.shown_placeholder = placeholder;
+            self.shown_placeholder = placeholder.clone();
             self.input.update(cx, |s, cx| s.set_placeholder(placeholder, window, cx));
         }
         let running = self.pane().is_some_and(|p| p.read(cx).summary.busy());
@@ -1094,6 +1412,8 @@ impl Render for Composer {
         }
         let strip = self.render_strip(cx);
         let creating = self.creating(cx);
+        // Typing, answering and sending wait while the thread moves.
+        let locked = creating || moving.is_some();
         let send_button = self.render_send_button(running, creating, cx);
         // Right-click it to send the message later (composer_send.rs).
         let send_button = self.with_send_menu(send_button, cx);
@@ -1103,10 +1423,19 @@ impl Render for Composer {
         let limit = self.render_limit_box(cx);
         // An edit is a message of its own: the open card waits for after it.
         let card = if self.editing.is_some() { None } else { self.render_card(window, cx) };
+        // Dimmed while the thread moves, with nothing on it taking a click.
+        let card = card.map(|card| match &moving {
+            Some(line) => div().relative().child(div().opacity(0.5).child(card)).child(div().id("composer-card-moving").absolute().inset_0().occlude().tip(line.clone())).into_any_element(),
+            None => card,
+        });
         let editing_banner = self.render_editing_banner(cx);
+        // With the card folded, its picks as chips over the words, so they
+        // don't go with no sign of them (composer_answers.rs).
+        let answer_chips = self.render_answer_chips(cx);
         let needs_you = self.open_card(cx).is_some_and(|c| !c.is_done());
         let palette = self.render_palette(window, cx);
         let width = self.card_width.clone();
+        let top = self.box_top.clone();
         // The folder's actions, on shelves on the box's top edge, in from its
         // rounded corner (ActionChips), as wide as the box leaves them.
         let shelves = self.pane().and_then(|pane| {
@@ -1115,7 +1444,13 @@ impl Render for Composer {
             let room = (self.card_width.get() - style::zoomed(style::COMPOSER_RADIUS) * 2.).max(0.);
             crate::viewer::action_chips(&summary, room, &icons, window, cx)
         });
-        let body = v_flex().w_full().gap(px(style::COMPOSER_GAP)).p(px(style::COMPOSER_PADDING)).children(editing_banner).when_some(strip, |s, strip| s.child(strip)).child(self.render_text_field(creating, cx)).child(controls);
+        // Claude refused the last turn: the offer to carry on with Codex,
+        // just above the box (RefusalOffer).
+        let refusal = match (&self.thread_id, self.app.upgrade()) {
+            (Some(id), Some(app)) => crate::app::Threadbear::refusal_offer(&app, id, cx),
+            _ => None,
+        };
+        let body = v_flex().w_full().gap(px(style::COMPOSER_GAP)).p(px(style::COMPOSER_PADDING)).children(editing_banner).children(answer_chips).when_some(strip, |s, strip| s.child(strip)).child(self.render_text_field(locked, cx)).child(controls);
         // The transcript's reading column: 780 wide at most, centred, with
         // the same side insets once the window is narrower.
         h_flex()
@@ -1128,6 +1463,7 @@ impl Render for Composer {
                 v_flex()
                     .w_full()
                     .max_w(px(style::MAX_CONTENT_WIDTH))
+                    .children(refusal)
                     // Overlapping the box's border, so the two read as one piece.
                     .when_some(shelves, |s, shelves| s.child(div().px(px(style::COMPOSER_RADIUS)).mb(gpui_kit::px(-0.5)).child(shelves)))
                     .child(
@@ -1144,13 +1480,25 @@ impl Render for Composer {
                     // moves nothing. First, so the rest draws over it.
                     .child(div().absolute().inset_0().rounded(px(style::COMPOSER_RADIUS)).border(px(if needs_you { 1. } else { 0.5 })).border_color(if needs_you { style::accent(cx) } else { style::hairline(cx) }))
                     // Clicking the card's padding puts the cursor in the text.
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| this.focus(window, cx)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.focus(window, cx);
+                        crate::web_panels::keyboard_to_app(window);
+                    }))
                     .children(limit)
                     .children(card)
                     .child(body)
                     // Measures the box for the palette, which sits on its top
                     // edge, and for the shelves, which get as many chips as fit.
-                    .child(canvas(move |bounds, _, _| width.set(f32::from(bounds.size.width)), |_, _, _, _| {}).absolute().size_full())
+                    .child(canvas(move |bounds, window, _| {
+                        width.set(f32::from(bounds.size.width));
+                        // A box that moved draws again, so an open palette
+                        // fits the room it has now.
+                        let moved = (top.get() - f32::from(bounds.top())).abs() > 0.5;
+                        top.set(f32::from(bounds.top()));
+                        if moved {
+                            window.refresh();
+                        }
+                    }, |_, _, _, _| {}).absolute().size_full())
                     .children(palette),
                     ),
             )
@@ -1167,6 +1515,31 @@ impl Render for Composer {
 pub(crate) fn bare_textarea(textarea: Textarea) -> Textarea {
     textarea.appearance(false).bordered(false).xsmall().mx(gpui_kit::px(-4.))
 }
+
+/// The × over a thumbnail of the box's pictures (AttachmentThumbnail's
+/// remove button): 18 round, black at 0.72 with a faint white edge.
+pub(crate) fn remove_badge(id: impl Into<ElementId>) -> impl StatefulInteractiveElement + ParentElement + IntoElement {
+    use gpui_kit::base::TestSupportExt as _;
+    div()
+        .id(id)
+        .test_support()
+        .aria_label(REMOVE_LABEL)
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(hsla(0., 0., 0., 0.72))
+        .border(gpui_kit::px(0.5))
+        .border_color(hsla(0., 0., 1., 0.2))
+        .cursor_pointer()
+        .child(Icon::from(IconName::X).with_size(px(9.)).text_color(gpui_kit::white()))
+        .tip("Remove")
+}
+
+/// The ×'s name for VoiceOver (the Swift one's accessibilityLabel), and for
+/// `composer-peek` to find it by.
+pub(crate) const REMOVE_LABEL: &str = "Remove image";
 
 /// The token a chip draws from. The token's text is the mark the draft holds
 /// (InlinePictures.mark); its label is only for accessibility and measuring.

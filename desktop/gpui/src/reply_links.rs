@@ -78,9 +78,10 @@ fn save_prefs(update: impl FnOnce(&mut LinkPrefs)) {
         update(prefs);
         serde_json::to_vec_pretty(prefs).ok()
     });
-    // Best effort: it's a preference, not data.
+    // Best effort: it's a preference, not data. Written whole, and only
+    // this user's, as everything in the data folder is.
     if let Some(data) = data {
-        let _ = std::fs::write(prefs_path(), data);
+        let _ = threadbear_core::private_file::write(&prefs_path(), &data);
     }
 }
 
@@ -162,6 +163,13 @@ pub(crate) fn watch() -> impl IntoElement {
     )
     .absolute()
     .inset_0()
+}
+
+/// Whether the left button is down in the window (`LEFT_HELD`): an update's
+/// restart waits for the release (app_update.rs), and a draft box's words
+/// step aside for a selection being made from outside them (draft_boxes.rs).
+pub(crate) fn left_held() -> bool {
+    LEFT_HELD.with(Cell::get)
 }
 
 /// Called first by every link handler: during a probe it notes the link and
@@ -253,7 +261,7 @@ impl ThreadPane {
             return file_refs::file_link(text, root, &known, &home, &|p| p.starts_with('/'), &|_, _| None);
         }
         let known = file_refs::tool_paths(self.feed.model().items(), &local_home);
-        file_refs::file_link(text, root, &known, &local_home, &|p| Path::new(p).exists(), &file_refs::search)
+        file_refs::file_link(text, root, &known, &local_home, &|p| policy::local_metadata(Path::new(p)).is_ok(), &file_refs::search)
     }
 
     /// Whether the pane beside the transcript is this thread's: it is for
@@ -309,7 +317,11 @@ impl ThreadPane {
             }
             return;
         }
-        let mut action = action.resolved(&path, Path::new(&path).is_dir());
+        let meta = match policy::local_metadata(Path::new(&path)) {
+            Ok(meta) => meta,
+            Err(error) => { self.show_error(format!("Couldn't open that file: {error}"), cx); return; }
+        };
+        let mut action = action.resolved(&path, meta.is_dir());
         // A plain click on a kind the pane can't draw yet (a PDF, a film)
         // goes to its app, rather than to a note saying it opens there.
         if clicked && action == FileLinkAction::Panel && !pane_draws(&path) && file_click() == FileLinkAction::Automatic {
@@ -374,7 +386,7 @@ fn opens_in_its_app(path: &str) -> bool {
     if !hl::is_app_project(path) {
         return false;
     }
-    let Ok(real) = std::fs::canonicalize(path) else { return false };
+    let Ok(real) = threadbear_core::open_policy::real_path(Path::new(path)) else { return false };
     let real = real.to_string_lossy().into_owned();
     hl::is_app_project(&real) && open_gate::opening_app(&real).is_some()
 }
@@ -657,7 +669,7 @@ fn rested(serial: u64, pane: &WeakEntity<ThreadPane>, thread: &str, row: &str, w
 /// Whether a link can have a card, cheaply: a web page or a file does
 /// (`peek(atCharacter:)`); Threadbear's own links (a step, a thread, a
 /// review, a chip, a reply button) and other apps' (`mailto:`) don't.
-fn has_card(url: &str) -> bool {
+pub(crate) fn has_card(url: &str) -> bool {
     match url.split_once(':').map(|(s, _)| s.to_ascii_lowercase()) {
         Some(s) if s == "http" || s == "https" || s == "file" || s == "tbpath" => true,
         // `Foo.swift:12`: a file and a line.
@@ -705,7 +717,7 @@ enum Card {
 
 #[derive(Clone)]
 enum FilePicture {
-    Image(PathBuf),
+    Image(ImageSource),
     /// Its first lines, read once the card's due.
     Lines(PathBuf, Option<Vec<String>>),
     Symbol(&'static str),
@@ -728,10 +740,8 @@ impl Card {
 
 /// The start of a file, as its card's lines.
 fn first_lines_of(path: &Path) -> Option<Vec<String>> {
-    use std::io::Read as _;
-    let mut sample = vec![0u8; 4096];
-    let read = std::fs::File::open(path).ok()?.read(&mut sample).ok()?;
-    rules::first_lines(&sample[..read], 10, 70)
+    let sample = policy::local_read(path, 4096).ok()?;
+    rules::first_lines(&sample, 10, 70)
 }
 
 impl ThreadPane {
@@ -747,12 +757,60 @@ impl ThreadPane {
             LinkTarget::File(_) if self.summary.is_remote() => None,
             LinkTarget::File(None) => None,
             LinkTarget::File(Some(file)) => {
-                let exists = Path::new(&file.path).exists();
+                let meta = policy::local_metadata(Path::new(&file.path)).ok();
+                let exists = meta.is_some();
                 let words = rules::file_peek(&file.path, exists, None, &crate::files::home_dir());
                 let picture = match (exists, rules::peek_picture(&file.path)) {
-                    (true, PeekPicture::Image) => FilePicture::Image(PathBuf::from(&file.path)),
+                    (true, PeekPicture::Image) => FilePicture::Image(crate::rows::markdown::file_picture(&file.path)),
                     (true, PeekPicture::Lines) => FilePicture::Lines(PathBuf::from(&file.path), None),
-                    _ => FilePicture::Symbol(if Path::new(&file.path).is_dir() { "folder" } else { hl::file_symbol(&file.path) }),
+                    _ => FilePicture::Symbol(if meta.is_some_and(|m| m.is_dir()) { "folder" } else { hl::file_symbol(&file.path) }),
+                };
+                Some(Card::File { words, picture })
+            }
+        }
+    }
+
+    /// A Needs you card's link button's card (the guide's "in a reply or on
+    /// a Needs you card's buttons"): what `peek_card` shows for a reply's
+    /// link, with the button's words for a page's title. Drawn at once, so
+    /// a text file shows its symbol rather than its first lines, which are
+    /// only read off the main thread. None for a link with no card (a
+    /// review, a thread, another Mac's file).
+    pub(crate) fn ask_link_card(&self, title: &str, url: &str, cx: &App) -> Option<AnyElement> {
+        if !has_card(url) {
+            return None;
+        }
+        Some(match self.peek_card_named(url, title)? {
+            Card::Page { title, detail } => crate::chips::words_card(&title, &detail, cx),
+            Card::File { words, picture } => file_card(&words, &picture, cx),
+        })
+    }
+
+    /// The card's title and detail, for the dump (`peek` on a card's link).
+    #[cfg(feature = "automation")]
+    pub(crate) fn ask_link_words(&self, title: &str, url: &str) -> Option<(String, String)> {
+        has_card(url).then_some(())?;
+        Some(match self.peek_card_named(url, title)? {
+            Card::Page { title, detail } => (title, detail),
+            Card::File { words, .. } => (words.title, words.detail),
+        })
+    }
+
+    fn peek_card_named(&self, url: &str, words: &str) -> Option<Card> {
+        match self.link_target(url)? {
+            LinkTarget::Web(web) => {
+                let words = rules::page_peek(&web, words);
+                Some(Card::Page { title: words.title, detail: words.detail })
+            }
+            LinkTarget::File(_) if self.summary.is_remote() => None,
+            LinkTarget::File(None) => None,
+            LinkTarget::File(Some(file)) => {
+                let meta = policy::local_metadata(Path::new(&file.path)).ok();
+                let exists = meta.is_some();
+                let words = rules::file_peek(&file.path, exists, None, &crate::files::home_dir());
+                let picture = match (exists, rules::peek_picture(&file.path)) {
+                    (true, PeekPicture::Image) => FilePicture::Image(crate::rows::markdown::file_picture(&file.path)),
+                    _ => FilePicture::Symbol(if meta.is_some_and(|m| m.is_dir()) { "folder" } else { hl::file_symbol(&file.path) }),
                 };
                 Some(Card::File { words, picture })
             }
@@ -883,7 +941,7 @@ pub(crate) fn peek_command(app: &Entity<crate::app::Threadbear>, cmd: &serde_jso
     let named = |url: &str| -> Option<String> {
         match pane.read(cx).link_target(url)? {
             LinkTarget::Web(web) => Some(web),
-            LinkTarget::File(Some(file)) if !pane.read(cx).summary.is_remote() && Path::new(&file.path).exists() => Some(file.path),
+            LinkTarget::File(Some(file)) if !pane.read(cx).summary.is_remote() && policy::local_metadata(Path::new(&file.path)).is_ok() => Some(file.path),
             LinkTarget::File(_) => None,
         }
     };

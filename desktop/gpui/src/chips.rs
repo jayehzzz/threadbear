@@ -10,6 +10,7 @@
 use crate::open_gate::{self, Origin};
 use crate::style::{self, size};
 use crate::thread::ThreadPane;
+use crate::tips::Tip as _;
 use gpui_kit::base::text::{InlineElement, InlineRenderContext, MarkdownNode, MarkdownParseContext, MarkdownPlugin};
 use gpui_kit::base::SelectableText;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _};
@@ -41,7 +42,7 @@ const CARD_LABEL_MAX: f32 = 230.;
 /// and a picture's quickly, a page's a little longer, as links are
 /// everywhere (TextKit's hoverChip and hoverPeek).
 const QUICK: Duration = Duration::from_millis(350);
-const SLOWER: Duration = Duration::from_millis(500);
+pub(crate) const SLOWER: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------- hover cards
 
@@ -49,7 +50,7 @@ const SLOWER: Duration = Duration::from_millis(500);
 /// it's been there a moment, and goes when it leaves.
 static HOVERED: Mutex<Option<(SharedString, Instant)>> = Mutex::new(None);
 
-fn hover(key: &SharedString, on: bool, delay: Duration, window: &mut Window, cx: &mut App) {
+pub(crate) fn hover(key: &SharedString, on: bool, delay: Duration, window: &mut Window, cx: &mut App) {
     let mut hovered = HOVERED.lock().unwrap_or_else(|e| e.into_inner());
     if on {
         *hovered = Some((key.clone(), Instant::now()));
@@ -64,7 +65,7 @@ fn hover(key: &SharedString, on: bool, delay: Duration, window: &mut Window, cx:
     }
 }
 
-fn card_shown(key: &str, delay: Duration) -> bool {
+pub(crate) fn card_shown(key: &str, delay: Duration) -> bool {
     HOVERED.lock().ok().and_then(|h| h.as_ref().map(|(k, at)| k.as_ref() == key && at.elapsed() >= delay)).unwrap_or(false)
 }
 
@@ -77,7 +78,7 @@ pub(crate) fn show_card(key: Option<&str>) {
 
 /// A card under a chip `height` tall (ChipCardWindow): its left edge on the
 /// chip's, 4 below it, kept in the window.
-fn under(height: f32, card: AnyElement) -> AnyElement {
+pub(crate) fn under(height: f32, card: AnyElement) -> AnyElement {
     div()
         .absolute()
         .left_0()
@@ -134,7 +135,7 @@ fn picture_card(image: &ImageRef, cx: &App) -> AnyElement {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(img(PathBuf::from(&image.path)).w(px((w * scale).floor())).h(px((h * scale).floor())).rounded(px(3.)).object_fit(ObjectFit::Contain)),
+                .child(img(crate::rows::markdown::file_picture(&image.path)).w(px((w * scale).floor())).h(px((h * scale).floor())).rounded(px(3.)).object_fit(ObjectFit::Contain)),
         )
         .into_any_element()
 }
@@ -382,9 +383,18 @@ impl ThreadPane {
         let origin = self.origin();
         let name = kind.label();
         let chip = match kind {
+            // Another Mac's picture: its path names a file on that Mac, and
+            // read here it's whatever this Mac has at that path, so it opens
+            // no card and no viewer (Codex's review of the drags, 12 Nov). The
+            // picture itself is in the tile over the words, which the runner
+            // sends (remote_pictures.rs); the chip says where it is.
+            ChipKind::Picture(_) if origin != Origin::ThisMac => {
+                let runner = self.summary.runner_id.clone().unwrap_or_default();
+                let mac = self.composer.read(cx).app.upgrade().map_or_else(|| "another Mac".to_owned(), |app| app.read(cx).runner_name_of(&runner));
+                chip.cursor_default().tip(format!("This picture is on {mac}: it shows above"))
+            }
             ChipKind::Picture(index) => {
-                // Only this Mac's pictures: another Mac's path names a file there.
-                let picture = images.get(index).filter(|_| origin == Origin::ThisMac);
+                let picture = images.get(index);
                 let shown = picture.filter(|_| card_shown(&key, QUICK)).map(|p| under_chip(picture_card(p, cx)));
                 let images = images.to_vec();
                 let hover_key = key.clone();
@@ -564,7 +574,12 @@ pub(crate) fn link_thread_ids<'a>(text: &'a str, resolve: &dyn Fn(&str) -> Optio
     let mut out = String::with_capacity(text.len() + ids.len() * 56);
     let mut at = 0;
     for (range, word, id, code) in ids {
-        if range.start < at {
+        // The id goes into the link's destination as it is, so only one of
+        // a thread id's characters: an id another runner made up with a `)`
+        // in it would end the link and write markdown of its own after it
+        // (Daybreak 102). The index only holds such ids, but this is where
+        // it's written.
+        if range.start < at || !threadbear_core::thread_link::is_thread_id(&id) {
             continue;
         }
         out.push_str(&text[at..range.start]);
@@ -776,7 +791,8 @@ impl ThreadPane {
                     if header.moved_to.is_none() && index.resolve(&header.thread_id).is_some() {
                         chips.push((if header.title.is_empty() { header.thread_id.clone() } else { header.title.clone() }, header.thread_id.clone()));
                     }
-                    chips.extend(link_thread_ids(header.body.trim(), &resolve).1);
+                    let body = crate::rows::markdown::pictures(header.body.trim(), self.summary.runner_id.is_none());
+                    chips.extend(link_thread_ids(&body, &resolve).1);
                     chips
                 }
                 None => Vec::new(),
@@ -883,6 +899,17 @@ mod tests {
         assert_eq!(chips.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>(), ["85735a8f", id]);
         // A code span that's just the id is the chip, kept looking like code.
         assert_eq!(linked("in `85735a8f`").0, format!("in [85735a8f](tbchip:{id}?code)"));
+    }
+
+    /// Daybreak 102: an id another runner made up, found by its hex
+    /// prefix, is never written into the link (the index leaves it out
+    /// too: threadbear_core's remote_ids_tests).
+    #[test]
+    fn an_id_that_isnt_a_thread_ids_shape_writes_no_markdown() {
+        let resolve = |word: &str| (word == "deadbeef").then(|| "deadbeef) ![local](/tmp/private.png".to_owned());
+        let (text, chips) = link_thread_ids("see deadbeef here", &resolve);
+        assert_eq!(text, "see deadbeef here");
+        assert!(chips.is_empty());
     }
 
     #[test]

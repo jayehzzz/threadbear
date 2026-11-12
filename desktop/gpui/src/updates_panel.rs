@@ -4,15 +4,15 @@
 // `updates` and then `runner.updates`; the CLIs from hello's `clis` (or
 // `clis.list`) and then `clis.updated`. The words are threadbear_core::updates.
 //
-// The Swift app's own update (AppUpdater, and the icon's right-click popover
-// for it) isn't here: this app doesn't build and swap itself in yet
-// (`system.selfupdate`), so its App section says how a new build goes in.
+// The app's own update (app_update.rs) is its App section, and a right-click
+// on the icon puts it in a popover beside it with Restart to Update, the quick
+// way to take one (Swift's AppUpdatePopover).
 use crate::activity_panels::{button_row, panel_column, push_button, small_heading, system_orange, text_button, text_line, MenuLabel};
 use crate::app::Threadbear;
 use crate::{call, icons, now_ms, shell, style};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _};
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 // The zoom-aware px (style.rs), in place of GPUI's.
@@ -23,9 +23,8 @@ use std::time::Duration;
 use threadbear_core::inbox::ThreadSummary;
 use threadbear_core::new_thread::{Draft, NewThreadPicks};
 use threadbear_core::updates::{self as rules, AppSide, CliStatus, RunnerUpdates};
+use crate::tips::Tip as _;
 
-/// What the App section says, as this app doesn't update itself.
-const APP_LINE: &str = "This app doesn't update itself yet. A new build goes in with desktop/scripts/install-app.sh.";
 
 /// How long Copy says it copied.
 const COPIED_FOR: Duration = Duration::from_millis(1500);
@@ -51,6 +50,10 @@ pub(crate) struct UpdatesPanelState {
     /// an older one's timer leaves a newer one's word alone).
     copied: Option<u64>,
     copies: u64,
+    /// The icon's right-click popover is up, and its keyboard (Return
+    /// restarts, Esc puts it away).
+    pub(crate) popover: bool,
+    popover_focus: Option<FocusHandle>,
 }
 
 impl Threadbear {
@@ -104,9 +107,9 @@ impl Threadbear {
         self.updates_panel.runner = RunnerUpdates::decode(&params["updates"]);
     }
 
-    /// The app's side, which this app doesn't have yet.
+    /// The app's own update (app_update.rs).
     fn app_side(&self) -> AppSide {
-        AppSide::default()
+        self.app_update_side()
     }
 
     /// Something on its way for the runner or a CLI: the icon's grey dot.
@@ -285,7 +288,8 @@ impl Threadbear {
     pub(crate) fn render_updates_panel(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let fg = style::label_text(cx);
         let line = |text: String| text_line(text, 12., fg).into_any_element();
-        let mut sections = vec![section("App", vec![line(APP_LINE.to_owned())], cx)];
+        let app = self.render_app_update(cx);
+        let mut sections = vec![section("App", app, cx)];
         sections.push(section("Runner", self.render_runner_updates(cx), cx));
         let upstream = self.updates_panel.runner.as_ref().and_then(|r| r.upstream.clone());
         if let Some(text) = rules::upstream_line(upstream.as_ref()) {
@@ -299,6 +303,112 @@ impl Threadbear {
         // until 28 Oct; they're updates, not room.
         sections.push(section("CLIs", vec![self.render_clis(cx)], cx));
         panel_column("updates-panel", 14., sections)
+    }
+
+    /// The Updates icon with its right-click popover (`onRightClick` and
+    /// `AppUpdatePopover`): the app's update in a line, with Restart to Update
+    /// once a new version is ready, or the log once a build failed. It
+    /// follows the update as it goes, so one opened mid-build gets its
+    /// button once the build is staged.
+    pub(crate) fn with_update_popover(&mut self, icon: AnyElement, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let popover = self.updates_panel.popover.then(|| self.render_update_popover(window, cx));
+        div()
+            .id("rail-updates-wrap")
+            .relative()
+            .flex_none()
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.toggle_update_popover(window, cx);
+            }))
+            .child(icon)
+            .children(popover)
+            .into_any_element()
+    }
+
+    pub(crate) fn toggle_update_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = &mut self.updates_panel;
+        panel.popover = !panel.popover;
+        if panel.popover {
+            let focus = panel.popover_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            window.focus(&focus, cx);
+            crate::web_panels::keyboard_to_app(window);
+        }
+        cx.notify();
+    }
+
+    fn render_update_popover(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let side = self.app_side();
+        let staged = self.updater.staged.as_ref().map(|s| s.short.clone()).filter(|_| side.staged.is_some());
+        let secondary = style::secondary_text(cx);
+        let line = h_flex()
+            .gap(px(7.))
+            .items_center()
+            .when(side.building && side.staged.is_none(), |s| s.child(div().size(px(11.)).child(gpui_kit::component::spinner::Spinner::new().icon(gpui_kit::assets::IconName::LoaderCircle).color(secondary).with_size(px(11.)))))
+            .child(div().whitespace_nowrap().text_size(px(12.)).text_color(style::label_text(cx)).child(rules::popover_line(&side)));
+        let button = match &staged {
+            // Return takes it, as the popover is there for this.
+            Some(short) => Some(push_button("updates-popover-restart", "Restart to Update", format!("Quit and reopen on {short}. Running threads carry on in the runner."), false, false, cx, |t, _, cx| {
+                t.updates_panel.popover = false;
+                t.restart_to_update(cx);
+            })),
+            // Not while a newer main builds: the line is about that.
+            None if side.failed && !side.building => Some(push_button("updates-popover-log", "Show the Log", "Open the update build's log, to see why it failed", false, false, cx, |t, _, cx| {
+                t.updates_panel.popover = false;
+                cx.notify();
+                crate::open_gate::open_own(&crate::app_update::log_path(), cx);
+            })),
+            None => None,
+        };
+        let focus = self.updates_panel.popover_focus.clone();
+        let (bg, border) = (cx.theme().popover, cx.theme().border);
+        let body = v_flex()
+            .id("updates-popover")
+            .occlude()
+            .p(px(14.))
+            .gap(px(10.))
+            .rounded(px(10.))
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .shadow_lg()
+            .when_some(focus, |s, f| s.track_focus(&f))
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| match ev.keystroke.key.as_str() {
+                "enter" if this.updater.staged.is_some() => {
+                    this.updates_panel.popover = false;
+                    this.restart_to_update(cx);
+                }
+                "escape" => {
+                    this.updates_panel.popover = false;
+                    cx.notify();
+                }
+                _ => {}
+            }))
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.updates_panel.popover = false;
+                cx.notify();
+            }))
+            .child(line)
+            .children(button.map(|b| h_flex().child(b)));
+        // Beside the icon, its foot level with the icon's, kept in the window.
+        div()
+            .absolute()
+            .left(px(crate::rails::BUTTON + 8.))
+            .bottom_0()
+            .child(deferred(anchored().anchor(Anchor::BottomLeft).snap_to_window_with_margin(px(8.)).child(body)).with_priority(2))
+            .into_any_element()
+    }
+
+    /// The app's own update, as the Swift panel's App section: what's on its
+    /// way, with Restart to Update once it's ready, or the log once it failed.
+    fn render_app_update(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let side = self.app_side();
+        let mut out = vec![text_line(rules::app_line(&side), 12., style::label_text(cx)).into_any_element()];
+        if side.staged.is_some() {
+            out.push(h_flex().child(push_button("updates-restart", "Restart to Update", "Quit and reopen on the new version. Running threads carry on in the runner.", false, false, cx, |t, _, cx| t.restart_to_update(cx))).into_any_element());
+        } else if side.failed {
+            out.push(h_flex().child(push_button("updates-log", "Show the Log", "Open the update build's log, to see why it failed", false, false, cx, |_, _, cx| crate::open_gate::open_own(&crate::app_update::log_path(), cx))).into_any_element());
+        }
+        out
     }
 
     /// The runner's lines: not following main, its build, the threads still
@@ -443,7 +553,7 @@ impl Threadbear {
         let current = cli.policy.clone();
         let app = cx.entity().downgrade();
         let words = format!("Updates: {}", rules::policy_title(&cli.policy));
-        let holder = div().id(SharedString::from(format!("updates-policy-{}", cli.provider))).flex_none().test_support().aria_label(tip).tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx));
+        let holder = div().id(SharedString::from(format!("updates-policy-{}", cli.provider))).flex_none().test_support().aria_label(tip).tip(tip);
         if busy {
             // Taking no other choice until the runner has this one.
             return holder.opacity(0.5).child(MenuLabel::new(SharedString::from(format!("updates-policy-{provider}-label")), words, 11., style::label_text(cx))).into_any_element();
@@ -473,7 +583,7 @@ impl Threadbear {
 
     /// What the panel says, a line each, in the Swift app's dump shape.
     pub(crate) fn updates_dump(&self, cx: &App) -> Value {
-        let mut lines = vec!["# App".to_owned(), APP_LINE.to_owned(), "# Runner".to_owned()];
+        let mut lines = vec!["# App".to_owned(), rules::app_line(&self.app_side()), "# Runner".to_owned()];
         match &self.updates_panel.runner {
             Some(runner) => {
                 let (build, old, launcher) = (rules::build_line(runner), rules::old_runners_line(runner), rules::launcher_line(runner));
@@ -532,12 +642,41 @@ fn section(title: &'static str, content: Vec<AnyElement>, cx: &App) -> AnyElemen
 
 /// The automation's `updates` (the Swift app's): `show` opens or closes the
 /// panel; with nothing, whether the icon has its dot, its tooltip, and what
-/// the panel says about the app and the runner. The Swift app's `preview`,
-/// `rightClick` and `popover` are about its own update, which this app
-/// doesn't do yet.
-pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, cx: &mut App) -> Result<Value, String> {
-    if cmd.get("preview").is_some() || cmd.get("rightClick").is_some() || cmd.get("popover").is_some() {
-        return Err("this app doesn't update itself yet, so it has no update of its own to show".into());
+/// the panel says about the app and the runner. `preview` makes up the app's
+/// own update first (`staged`, `building`, `failed`, `waiting` or `none`), as
+/// the Swift app's; this app has no right-click popover (`rightClick`).
+pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, window: &mut Window, cx: &mut App) -> Result<Value, String> {
+    // What a restart onto an update leaves for the next launch, put back as
+    // that launch does (app_update.rs, `restore_after_update`): a scripted
+    // app never restarts itself.
+    if let Some(saved) = cmd.get("restore").filter(|v| v.is_object()) {
+        app.update(cx, |t, cx| {
+            t.settings.saved.update_restore = Some(saved.clone());
+            t.restore_after_update(cx);
+        });
+        return Ok(json!("ok"));
+    }
+    if let Some(state) = cmd["preview"].as_str() {
+        if !["staged", "building", "failed", "waiting", "none"].contains(&state) {
+            return Err("preview is staged, building, failed, waiting or none".into());
+        }
+        app.update(cx, |t, cx| t.preview_update(state, cx));
+    }
+    // {"rightClick": true}: the icon's right-click, which opens or closes
+    // the popover; {"popover": false} closes it.
+    if cmd["rightClick"].as_bool() == Some(true) {
+        let shown = app.update(cx, |t, cx| {
+            t.toggle_update_popover(window, cx);
+            t.updates_panel.popover
+        });
+        return Ok(json!(format!("ok popover {}", if shown { "shown" } else { "closed" })));
+    }
+    if let Some(popover) = cmd["popover"].as_bool() {
+        app.update(cx, |t, cx| {
+            t.updates_panel.popover = popover;
+            cx.notify();
+        });
+        return Ok(json!(format!("ok popover {}", if popover { "shown" } else { "closed" })));
     }
     if let Some(show) = cmd["show"].as_bool() {
         let shown = app.update(cx, |t, cx| {
@@ -555,7 +694,8 @@ pub(crate) fn automation(app: &Entity<Threadbear>, cmd: &Value, cx: &mut App) ->
     let t = app.read(cx);
     let side = t.app_side();
     let runner = t.updates_panel.runner.as_ref();
-    let mut lines = vec![format!("shown: {}", rules::shown(&side, runner)), format!("tip: {}", t.updates_tooltip().replace('\n', " / ")), APP_LINE.to_owned()];
+    let popover = format!("popover: {}, {}", if t.updates_panel.popover { "shown" } else { "closed" }, rules::popover_line(&side));
+    let mut lines = vec![format!("shown: {}", rules::shown(&side, runner)), format!("tip: {}", t.updates_tooltip().replace('\n', " / ")), popover, rules::app_line(&side)];
     lines.extend(rules::runner_lines(runner));
     Ok(json!(format!("ok {}", serde_json::to_string(&lines).unwrap_or_default())))
 }

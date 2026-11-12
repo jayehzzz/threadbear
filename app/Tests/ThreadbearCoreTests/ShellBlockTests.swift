@@ -104,6 +104,9 @@ final class ShellBlockTests: XCTestCase {
         XCTAssertFalse(TerminalPut.pasteRuns("echo one"))
         XCTAssertTrue(TerminalPut.pasteRuns("touch /tmp/x\n"))
         XCTAssertTrue(TerminalPut.pasteRuns("a\rb"))
+        XCTAssertTrue(TerminalPut.pasteRuns("echo $(touch /tmp/x)\t"), "a Tab is the Tab key without brackets")
+        XCTAssertTrue(TerminalPut.pasteQuestion("ls\t").detail.contains("Tab"))
+        XCTAssertTrue(TerminalPut.pasteQuestion("ls\n").detail.contains("Return"))
         XCTAssertEqual(TerminalPut.pasteQuestion("a\nb\n").title, "Paste 2 lines?")
         XCTAssertEqual(TerminalPut.pasteQuestion("ls\n").title, "Paste this line?")
     }
@@ -114,6 +117,21 @@ final class ShellBlockTests: XCTestCase {
         XCTAssertEqual(TerminalPut.pasteBytes("echo\u{1b}[201~\nrm -rf ~", bracketed: true), Array("\u{1b}[200~echo[201~\rrm -rf ~\u{1b}[201~".utf8))
         // With no brackets a control character would be a key pressed.
         XCTAssertEqual(TerminalPut.pasteBytes("ls\u{3}\u{1}\u{1b}:q!\u{15}\u{7f}\u{9b}\tx", bracketed: false), Array("ls:q!\tx".utf8))
+    }
+
+    /// Daybreak's finding 84: inside the brackets a ^\ (or ^C, ^Z) is still
+    /// a signal to the pty, which flushes the opening bracket, so the line
+    /// break after it ran the command. Every control but Tab and Return
+    /// goes, C0, DEL and C1 alike (the GPUI app's tests/paste_pty.rs plays it
+    /// against a real bash).
+    func testABracketedPasteHasNoControlCharactersInIt() {
+        XCTAssertEqual(TerminalPut.pasteBytes("\u{1c}printf \"TB_%s_RAN\\n\" PASTE\n", bracketed: true),
+                       Array("\u{1b}[200~printf \"TB_%s_RAN\\n\" PASTE\r\u{1b}[201~".utf8))
+        let every = String(String.UnicodeScalarView((0..<0x20).compactMap(Unicode.Scalar.init) + (0x7f..<0xa0).compactMap(Unicode.Scalar.init)))
+        XCTAssertEqual(TerminalPut.pasteBytes("a\(every)b", bracketed: true), Array("\u{1b}[200~a\t\r\rb\u{1b}[201~".utf8))
+        XCTAssertEqual(TerminalPut.pasteBytes("a\(every)b", bracketed: false), Array("a\t\r\rb".utf8))
+        XCTAssertEqual(TerminalPut.pasteBytes("caf\u{e9} \u{65e5}\u{672c} \u{1f43b}", bracketed: true),
+                       Array("\u{1b}[200~caf\u{e9} \u{65e5}\u{672c} \u{1f43b}\u{1b}[201~".utf8))
     }
 
     func testASnippetWithALineBreakIsAPasteNotKeys() {

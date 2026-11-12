@@ -88,6 +88,15 @@ extension Automation {
         return viewer([:])
     }
 
+    /// `tiles`: what each picture of the last row of at least `count` says,
+    /// "picture" for one that's drawn, else its words, as the GPUI app's.
+    static func tiles(_ c: [String: Any], app: AppModel) -> String {
+        let least = max((c["count"] as? Int) ?? 1, 1)
+        let grids = all(ImageGridView.self, in: app.transcript.tableView).filter { $0.debugPaths.count >= least }
+        guard let grid = grids.last else { return "error no row of \(least) pictures on screen" }
+        return "ok " + grid.debugTileWords.joined(separator: " | ")
+    }
+
     /// `viewer`: says what a tile's click would be showing.
     static func viewer(_ c: [String: Any]) -> String {
         if c["close"] as? Bool == true { viewerShown = nil }
@@ -330,6 +339,30 @@ extension Automation {
         guard let prefix, let session = app.transcript.session else { return nil }
         if let index = session.displayIndex(of: prefix) { return session.displayRow(index) }
         return (0..<session.displayCount).lazy.map { session.displayRow($0) }.first { $0.id.hasPrefix(prefix) }
+    }
+
+    /// `edit-message` with `click`: the row hovered, so its pencil shows as
+    /// it does under the pointer, then a press and release on the pencil
+    /// through the window, hit-tested as a real click is. Nil once clicked,
+    /// or why it couldn't be.
+    static func clickPencil(_ row: TranscriptRow, app: AppModel) async -> String? {
+        guard let index = app.transcript.session?.displayIndex(of: row.id) else { return "error no such row" }
+        app.transcript.scroll(toRow: index, offset: 120)
+        guard let cell = app.transcript.tableView.view(atColumn: 0, row: index, makeIfNecessary: false) as? TextRowCell, let window = cell.window else { return "error row isn't drawn" }
+        guard cell.debugHover(true), !cell.edit.isHidden else { return "error no pencil by \(row.id)" }
+        defer { _ = cell.debugHover(false) }
+        let at = cell.edit.convert(NSPoint(x: cell.edit.bounds.midX, y: cell.edit.bounds.midY), to: nil)
+        func event(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(with: type, location: at, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+        }
+        guard let down = event(.leftMouseDown), let up = event(.leftMouseUp) else { return "error no event" }
+        // A button tracks the press until it pulls the release off the
+        // queue, so the release goes on the queue first.
+        NSApp.postEvent(up, atStart: false)
+        window.sendEvent(down)
+        try? await Task.sleep(for: .milliseconds(100))
+        return nil
     }
 
     static func scroll(toRow prefix: String?, offset: Double, app: AppModel) -> String {
@@ -768,7 +801,10 @@ extension Automation {
             guard let menu = note.object as? NSMenu else { return }
             let isSub = menu === submenu
             if !isSub {
-                titles = menu.items.map { $0.isSeparatorItem ? "---" : $0.title + ($0.submenu != nil ? " >" : "") }
+                // `ticks`: a ticked line reads "[x] " first, as the GPUI app's
+                // menus say it (the Inbox's sort, @sidebar.sort).
+                let ticks = c["ticks"] as? Bool == true
+                titles = menu.items.map { $0.isSeparatorItem ? "---" : (ticks && $0.state == .on ? "[x] " : "") + $0.title + ($0.submenu != nil ? " >" : "") }
                 if let sub { submenu = menu.items.first { $0.title == sub }?.submenu }
                 if let pick, let index = menu.items.firstIndex(where: { $0.title == pick }) { picked = (menu, index) }
             }

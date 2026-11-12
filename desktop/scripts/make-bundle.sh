@@ -60,13 +60,16 @@ cat > "$bundle/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-# The same picture as the Swift app's icon (app/build-app.sh).
+# The Swift app's bear, green, half machine, with GPUI across its front, so
+# the two apps can be told apart in the Dock and the app switcher while both
+# are installed (Mike picked it, 12 Nov). Drawn from app/icons/threadbear.png.
+icon="$root/desktop/gpui/icons/threadbear-gpui.png"
 iconset="$(mktemp -d "${TMPDIR:-/tmp}/threadbear-icon-XXXX")/threadbear.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$root/app/icons/threadbear.png" --out "$iconset/icon_${size}x${size}.png" >/dev/null
+  sips -z "$size" "$size" "$icon" --out "$iconset/icon_${size}x${size}.png" >/dev/null
   double=$((size * 2))
-  sips -z "$double" "$double" "$root/app/icons/threadbear.png" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$double" "$double" "$icon" --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/threadbear.icns"
 rm -rf "$(dirname "$iconset")"
@@ -89,6 +92,11 @@ with open(path, "w") as f:
         "builtAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }, f, indent=2)
 PY
+
+# The update script, so the app runs the copy it was built with
+# (desktop/gpui/src/app_update.rs).
+cp "$root/desktop/scripts/stage-update.sh" "$bundle/Contents/Resources/stage-update.sh"
+chmod +x "$bundle/Contents/Resources/stage-update.sh"
 
 # Signed with the first Apple Development identity, as the Swift app is, so
 # the app keeps the same identity from one build to the next and macOS's

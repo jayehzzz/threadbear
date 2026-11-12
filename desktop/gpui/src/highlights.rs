@@ -10,7 +10,6 @@ use crate::app::Threadbear;
 use crate::{call, icons, now_ms, style};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _, StyledExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -25,6 +24,7 @@ use threadbear_client::runner::Client;
 use threadbear_core::highlights::{self as core, fold, Highlight, HighlightKind, HighlightSections, Panel, ProjectInfo, ProjectRow, Schedule, ThreadHighlights};
 use threadbear_core::inbox::ThreadSummary;
 use threadbear_core::sidebar as side;
+use crate::tips::Tip as _;
 
 pub(crate) const HIGHLIGHTS: &str = "threadbear.highlights";
 pub(crate) const PATCHES: &str = "threadbear.patches";
@@ -200,6 +200,9 @@ pub(crate) enum MenuAction {
     // what a click on a web link does.
     OpenInProfile { url: String, directory: String },
     SetWebClick { action: threadbear_core::reply_links::WebLinkAction },
+    // A row of Threads it started (`startedRow`'s menu).
+    OpenThread { id: String },
+    OpenThreadInPanel { id: String },
 }
 
 /// The app's window of files read so far and folders looked at lives in
@@ -714,6 +717,18 @@ impl SidePane {
                 paths.iter().for_each(|path| crate::files::reveal(path, origin, cx));
             }
             MenuAction::FolderCrumb { key, path, selecting } => self.run_folder_crumb_action(&key, path, selecting, thread, cx),
+            // A row of Threads it started: the thread, in the main panel or a
+            // panel of its own (thread_panels.rs).
+            MenuAction::OpenThread { id } => {
+                if let Some(app) = self.app.upgrade() {
+                    app.update(cx, |app, cx| app.open(id, window, cx));
+                }
+            }
+            MenuAction::OpenThreadInPanel { id } => {
+                if let Some(app) = self.app.upgrade() {
+                    app.update(cx, |app, cx| app.open_thread_in_panel(id, cx));
+                }
+            }
         }
         self.menu = None;
         cx.notify();
@@ -876,7 +891,7 @@ pub(crate) fn icon(name: &str, size: f32, color: Hsla) -> Icon {
 pub(crate) fn tipped(el: Stateful<Div>, tip: impl Into<SharedString>) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
     let text: SharedString = tip.into();
     let shown = text.clone();
-    el.test_support().aria_label(text).tooltip(move |window, cx| Tooltip::new(shown.clone()).build(window, cx))
+    el.test_support().aria_label(text).tip(shown)
 }
 
 /// One row in the pane's lists (`PaneRow`): a grey icon, the title with a word
@@ -898,6 +913,8 @@ pub(crate) struct PaneRow {
     pub tip: Option<String>,
     pub on_click: Option<Rc<dyn Fn(&mut SidePane, &mut Window, &mut Context<SidePane>)>>,
     pub on_menu: Option<Rc<dyn Fn(&mut SidePane, Point<Pixels>, &mut Window, &mut Context<SidePane>)>>,
+    /// A file on this Mac it drags out as (file_drag.rs).
+    pub drag: Option<String>,
 }
 
 impl PaneRow {
@@ -919,6 +936,7 @@ impl PaneRow {
             tip: None,
             on_click: None,
             on_menu: None,
+            drag: None,
         }
     }
 
@@ -997,6 +1015,13 @@ impl PaneRow {
         self
     }
 
+    /// Dragged out, it's this file on this Mac (file_drag.rs). None for
+    /// another Mac's, whose paths are that Mac's.
+    pub(crate) fn drag(mut self, path: Option<String>) -> Self {
+        self.drag = path;
+        self
+    }
+
     pub(crate) fn render(self, p: Palette, cx: &mut Context<SidePane>) -> impl IntoElement + use<> {
         let hover = p.hover;
         let label_color = if self.quiet { p.secondary } else { p.fg };
@@ -1034,7 +1059,7 @@ impl PaneRow {
         let row = row.when(self.on_click.is_some(), |s| s.hover(move |st| st.bg(hover)).cursor_pointer());
         let mut wrapper = div().id(self.id).px(px(OUTER_INSET)).child(row);
         if let Some(tip) = self.tip {
-            wrapper = wrapper.tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx));
+            wrapper = wrapper.tip(tip.clone());
         }
         let mut wrapper = wrapper.test_support().aria_label(SharedString::from(self.title));
         if let Some(click) = self.on_click {
@@ -1043,7 +1068,7 @@ impl PaneRow {
         if let Some(menu) = self.on_menu {
             wrapper = wrapper.on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, window, cx| (menu)(this, ev.position, window, cx)));
         }
-        wrapper
+        crate::file_drag::FileDragExt::file_drag(wrapper, self.drag)
     }
 
 }
@@ -1067,7 +1092,7 @@ impl SidePane {
         let (fg, secondary, faint, hairline) = (p.fg, p.secondary, p.faint, p.hairline);
         let hover_group = group.clone();
         let chevron_group = group.clone();
-        let title_el = div().flex_none().text_size(px(style::size::LABEL)).line_height(px(style::natural_line(style::size::LABEL))).font_semibold().text_color(secondary).group_hover(hover_group, move |s| s.text_color(fg)).child(h.title.clone());
+        let title_el = style::group_hover_text(div().id(SharedString::from(format!("hl-heading-title-{}", h.key))).flex_none().text_size(px(style::size::LABEL)).line_height(px(style::natural_line(style::size::LABEL))).font_semibold().text_color(secondary), hover_group, fg).child(h.title.clone());
         let mut label = h_flex().group(group.clone()).flex_1().min_w_0().gap(px(6.)).pl(px(LEADING)).pt(px(18.)).pb(px(6.)).items_center();
         if let Some(leading) = h.icon {
             label = label.child(leading);
@@ -1153,6 +1178,8 @@ impl SidePane {
         }
         let (menu_item, menu_thread) = (item.clone(), thread.clone());
         pr = pr.on_menu(move |this, pos, window, cx| this.open_highlight_menu(&menu_item, &menu_thread, pos, window, cx));
+        // A file of this Mac's drags out as itself (`fileDrag`).
+        pr = pr.drag(item.path.clone().filter(|_| !thread.is_remote()));
         pr.render(p, cx).into_any_element()
     }
 
@@ -1285,7 +1312,7 @@ impl SidePane {
                         _ => None,
                     };
                     let (id, title) = (row.thread.id.clone(), row.thread.title.clone());
-                    let open_id = id.clone();
+                    let (open_id, menu_id) = (id.clone(), id.clone());
                     let pr = PaneRow::new(SharedString::from(format!("hl-started-{id}")), title)
                         .icon(core::started_icon(row.state))
                         .tinted(color)
@@ -1296,6 +1323,14 @@ impl SidePane {
                             if let Some(app) = this.app.upgrade() {
                                 app.update(cx, |t, cx| t.open(id, window, cx));
                             }
+                        })
+                        // Open, or Open in New Panel (`startedRow`'s menu).
+                        .on_menu(move |this, pos, window, cx| {
+                            let items = vec![
+                                MenuItem::action("Open", "arrow.up.forward", MenuAction::OpenThread { id: menu_id.clone() }),
+                                MenuItem::action("Open in New Panel", "rectangle.split.2x1", MenuAction::OpenThreadInPanel { id: menu_id.clone() }),
+                            ];
+                            this.open_menu(items, pos, window, cx);
                         });
                     list = list.child(pr.render(p, cx));
                 }
@@ -1436,6 +1471,7 @@ impl SidePane {
                         .detail(Some(core::text::folder(path, Some(&thread.cwd), &crate::files::home_dir())))
                         .indent()
                         .tip("Open in its app")
+                        .drag(Some(path.clone()).filter(|_| !thread.is_remote()))
                         .on_click(move |this, _window, cx| {
                             // Code to read in an editor, not to review. Another Mac's
                             // copy is fetched and opened by files.rs.

@@ -6,6 +6,7 @@ mod cards;
 mod diff;
 mod export;
 mod images;
+mod lab_review;
 pub(crate) mod list;
 pub(crate) mod markdown;
 pub(crate) use markdown::reading_style;
@@ -18,7 +19,6 @@ use crate::thread::ThreadPane;
 use gpui_kit::base::{SelectableText, TextView};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Sizable as _, StyledExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -69,6 +69,9 @@ pub(crate) struct RowsState {
     /// Where to come back to once older pages have brought its row in: the
     /// pane is new each time a thread opens, with only the newest page.
     pub(crate) pending_restore: Option<ScrollMemory>,
+    /// Each gap row's words as last drawn, by row id, for `dump` (work.rs).
+    #[cfg(feature = "automation")]
+    pub(crate) gap_labels: std::rc::Rc<std::cell::RefCell<HashMap<String, Bounds<Pixels>>>>,
 }
 
 /// Where a thread was reading, kept across opening other threads (the pane is
@@ -100,7 +103,7 @@ impl ThreadPane {
             RowContent::Assistant(item) => self.assistant_row(ix, &row, item, cx),
             RowContent::Reasoning(item) => self.thinking_row(ix, &row, item, cx),
             RowContent::Tool(tool) => self.tool_row(ix, &row, tool, cx),
-            RowContent::Images { images, generated, .. } => self.images_row(&row, images, *generated),
+            RowContent::Images { images, generated, .. } => self.images_row(&row, images, *generated, cx),
             RowContent::Approval(item) if item.resolution.is_some() => self.settled_approval_row(ix, &row, item, cx),
             RowContent::Approval(item) if !item.queued().is_empty() => self.stacked_approval_card(ix, &row, item, window, cx),
             RowContent::Approval(item) => self.approval_card(ix, &row, item, window, cx),
@@ -121,8 +124,9 @@ impl ThreadPane {
             RowContent::Group(group) => self.group_row(ix, &row, group, cx),
             RowContent::Working(status) => self.working_row(status.started_at, window, cx),
             RowContent::Background(status) => self.background_row(status, cx),
-            RowContent::Gap(gap) => self.gap_row(gap, cx),
+            RowContent::Gap(gap) => self.gap_row(&row, gap, cx),
             RowContent::Changes(changes) => self.changes_card(ix, &row, changes, cx),
+            RowContent::LabReview(review) => self.lab_review_row(&row, review, cx),
         };
         // A step a work link went to: an accent rail and tint for a moment
         // (`TranscriptController.light`). The right-click menu goes over
@@ -171,7 +175,7 @@ impl ThreadPane {
         let faded = pending.is_some();
         let mut col = v_flex().items_end().pt(px(USER_TOP)).pb(px(USER_BOTTOM));
         if !message.images.is_empty() {
-            col = col.child(self.user_images(&message.images));
+            col = col.child(self.user_images(&message.images, cx));
         }
         let show_text = !message.text.is_empty() || message.images.is_empty();
         if show_text {
@@ -184,7 +188,8 @@ impl ThreadPane {
                 _ => {}
             }
             let text = if message.text.is_empty() { " ".to_string() } else { message.text.clone() };
-            let answered = !message.answers.is_empty() || message.review.is_some();
+            let answered_words = answered_words(message);
+            let answered = answered_words.is_some();
             // As wide as its widest line, as the Swift bubble is (its text's
             // used width): GPUI's wrapped text takes all the width it's
             // given. The text keeps room for a wrapped line's trailing space,
@@ -214,7 +219,7 @@ impl ThreadPane {
                 // fits exactly would wrap.
                 .when_some(fit, |d, (ink, span)| d.child(div().w(span + px(1.)).mr(ink - span - px(1.)).child(SelectableText::new(("user-text", ix), text))))
                 .when_some(chips.map(|c| c.1), |d, lines| d.child(lines))
-                .when(answered, |d| d.child(answers_body(ix, message, cx)));
+                .when_some(answered_words, |d, words| d.child(answers_body(ix, &words, cx)));
             // The pencil, left of the bubble and level with its last line, on
             // hover, as Codex and ChatGPT put theirs (`Cells.updateEdit`).
             let editable = message.editable && pending.is_none() && threadbear_core::composer::can_rewind(&self.summary.provider) && self.subagent_id.is_none();
@@ -285,12 +290,15 @@ impl ThreadPane {
         // Its first line names the sending thread as a chip (chips.rs), and
         // thread ids in its words are chips too.
         let title = self.agent_header_line(&format!("agent-{ix}"), header, cx);
-        let body = self.with_thread_chips(header.body.trim().to_owned(), cx);
+        // Its pictures as a reply's: another Mac's thread draws none from
+        // this Mac, and only picture files are drawn (`markdown::pictures`).
+        let body = markdown::pictures(header.body.trim(), self.summary.runner_id.is_none()).into_owned();
+        let body = self.with_thread_chips(body, cx);
         let doc = (!body.is_empty()).then(|| self.markdown_state(&format!("agent-{ix}"), &body, cx));
         let text_style = self.reading_style(cx);
         // Its links' own menus and cards, as a reply's (reply_links.rs).
         let text = doc.map(|doc| {
-            let text = self.linked_text(&doc, &format!("agent-{ix}"), cx).selectable(true).style(text_style).code_block_highlighter(plain_code_blocks);
+            let text = self.linked_text(&doc, &format!("agent-{ix}"), cx).selectable(true).style(text_style).shared_code_block_highlighter(plain_code_blocks());
             crate::reply_links::link_aware(text, ix, row, &self.summary.id, cx)
         });
         let card = v_flex()
@@ -314,6 +322,7 @@ impl ThreadPane {
         let drafts = crate::draft_boxes::DraftBoxes { origin: self.origin(), cwd: self.summary.cwd.clone(), row: row_id.to_owned() };
         let chips = crate::chips::ThreadChipPills { row: row_id.to_owned() };
         let row_id = row_id.to_owned();
+        let local = self.summary.runner_id.is_none();
         crate::open_gate::text_view(doc, self.origin(), &self.summary.cwd)
             .on_link_click(move |url: &SharedString, event: &ClickEvent, window: &mut Window, cx: &mut App| {
                 // Asked which link is under the pointer (reply_links.rs), or
@@ -329,8 +338,9 @@ impl ThreadPane {
             })
             // `[title](button:<id>)` as a pill that presses it.
             .plugin(crate::reply_buttons::Pills)
-            // Pictures from files on this Mac (`markdown::pictures`).
-            .image_source(markdown::picture_source)
+            // Pictures from files on this Mac, in this Mac's threads only
+            // (`markdown::picture_source`).
+            .image_source(move |uri| markdown::picture_source(uri, local))
             // A closed ```slack, ```email or ```draft fence as the draft's box.
             .plugin(drafts)
             // A thread's id as its chip (`with_thread_chips`).
@@ -348,7 +358,7 @@ impl ThreadPane {
         let source = self.with_thread_chips(source, cx);
         let doc = self.markdown_state(&item.item_id, &source, cx);
         let text_style = self.reading_style(cx);
-        let text = self.linked_text(&doc, &row.id, cx).selectable(true).style(text_style).code_block_highlighter(plain_code_blocks);
+        let text = self.linked_text(&doc, &row.id, cx).selectable(true).style(text_style).shared_code_block_highlighter(plain_code_blocks());
         // A ```bash block's play and copy icons (shell_blocks.rs).
         let text = crate::shell_blocks::with_icons(text, &source, &self.summary.id);
         // TextKit leaves out the space over a text's first paragraph, so a
@@ -453,10 +463,13 @@ impl ThreadPane {
             return column(card(border).child(col)).into_any_element();
         }
         let mut card = card(if asks.is_open { warning } else { border });
+        // The reading column's style, so a link in a why is drawn as in a
+        // reply (no underline, the link blue), in the card's muted text.
+        let why_style = self.reading_style(cx).with_foreground(muted);
         for (ai, ask) in asks.asks.iter().enumerate() {
             let mut block = v_flex().gap_1().child(div().font_semibold().child(ask.action.clone()));
             if let Some(why) = &ask.why {
-                block = block.child(div().text_sm().text_color(muted).child(crate::open_gate::markdown_view(("why", ix * 10 + ai), why.clone(), self.origin(), &self.summary.cwd)));
+                block = block.child(div().text_sm().text_color(muted).child(crate::open_gate::reading_markdown_view(("why", ix * 10 + ai), why.clone(), self.origin(), &self.summary.cwd).style(why_style.clone())));
             }
             if asks.is_open && !ask.options.is_empty() {
                 let mut buttons = h_flex().gap_2().flex_wrap().pt_1();
@@ -530,15 +543,28 @@ pub(crate) fn row_wrap(row: &Row, inner: impl IntoElement) -> AnyElement {
         .into_any_element()
 }
 
+/// What a message that answered asks or a review draws (`userWords`): each
+/// question with its answer, then what he wrote under them. None for any
+/// other message, and for text that doesn't start with its answers, which is
+/// shown as it is. His words used to be dropped (thread 3fdaaeec, 12 Nov).
+pub(crate) struct AnsweredWords {
+    pub lines: Vec<(String, String)>,
+    pub extra: String,
+}
+
+pub(crate) fn answered_words(message: &UserMessage) -> Option<AnsweredWords> {
+    if let Some(review) = &message.review {
+        return Some(AnsweredWords { lines: review.lines.iter().map(|l| (l.label.clone(), l.text.clone())).collect(), extra: String::new() });
+    }
+    let extra = threadbear_core::composer::answers_extra(&message.text, &message.answers)?;
+    Some(AnsweredWords { lines: message.answers.iter().map(|a| (a.action.clone(), a.answer.clone())).collect(), extra })
+}
+
 /// The body of a message that answered asks or a review (`userWords`): each
 /// question small and quiet, its answer as his own words, then the rest.
-fn answers_body(ix: usize, message: &UserMessage, cx: &App) -> Div {
+fn answers_body(ix: usize, words: &AnsweredWords, cx: &App) -> Div {
     let question = style::secondary_label(cx);
-    let lines: Vec<(String, String)> = if let Some(review) = &message.review {
-        review.lines.iter().map(|l| (l.label.clone(), l.text.clone())).collect()
-    } else {
-        message.answers.iter().map(|a| (a.action.clone(), a.answer.clone())).collect()
-    };
+    let AnsweredWords { lines, extra } = words;
     let mut body = v_flex().gap(px(8.));
     for (i, (label, text)) in lines.iter().enumerate() {
         body = body.child(
@@ -546,6 +572,9 @@ fn answers_body(ix: usize, message: &UserMessage, cx: &App) -> Div {
                 .when(!label.is_empty(), |d| d.child(div().text_size(px(size::SMALL)).line_height(px(18.)).text_color(question).child(label.clone())))
                 .child(SelectableText::new(("answer-text", ix * 1000 + i), text.clone())),
         );
+    }
+    if !extra.is_empty() {
+        body = body.child(SelectableText::new(("answer-extra", ix), extra.to_owned()));
     }
     body
 }
@@ -614,11 +643,21 @@ fn card(border: Hsla) -> Div {
     v_flex().gap_3().p_3p5().rounded_xl().border_1().border_color(border)
 }
 
-/// A tooltip builder for `.tooltip(...)`, Every control gets one.
+/// What a code block's highlighter is.
+type CodeHighlighter = std::sync::Arc<dyn Fn(&gpui_kit::base::text::CodeBlock) -> Vec<(std::ops::Range<usize>, gpui_kit::HighlightStyle)> + Send + Sync>;
+
 /// The transcript's code blocks stay plain, as the Swift app's do; the kit's
 /// highlighter is for the file preview (files.rs).
-pub(crate) fn plain_code_blocks(_: &gpui_kit::base::text::CodeBlock) -> Vec<(std::ops::Range<usize>, gpui_kit::HighlightStyle)> {
-    Vec::new()
+///
+/// The same one every frame, never a new closure: the kit compares
+/// highlighters by pointer, and a new one tells it the text is reflowing, so
+/// it keeps the selection it had through it and doesn't take a new one. With
+/// a new closure every render, a Shift-click's selection (or any made while
+/// the pane redrew) was neither drawn nor copied (12 Nov; the bar over words
+/// with nothing highlighted in Mike's recording).
+pub(crate) fn plain_code_blocks() -> CodeHighlighter {
+    static PLAIN: std::sync::LazyLock<CodeHighlighter> = std::sync::LazyLock::new(|| std::sync::Arc::new(|_| Vec::new()));
+    PLAIN.clone()
 }
 
 impl crate::thread::ThreadPane {
@@ -640,8 +679,69 @@ impl crate::thread::ThreadPane {
     }
 }
 
-pub(crate) fn tip(text: &str) -> impl Fn(&mut Window, &mut App) -> AnyView + use<> {
-    let text: SharedString = text.to_owned().into();
-    move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+#[cfg(test)]
+mod highlighter_tests {
+    /// The kit takes a different highlighter for a reflow, which keeps the old
+    /// selection over a new one: a Shift-click in a reply showed and copied
+    /// nothing whenever the pane redrew (proven with the kit's own logs and
+    /// the real pointer, features/tools/real-select.ts, 12 Nov).
+    #[test]
+    fn the_transcript_hands_over_the_same_highlighter_every_time() {
+        assert!(std::sync::Arc::ptr_eq(&super::plain_code_blocks(), &super::plain_code_blocks()));
+    }
 }
 
+/// A selection from one of Mike's messages (plain selectable text) on into
+/// a reply (the kit's text view) copies the words of both. (The Swift app
+/// can't select across rows: each is a text view of its own.)
+#[cfg(all(test, feature = "automation"))]
+mod across_tests {
+    use gpui_kit::base::{SelectableText, TextSelection, TextViewState};
+    use gpui_kit::prelude::*;
+    use gpui_kit::test::{TestEventExt as _, TestWindowExt as _};
+    // By name: a glob of the kit would bring its `test` over the one the
+    // test macro's own expansion uses.
+    use gpui_kit::{div, point, px, size, Bounds, Entity, MouseButton, Point, TestAppContext, Window, WindowBounds, WindowOptions};
+
+    struct Thread {
+        reply: Entity<TextViewState>,
+    }
+
+    impl Render for Thread {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().w(px(320.)).child(SelectableText::new(("user-text", 0usize), "Where do things stand")))
+                .child(div().w(px(320.)).child(crate::open_gate::text_view(&self.reply, crate::open_gate::Origin::ThisMac, "").selectable(true).shared_code_block_highlighter(super::plain_code_blocks())))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_drag_from_a_message_into_a_reply_copies_both(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let window = cx.update(|cx| {
+            let bounds = Bounds { origin: Point::default(), size: size(px(400.), px(300.)) };
+            let options = WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() };
+            gpui_kit::open_window(options, cx, |_, cx| cx.new(|cx| Thread { reply: cx.new(|cx| TextViewState::markdown("Here is the answer", cx)) })).expect("a test window").0
+        });
+        let selected = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                let line = |words: &str, window: &Window| {
+                    gpui_kit::base::test_support::texts(window).into_iter().find(|t| t.visible() && t.text().starts_with(words)).unwrap_or_else(|| panic!("no {words:?} drawn")).bounds()
+                };
+                // The message's plain text isn't in the kit's list of texts:
+                // it's the window's first line, above the reply.
+                let reply = line("Here", window);
+                let (from, to) = (point(px(1.), reply.top() / 2.), point(reply.right() - px(1.), reply.center().y));
+                window.pointer_move(from, None, cx);
+                window.pointer_down(from, MouseButton::Left, cx);
+                window.pointer_move(to, Some(MouseButton::Left), cx);
+                window.pointer_up(to, MouseButton::Left, cx);
+                window.render_frame(cx);
+                TextSelection::selected_text(window, cx)
+            })
+            .expect("the test window");
+        assert_eq!(selected.trim(), "Where do things stand\nHere is the answer");
+    }
+}

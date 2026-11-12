@@ -8,8 +8,9 @@ new ones, and threads still get both, for skills written before.
 
 Threadbear is Mike's own agent app: a TypeScript runner daemon (`runner/`)
 that drives the official Claude Code (and later Codex) CLIs, and a native
-SwiftUI + AppKit Mac app (`app/`) that talks to it over the protocol in
-`docs/protocol.md`. Read `docs/plan.md` and `docs/protocol.md` before changing
+desktop app that talks to it over the protocol in `docs/protocol.md`: the GPUI
+one in `desktop/`, which replaces the frozen SwiftUI one in `app/` (see "The
+GPUI port"). Read `docs/plan.md` and `docs/protocol.md` before changing
 anything. The Convex mirror, the iPhone app (`ios/`) and the website (`web/`)
 are in `docs/convex-backend.md` and `docs/website.md`. The public landing
 page (threadbear.mikecann.app) is `site/`, a separate
@@ -67,7 +68,7 @@ and ask the user what they use instead, rather than trying to reach them.
   validators, so a field Convex would refuse fails there too.
   Nightly, `scripts/parity/nightly.sh` plays the same scenarios into a
   throwaway backend on Tinker Desk and has the real website, iPhone app
-  and Mac app read them, with a picture of each side by side in
+  and GPUI Mac app read them, with a picture of each side by side in
   `~/Library/Caches/Threadbear/parity/<time>/index.html` (its first run
   found the website and the iPhone drawing cards without their notes).
   A scenario's `shows` are the words each surface must show.
@@ -237,13 +238,22 @@ look at the screen). Wake its screen with `caffeinate -u`, or the events go nowh
 ## The GPUI port
 
 The desktop app is being rewritten as one GPUI app for Mac, Windows and Linux
-(`docs/gpui-port.md`, `desktop/`). Until it replaces `app/`, a change to what the
-Mac app does should get a spec in `features/` (Gherkin, driven against both apps;
+(`docs/gpui-port.md`, `desktop/`). Mike uses it every day since 12 Nov, so the
+Swift app (`app/`, `dock/`) is frozen: changes go in `desktop/`, never in both.
+`scripts/swift-freeze.sh` refuses a Claude edit or a commit there in Mike's copy,
+and `check.sh` no longer builds or tests the Swift app unless it changed (or with
+`--app`). What the GPUI and iPhone apps still use from `app/` stays open (the mock
+runner, test tools, fixtures, art, the files ThreadbearKit links); the script's
+comment lists it, and says how to let a change through when Mike asks for one. In other
+people's copies it will only warn, from the release that gives them the GPUI app.
+A change to what the app does should get a spec in `features/` (Gherkin;
 `features/README.md`), so the two apps' differences stay visible in
 `docs/gpui-port/PARITY.md`. A change to how the transcript folds has to keep both
 languages' golden tests happy (`desktop/core/tests/golden`). Rust builds and spec
 runs go elsewhere: `desktop/scripts/remote.sh cloud -- <command>`, or
-`tinker-desk --desk` for a window on a real Mac.
+`tinker-desk --desk` for a window on a real Mac. The installed GPUI app
+follows main as the Mac app does (`desktop/gpui/src/app_update.rs`, built on a
+check host), so `wait_for_app_restart` hears it restart onto a landed change.
 
 ## Other people's PRs
 
@@ -337,10 +347,24 @@ if `tb` isn't found (an older runner, or outside a thread), use
   reused with its Swift build caches so the app builds warm. Your system prompt says where. Commit there. When
   the work is done and checked, `tb land` rebases it on main, runs
   `./check.sh --quick` and fast-forwards main in the main checkout
-  (`--dry-run` first if you like; it never pushes). Mike's Land chip does
+  (`--dry-run` first if you like; it never pushes). Landings waiting
+  for the lock are checked together in the next check, and a failed
+  group is halved until the one that broke it is found
+  (docs/thread-worktrees.md, "Landing together"), so run it in the
+  background and expect up to two checks' wait. Mike's Land chip does
   the same. If it refuses, it says why and what to fix: commit your
   changes, sort out the conflicting files, fix the check, or wait for
-  whoever has uncommitted changes in main's checkout. You can carry on
+  whoever has uncommitted changes in main's checkout. It also holds a
+  landing that changes what the Desktop app workflow checks (desktop/,
+  features/ and its other paths) while that workflow's last run on main
+  failed on GitHub, naming the run and what failed: the quick check can't
+  see what only GitHub's Macs, Linux and Windows do (red for two days of
+  GPUI landings, 10 to 12 Nov). Fix that red first; `tb land
+  --despite-red` is for the landing that's the fix
+  (docs/thread-worktrees.md, "Red on GitHub"). To bring GitHub's main
+  into this Mac's, or push it, run `scripts/sync-main.sh`: it holds
+  the landing lock throughout and checks a rebased combination before
+  main moves (docs/thread-worktrees.md, "Syncing main with GitHub"). You can carry on
   after landing; the next `tb land` lands only what's new. Changing a
   `package.json`? Replace the link first: `rm runner/node_modules` (no
   trailing slash, so only the link goes), then `npm ci` there. When the

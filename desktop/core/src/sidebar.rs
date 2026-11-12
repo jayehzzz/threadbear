@@ -330,6 +330,20 @@ pub fn carries_on_when<Tz: TimeZone>(until_ms: i64, now: &DateTime<Tz>) -> Strin
     }
 }
 
+/// A done card's loose end as its line reads (`looseEndsText`): a booked
+/// check-in has when it comes back before it ("Fri 13 Nov, 9:30 am: Look
+/// at the nightly run"), in the time zone of `now`; anything else is its
+/// words.
+pub fn loose_end_line<Tz: TimeZone>(end: &crate::reducer::LooseEnd, now: &DateTime<Tz>) -> String {
+    match end.at.as_deref().filter(|_| end.kind == "booked").and_then(parse_ms) {
+        Some(ms) => {
+            let date = local(ms, &now.timezone());
+            format!("{} {} {}, {}: {}", weekday_name(&date), date.day(), MONTHS[date.month0() as usize], clock(&date), end.text)
+        }
+        None => end.text.clone(),
+    }
+}
+
 /// "5:00 am", and the day when it isn't today ("tomorrow", "Thu")
 /// (`Pools.waitingParts`).
 fn waiting_parts<Tz: TimeZone>(until_ms: i64, now: &DateTime<Tz>) -> (Option<&'static str>, String) {
@@ -660,6 +674,10 @@ pub struct Subagent {
     pub parent_id: Option<String>,
     pub description: String,
     pub agent_type: Option<String>,
+    /// The model it runs on, from its own replies: "claude-opus-5-5".
+    pub model: Option<String>,
+    /// Its effort level, once the runner has read its transcript.
+    pub effort: Option<String>,
     pub status: String,
     pub background: bool,
     pub activity: Option<String>,
@@ -785,6 +803,36 @@ pub fn subagent_detail(s: &Subagent) -> String {
 /// How long it ran, or has run so far: "53s", "4m" (`SubagentRows.duration`).
 pub fn subagent_duration(s: &Subagent, now_ms: i64) -> String {
     working_label(s.started_ms(), s.ended_ms().unwrap_or(now_ms))
+}
+
+/// What it runs on, as the composer's model chip says it: "Opus 5.5 · High",
+/// or "Opus 5.5" before its transcript has been read. None until its first
+/// reply. For the header and the row's tooltip (Mike asked 12 Nov).
+pub fn subagent_model_text(s: &Subagent) -> Option<String> {
+    let model = s.model.as_deref().filter(|m| !m.is_empty())?;
+    Some(crate::logins::chip_title(Some(model), s.effort.as_deref(), &[]))
+}
+
+/// The open sub-agent's header line, under its title: "Explore · Opus 5.5 ·
+/// High · Running in the background · 4 tool calls · from Fix the build".
+pub fn subagent_header_meta(s: Option<&Subagent>, thread_title: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(s) = s {
+        if let Some(kind) = s.agent_type.as_deref().filter(|k| !k.is_empty()) {
+            parts.push(kind.to_owned());
+        }
+        if let Some(model) = subagent_model_text(s) {
+            parts.push(model);
+        }
+        parts.push(subagent_status_text(s).to_owned());
+        if let Some(n) = s.tool_uses.filter(|n| *n > 0) {
+            parts.push(if n == 1 { "1 tool call".to_owned() } else { format!("{n} tool calls") });
+        }
+    }
+    if let Some(title) = thread_title {
+        parts.push(format!("from {}", if title.is_empty() { "Untitled" } else { title }));
+    }
+    parts.join(" · ")
 }
 
 /// The status in words, for tooltips (`SubagentRows.statusText`).
@@ -948,6 +996,15 @@ mod tests {
     }
 
     #[test]
+    fn a_booked_check_in_says_when_it_comes_back() {
+        let now = at("2026-11-12T20:00:00+11:00");
+        let end = |kind: &str, at: Option<&str>| crate::reducer::LooseEnd { kind: kind.into(), text: "Look at the nightly run".into(), thread_id: None, at: at.map(String::from) };
+        assert_eq!(loose_end_line(&end("booked", Some("2026-11-12T22:30:00Z")), &now), "Fri 13 Nov, 9:30 am: Look at the nightly run");
+        assert_eq!(loose_end_line(&end("booked", None), &now), "Look at the nightly run", "no time, just its words");
+        assert_eq!(loose_end_line(&end("thread", Some("2026-11-13T01:30:00Z")), &now), "Look at the nightly run", "only a check-in has one");
+    }
+
+    #[test]
     fn waiting_for_room_says_when() {
         let now = at("2026-11-09T20:00:00+11:00");
         let ms = |s: &str| at(s).timestamp_millis();
@@ -1045,6 +1102,23 @@ mod tests {
         assert_eq!(subagent_detail(&all[1]), "Reading files");
         assert_eq!(subagent_detail(&all[3]), "Failed: No such file");
         assert_eq!(subagent_duration(&all[1], now), "2m");
+    }
+
+    #[test]
+    fn subagent_model_reads_like_the_composer_chip() {
+        let mut s: Subagent = serde_json::from_value(json!({ "id": "a", "model": "claude-opus-5-5", "effort": "xhigh", "status": "running", "startedAt": "2026-11-09T08:58:00Z" })).unwrap();
+        assert_eq!(subagent_model_text(&s).as_deref(), Some("Opus 5.5 · Extra high"));
+        s.effort = None;
+        assert_eq!(subagent_model_text(&s).as_deref(), Some("Opus 5.5"));
+        s.model = None;
+        assert_eq!(subagent_model_text(&s), None, "nothing until its first reply");
+    }
+
+    #[test]
+    fn subagent_header_line() {
+        let s: Subagent = serde_json::from_value(json!({ "id": "a", "agentType": "general-purpose", "model": "claude-opus-5-5", "effort": "high", "status": "running", "background": true, "toolUses": 30, "startedAt": "2026-11-09T08:58:00Z" })).unwrap();
+        assert_eq!(subagent_header_meta(Some(&s), Some("Finishing the video")), "general-purpose · Opus 5.5 · High · Running in the background · 30 tool calls · from Finishing the video");
+        assert_eq!(subagent_header_meta(None, Some("")), "from Untitled");
     }
 
     #[test]

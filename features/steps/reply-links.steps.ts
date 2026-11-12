@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { After, Given, Then, When } from '@cucumber/cucumber';
+import { Given, Then, When } from '@cucumber/cucumber';
+import { tempFolder } from '../support/temp.ts';
 import type { ThreadbearWorld } from '../support/world.ts';
 import { okValue, type Dump, type Row } from '../support/driver.ts';
 import { previewLine } from '../support/pane.ts';
@@ -14,16 +14,9 @@ import { previewLine } from '../support/pane.ts';
 
 type LinkWorld = ThreadbearWorld & { file?: string };
 
-// A scenario's files, each in a folder of its own, gone after it.
-const made: string[] = [];
-After(() => {
-  for (const dir of made.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
-});
-
 Given('a file {string} saying {string} in a folder of its own', function (this: LinkWorld, name: string, text: string) {
-  // Its real path, so what an app resolves (symlinks followed) reads the same.
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tb-links-')));
-  made.push(dir);
+  // A folder of its own, gone after the scenario (support/temp.ts).
+  const dir = tempFolder('tb-links-');
   this.file = path.join(dir, name);
   fs.writeFileSync(this.file, text.replaceAll('\\n', '\n'));
 });
@@ -68,9 +61,18 @@ async function peek(world: ThreadbearWorld, words: string, command: Record<strin
   return world.app.do({ cmd: 'peek', row: row.id, words, ...command });
 }
 
-Then('the menu of the link {string} offers {string}', async function (this: ThreadbearWorld, words: string, list: string) {
-  const items = JSON.parse(okValue(await peek(this, words, { menu: true }))) as string[];
+async function menuOffers(world: ThreadbearWorld, words: string, list: string) {
+  const items = JSON.parse(okValue(await peek(world, words, { menu: true }))) as string[];
   for (const item of list.split(' | ')) assert.ok(items.includes(item), `no "${item}" in: ${items.join(' | ')}`);
+}
+
+Then('the menu of the link {string} offers {string}', async function (this: ThreadbearWorld, words: string, list: string) {
+  await menuOffers(this, words, list);
+});
+
+// The Finder is the Mac's; Windows and Linux call theirs a folder.
+Then('the menu of the link {string} offers {string} on a Mac, {string} elsewhere', async function (this: ThreadbearWorld, words: string, mac: string, elsewhere: string) {
+  await menuOffers(this, words, process.platform === 'darwin' ? mac : elsewhere);
 });
 
 When('I choose {string} from the menu of the link {string}', async function (this: ThreadbearWorld, item: string, words: string) {
@@ -102,13 +104,13 @@ Then("the clipboard holds that file's path", async function (this: LinkWorld) {
 });
 
 Then('the pane is showing that file', async function (this: LinkWorld) {
-  const want = `file ${file(this)}`;
+  const want = `file ${file(this).replaceAll('\\', '/')}`;
   await this.until(`the pane showing ${want}`, (d) => previewLine(d) === want);
 });
 
 Then("the pane isn't showing that file", async function (this: LinkWorld) {
   const d = await this.app.dump();
-  assert.notEqual(previewLine(d), `file ${file(this)}`, 'the pane is showing it');
+  assert.notEqual(previewLine(d), `file ${file(this).replaceAll('\\', '/')}`, 'the pane is showing it');
 });
 
 /** What the app would have handed the system to open, since last asked. */

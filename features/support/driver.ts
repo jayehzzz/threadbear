@@ -24,6 +24,8 @@ export type Row = {
   /** The chips a row draws among its words: "picture: Picture 1", "card:
    * Fix the button", "thread: Morning brief". */
   chips?: string[];
+  /** A gap row's words as drawn, from the row's own top, while it's on screen. */
+  label?: { top: number; height: number };
 };
 
 export type Thread = {
@@ -46,6 +48,8 @@ export type Thread = {
   subagents?: { id: string; depth: number; status: string; title: string; detail: string; selected: boolean }[];
   /** "On bruce" for another runner's thread ("On bruce, offline"). */
   runner?: string | null;
+  /** The row is laid out within the part of the list that's showing (GPUI only; null when it isn't drawn). */
+  inView?: boolean | null;
 };
 
 export type Dump = {
@@ -60,6 +64,8 @@ export type Dump = {
     sort?: string;
     /** Before the runner's first list: the grey loading rows are showing. */
     loading?: boolean;
+    /** The Threads panel has the keyboard, for its arrows and Esc (GPUI only). */
+    keyboard?: boolean;
   };
   /** The line under the bar when the thread can't go on where it is (LimitBanner). */
   limit?: { text: string; button?: string | null; carryOn?: string | null } | null;
@@ -84,6 +90,8 @@ export type Dump = {
     state?: string;
     atBottom?: boolean;
     hasMoreAbove?: boolean;
+    /** The spinner in the middle while it's read (the GPUI app's; the Swift dump has only `state`). */
+    spinner?: boolean;
     rows: Row[];
   };
   banner?: { style: string; text: string; detail?: string } | null;
@@ -95,10 +103,28 @@ export type Dump = {
   dock?: string;
   /** The Threads panel is on screen: in the layout and not folded away with ⌘/. */
   threadsShowing?: boolean;
+  /** Threads open in panels of their own: whether each one's tab is showing, and its transcript. */
+  threadPanels?: { id: string; title: string; showing: boolean; transcript?: Dump['transcript'] | null }[];
+  /** The thread the main panel says is open in its own panel. */
+  openElsewhere?: string | null;
+  /** The keys shown beside the buttons while ⌘ is held ("Threads ⌘1"). */
+  keyHints?: string[];
+  /** The card a page swipe shows while it's under way: its lines ("Back to", the thread, its place). */
+  pageSwipe?: { lines: string[]; armed: boolean; progress: number } | null;
   /** The window's zoom, in percent. */
   zoom?: number;
   /** The thread the Archived note names, while it's up. */
   archivedNote?: string | null;
+  /** The last archive or hibernate flight: where the page started (the
+   * transcript, in window points from the top left) and aimed, and once it
+   * landed, where the heading's box was. */
+  flight?: Flight | null;
+  /** Whether motion is reduced, so flights and glides don't play (GPUI only). */
+  reduceMotion?: boolean;
+  /** The last time the panels moved with their glide: where each panel was
+   * drawn and where it is (or, in the GPUI app, is going), by panel
+   * ("thread", "terminal"), and whether it's still moving (GPUI only). */
+  panelMotion?: { from: Record<string, Rect>; to: Record<string, Rect>; moving?: boolean } | null;
   /** "end" or "empty" while the end-of-inbox note is up. */
   inboxEndNote?: string | null;
   /** The panel bar's title line and its buttons' tips. */
@@ -122,9 +148,14 @@ export type Dump = {
     cols?: number | null;
     rows?: number | null;
     screen?: string[] | null;
+    /** The GPUI app's: the screen as lines, rows the text wrapped over joined. */
+    lines?: string[] | null;
     shells: string[];
   } | null;
 };
+
+export type Rect = { x: number; y: number; width: number; height: number };
+export type Flight = { to: 'archive' | 'hibernate'; thread?: string | null; start: Rect; end?: { x: number; y: number } | null; onHeading: boolean; landed: boolean; landedBox?: Rect | null };
 
 /** `dot` is the accent dot (something only you can do), `quietDot` the grey one. */
 export type RailButton = { title: string; badge?: number | null; dot?: boolean; quietDot?: boolean; active: boolean };
@@ -142,6 +173,9 @@ export interface Driver {
   shot(file: string): Promise<void>;
   /** Quits the app and opens it again, keeping its data and its settings. */
   relaunch(): Promise<void>;
+  /** The app's own log so far (the connection, failed requests, notices),
+   * as `dev-app.sh log` shows the Swift app's. */
+  appLog(): Promise<string>;
   stop(): Promise<void>;
 }
 

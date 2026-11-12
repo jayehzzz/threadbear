@@ -263,7 +263,7 @@ function pickInPool(pool, provider, current) {
   const want = provider ?? own[0]?.provider;
   const candidates = own.filter((a) => a.provider === want);
   const cur = candidates.find((a) => a.id === current);
-  if (cur && roomOf(cur) >= 10) return cur.id;
+  if (cur && roomOf(cur) >= 1) return cur.id; // the runner's MIN_ROOM_PERCENT
   return [...candidates].sort((a, b) => roomOf(b) - roomOf(a))[0]?.id;
 }
 // The provider whose account lists a model id, if any does.
@@ -564,7 +564,7 @@ async function dispatch(client, method, p) {
       }
       return {
         runnerVersion, protocol: 1, accounts: publicAccounts(),
-        defaults: oldRunner ? { ...defaults, poolId: undefined } : defaults, ...(oldRunner ? {} : { providers: [PROVIDER_INFO.claude, PROVIDER_INFO.codex, ...(process.env.TB_MOCK_ANTIGRAVITY ? [PROVIDER_INFO.antigravity] : [])], clis, updates, pools, experiments: ['moveToRunner', ...(process.env.TB_MOCK_DECISIONS ? ['projectDecisions'] : [])] }),
+        defaults: oldRunner ? { ...defaults, poolId: undefined } : defaults, ...(oldRunner ? {} : { providers: [PROVIDER_INFO.claude, PROVIDER_INFO.codex, ...(process.env.TB_MOCK_ANTIGRAVITY ? [PROVIDER_INFO.antigravity] : [])], clis, updates, pools, experiments: process.env.TB_MOCK_DECISIONS ? ['projectDecisions'] : [] }),
       };
     // Moving a thread to another runner (docs/protocol.md): a guess from
     // "that runner", and a move that only marks the row, for the app's
@@ -603,6 +603,10 @@ async function dispatch(client, method, p) {
     case 'files.read':
       // Slow enough on bruce that the app's loading state shows.
       if (client.as) await sleep(400);
+      // Another runner's file asked of this one, as the GPUI app asks for
+      // bruce's pictures: refused as the real runner refuses it
+      // (runner/src/rpc.ts), never this Mac's file at the same path.
+      if (!client.as && typeof p.runnerId === 'string') throw rpcError(-32000, 'Files on another runner are kept there for now.');
       return readFile(client, p);
     case 'files.list':
       if (client.as) await sleep(400);
@@ -857,6 +861,11 @@ async function dispatch(client, method, p) {
       return { thread: s };
     }
     case 'threads.events': {
+      // THREADBEAR_MOCK_EVENTS_DELAY_MS: a runner slow to read a thread (one
+      // busy handing over, a loaded Mac), for the spinner while a thread's
+      // read and switching back to one kept loaded (switching-threads.feature).
+      const eventsDelay = Number(process.env.THREADBEAR_MOCK_EVENTS_DELAY_MS ?? 0);
+      if (eventsDelay > 0) await new Promise((r) => setTimeout(r, eventsDelay));
       const t = need(p.threadId);
       const failing = failingEvents.get(t.summary.id) ?? 0;
       if (failing > 0) {
@@ -1306,12 +1315,12 @@ async function dispatch(client, method, p) {
       return { highlight: list.highlights[0] };
     }
     case 'mock.showPanel': {
-      // As the agent's show_panel tool would: {threadId, panel, where?}
+      // As the agent's show_panel tool would: {threadId, panel, where?, reload?}
       // (docs/protocol.md, "Showing panels"). The panel isn't checked.
       const t = need(p.threadId);
       const named = { highlights: 'Highlights', patches: 'Patches', usage: 'Usage', updates: 'Updates' };
       const title = named[p.panel] ?? t.summary.panels?.find((x) => x.id === p.panel)?.title ?? String(p.panel);
-      t.summary.panelRequest = { id: 'pr_' + crypto.randomBytes(4).toString('hex'), panel: String(p.panel), title, ...(p.where ? { where: p.where } : {}), at: iso() };
+      t.summary.panelRequest = { id: 'pr_' + crypto.randomBytes(4).toString('hex'), panel: String(p.panel), title, ...(p.where ? { where: p.where } : {}), ...(p.reload ? { reload: true } : {}), at: iso() };
       broadcastSummary(t.summary.id);
       return { request: t.summary.panelRequest };
     }
@@ -1569,6 +1578,20 @@ async function dispatch(client, method, p) {
       broadcastSummary(entry.summary.id);
       return { ok: true };
     }
+    // The runner's loose-ends check on a thread's done card, by title
+    // (protocol "Loose ends"): `ends` as the summary's `looseEnds.ends`,
+    // for its last turn.completed (or `seq`); no `ends` takes it away.
+    // `quiet` leaves it unsent, as a check that finished while the app was
+    // away is: the app hears of it only from threads.list on reconnecting.
+    case 'mock.looseEnds': {
+      const entry = [...threads.values()].find((t) => t.summary.title === p.title);
+      if (!entry) throw rpcError(-32602, `No thread called "${p.title}"`);
+      const seq = p.seq ?? entry.events.findLast((e) => e.type === 'turn.completed')?.seq;
+      if (Array.isArray(p.ends) && seq != null) entry.summary.looseEnds = { seq, ends: p.ends, at: iso() };
+      else delete entry.summary.looseEnds;
+      if (!p.quiet) broadcastSummary(entry.summary.id);
+      return { thread: entry.summary };
+    }
     case 'mock.moveLeftBehind':
       moveLeftBehind = p.lines ?? [];
       return { lines: moveLeftBehind };
@@ -1715,9 +1738,22 @@ async function dispatch(client, method, p) {
       failingEvents.set(t.summary.id, Number(p.times ?? 1));
       return { ok: true };
     }
-    case 'mock.clis':
+    case 'mock.clis': {
       if (p.wentBack) return wentBack();
+      // { failed: { provider, message } }: that CLI's update failed, as the
+      // runner reports one (the apps' banner says so until it's dismissed).
+      const cli = p.failed && clis.find((c) => c.provider === p.failed.provider);
+      if (cli) {
+        cli.update = { state: 'failed', targetVersion: cli.latestVersion, finishedAt: iso(), message: String(p.failed.message ?? '') };
+        broadcastClis();
+      }
       return { clis };
+    }
+    // A runner.notice to every client, as the runner sends its warnings and
+    // errors: { level: "info" | "warning" | "error", message }.
+    case 'mock.notice':
+      broadcastNotice(p.level ?? 'warning', String(p.message ?? ''));
+      return { ok: true };
     case 'mock.stream':
       return startStream(need(p.threadId).summary.id, p);
     // A thread with the id and title given, idle with nothing in it, for a
@@ -1736,6 +1772,61 @@ async function dispatch(client, method, p) {
       threads.set(threadId, { summary, events: [], inProgress: new Map(), timers: [] });
       broadcastSummary(threadId);
       return { thread: summary };
+    }
+    case 'mock.wakes': {
+      // Turns the agent started by itself as background jobs finished, for
+      // the wait lines between them ("44s later · ... finished"): a reply,
+      // then a turn woken by a long script path 44 s later, then one woken
+      // 3 min later by a command with a commit message in it, each with the
+      // runner's note on what finished. A shape from a real thread
+      // (a92fcf9a), whose wait lines the GPUI app drew over the replies.
+      // Back-dated, as the waits are worked out from the events' times.
+      const t = need(p.threadId);
+      const id = t.summary.id;
+      const start = Date.now() - 10 * 60_000;
+      const at = (seconds) => new Date(start + seconds * 1000).toISOString();
+      const script = '/Users/mike/.delegate/runs/20261111-153921-review-the-landing-fix/run.sh';
+      const commit = 'cd /Users/mike/dev/me/threadbear-threads/slot-5 && git add runner/src/cli.ts runner/src/runner/worktrees.ts && git commit -qm "Land the folder it runs in, never the thread\'s own\n\nThe review: with an unreadable .git in a sub-agent\'s checkout, git finds\nno checkout here and the landing fell back to the thread\'s worktree.\nNow it stops and says why." && tb land';
+      const turns = [
+        { woke: null, reply: 'The fix is committed. The review is still reading it; I\'ll pick it up when it finishes.' },
+        { woke: { at: 49, description: script }, note: `Background command "${script}" completed (exit code 0)`, reply: 'The review turned up two real gaps: the landing still falls back when git can\'t read the checkout, and the chip waits too long. Fixing both.' },
+        { woke: { at: 49 + 5 + 180, description: commit }, note: `Background command "${commit.split('\n')[0]}" completed (exit code 0)\nIts output is in the task's file.`, reply: 'Landing now lands the checkout it runs from, not the thread\'s worktree, so a sub-agent\'s own landing takes its own work.' },
+      ];
+      let clock = 0;
+      for (const [i, turn] of turns.entries()) {
+        const turnId = `turn_wake_${i}`;
+        if (turn.woke) clock = turn.woke.at;
+        else persist(id, { type: 'user.message', text: p.ask ?? 'Fix the landing and have it reviewed', images: [], ts: at(clock) }, turnId);
+        persist(id, { type: 'turn.started', turnId, ts: at(clock), ...(turn.woke ? { wokeBy: [{ kind: 'shell', description: turn.woke.description }] } : {}) }, turnId);
+        if (turn.note) persist(id, { type: 'system.note', text: turn.note, ts: at(clock) }, turnId);
+        persist(id, { type: 'assistant.text', itemId: `wake_${i}`, text: turn.reply, ts: at(clock + 3) }, turnId);
+        persist(id, { type: 'turn.completed', turnId, outcome: 'completed', durationMs: 5000, ts: at(clock + 5) }, turnId);
+      }
+      setStatus(id, 'idle');
+      return { thread: t.summary };
+    }
+    case 'mock.cardAnswer': {
+      // A daily brief's shape (thread 3fdaaeec, 12 Nov): a schedule's
+      // message, a reply ending on a card, Mike's answer to it with his own
+      // words under the pick, then, inside that answer's turn, a message
+      // another thread's agent sent in (send_message) and the agent's reply.
+      // His answer is the message to edit: the pencil by it did nothing.
+      const t = need(p.threadId);
+      const id = t.summary.id;
+      const ask = 'How did yesterday feel?';
+      persist(id, { type: 'user.message', text: '[Scheduled: "Daily brief", Every day at 6:30]\n\nWrite the daily brief.', images: [], origin: 'schedule' }, 'turn_brief');
+      persist(id, { type: 'turn.started' }, 'turn_brief');
+      persist(id, { type: 'assistant.text', itemId: 'brief_m', text: '# Morning brief\n\nA quiet day: two meetings and the lawn.', final: true }, 'turn_brief');
+      persist(id, { type: 'turn.completed', outcome: 'completed', durationMs: 60000, needs: 'you', asks: [{ action: ask, options: ['Great', 'Good', 'Meh', 'Rough'] }] }, 'turn_brief');
+      const words = p.words ?? 'It was good. I got a lot done.';
+      persist(id, { type: 'user.message', text: `${ask}\nGood\n\n${words}`, images: [], answers: [{ action: ask, answer: 'Good' }] }, 'turn_felt');
+      persist(id, { type: 'turn.started' }, 'turn_felt');
+      persist(id, { type: 'system.note', text: 'Resumed session' }, 'turn_felt');
+      persist(id, { type: 'user.message', text: '[Sent by the agent in the thread "Auth remaining work" (6888a556)]\n\nNot settled yet: hold the video.', images: [] }, 'turn_felt');
+      persist(id, { type: 'assistant.text', itemId: 'felt_m', text: 'Good to hear. The Auth thread says to hold the video.', final: true }, 'turn_felt');
+      persist(id, { type: 'turn.completed', outcome: 'completed', durationMs: 18000, needs: 'nothing' }, 'turn_felt');
+      setStatus(id, 'idle');
+      return { thread: t.summary };
     }
     case 'mock.review': {
       // As an agent's show_options would: {threadId, review: { id?, title,
@@ -1891,9 +1982,11 @@ async function fakeTurn(threadId, text, images, turnId = 'turn_' + crypto.random
   // through (docs/protocol.md, "Needs you", Answering).
   // "one decision" gives a single ask with no options, like a thread
   // started before end_turn had them. "follow-ups" ends done, with
-  // end_turn's next under "Or carry on".
+  // end_turn's next under "Or carry on". "pick a design" asks with a link
+  // to the demo review (review: links on a card, as show_options' are).
   const said = interrupted ? undefined
     : /follow-ups/i.test(text) ? { needs: 'nothing', next: ['Have the librarian tidy project notes when they get long', 'Add a size warning to the Notes panel'] }
+    : /pick a design/i.test(text) ? { needs: 'you', asks: [{ action: 'Pick one of the account picker designs', links: [{ title: 'See the designs', url: 'review:review_account_picker' }] }] }
     : /decisions/i.test(text) ? { needs: 'you', asks: DEMO_ASKS }
     : /one decision/i.test(text) ? { needs: 'you', asks: [{ action: 'Say go for Short 2 (Thomas on AI being dumb), or name another' }] }
     : undefined;
@@ -2110,7 +2203,9 @@ function startStream(threadId, p) {
     if (ticks >= total) {
       clearInterval(timer);
       finishText();
-      persist(threadId, { type: 'turn.completed', turnId, outcome: 'completed', durationMs: Date.now() - started }, turnId);
+      // `completed`: more of what the turn ended with, as end_turn says it
+      // (needs, next, asks, another lab's `review` ledger).
+      persist(threadId, { type: 'turn.completed', turnId, outcome: 'completed', durationMs: Date.now() - started, ...(p.completed ?? {}) }, turnId);
       setStatus(threadId, 'idle');
     }
   }, 1000 / hz);
@@ -2442,7 +2537,15 @@ function listFolder(client, p) {
   return {
     path: p.path, truncated: false,
     entries: fs.readdirSync(p.path).map((name) => {
-      const s = fs.statSync(path.join(p.path, name));
+      let s;
+      try {
+        s = fs.statSync(path.join(p.path, name));
+      } catch {
+        // A broken link, or one stat can't follow, still listed, as the
+        // runner lists it (runner/src/files.ts): failing the whole folder
+        // said "Couldn't read this folder" for / on GitHub's Macs (11 Nov).
+        return { name, isFolder: false, hidden: name.startsWith('.') };
+      }
       return { name, isFolder: s.isDirectory(), hidden: name.startsWith('.'), modifiedAt: s.mtime.toISOString(), ...(s.isDirectory() ? {} : { size: s.size }) };
     }),
   };
@@ -2482,7 +2585,7 @@ function addRemoteDemo() {
     threads.set(id, { summary, events, inProgress: new Map(), timers: [], runnerId: BRUCE });
   };
   make('bruce_backup', 'Check the photo library backup', '/Users/bruce/dev/me/misc', 12, 'idle', [{
-    ask: 'Is last night\'s photo library backup complete? Here is what Backblaze showed this morning.',
+    ask: 'Is last night\'s photo library backup complete? [Picture 1] is what Backblaze showed this morning.',
     images: [{ path: BRUCE_FILES.picture, mediaType: 'image/png', width: 760, height: 420 }],
     answer: 'The backup finished at 3:12 am: **48,210 files**, nothing skipped. The only warning is the external drive, which was asleep for the first pass and caught up on the second.\n\nWant me to keep the drive awake during backups?',
     needs: 'you',
@@ -3170,9 +3273,9 @@ function addDemoSubagents() {
   const now = Date.now();
   const at = (secondsAgo) => new Date(now - secondsAgo * 1000).toISOString();
   t.summary.subagents = [
-    { id: 'a_cache', itemId: 'agent_cache', description: 'Compare the cache keys', agentType: 'Explore', status: 'completed', background: false,
+    { id: 'a_cache', itemId: 'agent_cache', description: 'Compare the cache keys', agentType: 'Explore', model: 'claude-haiku-5-5', effort: 'medium', status: 'completed', background: false,
       summary: 'The lockfile hash changed on 21 Oct, so every run since misses the cache.', toolUses: 4, startedAt: at(200), endedAt: at(150) },
-    { id: 'a_bisect', itemId: 'agent_bisect', description: 'Find the commit that slowed the build', agentType: 'general-purpose', status: 'running', background: true,
+    { id: 'a_bisect', itemId: 'agent_bisect', description: 'Find the commit that slowed the build', agentType: 'general-purpose', model: 'claude-opus-5-5', effort: 'high', status: 'running', background: true,
       activity: 'Running git bisect on the last 40 commits', toolUses: 2, startedAt: at(95) },
     { id: 'a_bisect_tests', parentId: 'a_bisect', description: 'Time the test step on each commit', agentType: 'fork', status: 'running', background: false,
       activity: 'Reading run-845.log', toolUses: 1, startedAt: at(40) },
@@ -3307,6 +3410,32 @@ ${process.env.MOCK_SCRIPTED_TURNS ? '' : "<p>The mock runner's stand-in for the 
   }
 }
 
+// A real PDF of one US Letter page with a line of text, made by hand so the
+// mock needs no PDF library: each object's byte offset goes in the table at
+// the end, which is what readers find the objects by. ASCII only, so a
+// string's length is its bytes. The line is a link to `link`, so a click on
+// it can be seen going through the app's open gate (file-previews.feature).
+function onePagePdf(line, link) {
+  const text = `BT /F1 24 Tf 72 700 Td (${line.replace(/[()\\]/g, '\\$&')}) Tj ET`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R] >>',
+    `<< /Length ${text.length} >>\nstream\n${text}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Type /Annot /Subtype /Link /Rect [66 690 560 724] /Border [0 0 0] /A << /S /URI /URI (${link}) >> >>`,
+  ];
+  let out = '%PDF-1.4\n';
+  const offsets = objects.map((body, i) => {
+    const at = out.length;
+    out += `${i + 1} 0 obj\n${body}\nendobj\n`;
+    return at;
+  });
+  const table = out.length;
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets.map((n) => `${String(n).padStart(10, '0')} 00000 n \n`).join('')}`;
+  return `${out}trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${table}\n%%EOF\n`;
+}
+
 // The landing pages thread works in a real folder under the data dir, so its
 // highlights are files the app can preview: a mockup it pinned, a doc it
 // wrote, a screenshot it opened. Its other threads' highlights are only
@@ -3339,6 +3468,12 @@ The new hero is shorter, and every page now leads with what the app does.
 - Search moves to the top of the page.
 `);
     const before = file('screens/pricing-before.png', { copy: path.join(here, 'fixtures/demo-upload-resume/media/progress-before.png') });
+    // A real film (the site's inbox clip, 1600x1058 H.264), for a video in
+    // the pane (features/file-previews.feature). Only listed in the folder.
+    const clip = path.join(here, '../../../site/public/clips/inbox.mp4');
+    if (fs.existsSync(clip)) file('screens/hero-walkthrough.mp4', { copy: clip });
+    // And a one-page PDF, for a PDF in the pane.
+    file('docs/launch-brief.pdf', onePagePdf('Launch brief: the new hero ships Friday', 'https://example.com/launch-brief'));
     file('logs/docs-build.txt', 'Error: Could not resolve image /docs/hero.png\n  at src/pages/docs.astro:12\nBuild failed in 14.2s.\n');
     file('src/hero.ts', '// The hero at the top of the home page.\nexport function hero(words: string): string {\n  return `<h1>${words}</h1>`;\n}\n');
     site.summary.cwd = root;

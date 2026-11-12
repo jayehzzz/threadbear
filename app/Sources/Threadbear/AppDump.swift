@@ -152,6 +152,9 @@ struct AppDump: Encodable {
         /// A new thread from this box is on its way: its words stay, greyed
         /// and locked, until the runner has made it (`composer.starting`).
         var creating: Bool = false
+        /// The picks as chips over the box while the card's folded
+        /// (AnswerChips): "1: done".
+        var answers: [String]? = nil
     }
 
     /// The new-thread page, for the behaviour specs (`thread.newpage`),
@@ -324,6 +327,14 @@ struct AppDump: Encodable {
         /// cards and threads ("picture: Picture 1", "card: Fix the button",
         /// "thread: Morning brief").
         var chips: [String]? = nil
+        /// A gap row's words, from the row's own top, once drawn: they must
+        /// sit inside its fixed height, not over the rows either side.
+        var label: LabelFrame? = nil
+    }
+
+    struct LabelFrame: Encodable {
+        var top: Int
+        var height: Int
     }
 
     /// A draft's box as it's drawn: its label, each line (a Slack quote's
@@ -374,6 +385,8 @@ struct AppDump: Encodable {
     var limit: LimitInfo?
     /// The Archived note with Undo at the top of the thread panel: its thread.
     var archivedNote: String?
+    /// The last archive or hibernate flight (`ArchiveFlight.Record`).
+    var flight: ArchiveFlight.Record?
     /// The milestone note at the top of the thread panel: its first line.
     var milestoneNote: String?
     var error: String?
@@ -425,9 +438,44 @@ struct AppDump: Encodable {
     var pools: [PoolInfo] = []
     /// The window's panels and where they are (WindowDock), in one line.
     var dock: String = ""
+    /// The last time the panels moved with their glide (a panel opened or
+    /// closed): where each panel's group was and where it is now, by panel.
+    var panelMotion: PanelMotion?
+    struct PanelMotion: Encodable {
+        struct Rect: Encodable { var x, y, width, height: Double }
+        var from: [String: Rect]
+        var to: [String: Rect]
+    }
     /// The Threads panel is on screen: in the layout and not folded away
     /// with ⌘/ (`threadsShowing`).
     var threadsShowing: Bool = true
+    /// Threads open in panels of their own (ThreadPanels.swift).
+    var threadPanels: [ThreadPanelInfo] = []
+    /// The thread the main panel has selected but says is open in its own
+    /// panel (`OpenElsewhereNote`).
+    var openElsewhere: String? = nil
+    /// The keys shown beside the buttons while ⌘ is held (ShortcutHints),
+    /// as "Threads ⌘1", in the buttons' order.
+    var keyHints: [String] = []
+    /// The card in the middle of the window while a page swipe is under way
+    /// (`SwipeNavigationArrow`).
+    var pageSwipe: PageSwipeInfo? = nil
+
+    struct PageSwipeInfo: Encodable {
+        /// Its lines: "Back to", the thread or page, and where it is.
+        var lines: [String]
+        /// Letting go goes there.
+        var armed: Bool
+        var progress: Double
+    }
+
+    struct ThreadPanelInfo: Encodable {
+        var id: String
+        var title: String
+        /// Its tab's the one showing in its group, or it's in a window of its own.
+        var showing: Bool
+        var transcript: Transcript?
+    }
     /// The window's zoom, in percent (TextZoom).
     var zoom: Int = 100
     /// "end" or "empty" while the end-of-inbox note is up (InboxEndToast).
@@ -554,6 +602,9 @@ struct AppDump: Encodable {
         /// The project it's a part of, by title, and its own parts' titles.
         var parent: String? = nil
         var parts: [String] = []
+        /// The tab showing ("decisions" or "project") with the
+        /// projectDecisions experiment on; nil without tabs.
+        var tab: String? = nil
         var folders: [String]
         var threads: [String]
         var patches: [String]
@@ -732,6 +783,94 @@ struct AppDump: Encodable {
         }
     }
 
+    /// A transcript as it's drawn: the main panel's, or a thread's in a panel
+    /// of its own.
+    @MainActor
+    static func transcriptInfo(_ controller: TranscriptController) -> Transcript? {
+        guard let session = controller.session else { return nil }
+        let table = controller.tableView
+        let visible = table.rows(in: table.visibleRect)
+        let rows = (0..<session.displayCount).map { index -> Row in
+            let row = session.displayRow(index)
+            return Row(id: row.id, kind: row.kind.rawValue, height: Int(table.rect(ofRow: index).height.rounded()),
+                       expanded: opens(row) ? controller.isExpanded(row) : nil, inGroup: row.inGroup,
+                       onScreen: NSLocationInRange(index, visible), seq: row.seq, turn: row.turnId, text: RowDebug.excerpt(row),
+                       buttons: Self.buttons(row), drafts: Self.drafts(row), rich: Self.rich(row), shellBlocks: Self.shellBlocks(row, threadId: session.threadId),
+                       chips: Self.chips(row), label: Self.gapLabel(table, index))
+        }
+        let state: String
+        switch session.state {
+        case .idle: state = "idle"
+        case .loading: state = "loading"
+        case .loaded: state = "loaded"
+        case .failed(let message): state = "failed: \(message)"
+        }
+        return Transcript(threadId: session.threadId, state: state, hasMoreAbove: session.hasMoreAbove,
+                          atBottom: controller.isAtBottom, rows: rows)
+    }
+
+    /// Where a gap row's label is in its cell (flipped, so from the top),
+    /// when the row's on screen.
+    @MainActor
+    static func gapLabel(_ table: NSTableView, _ index: Int) -> LabelFrame? {
+        guard let cell = table.view(atColumn: 0, row: index, makeIfNecessary: false) as? GapRowCell else { return nil }
+        return LabelFrame(top: Int(cell.label.frame.minY.rounded()), height: Int(cell.label.frame.height.rounded()))
+    }
+
+    /// The keys the buttons show while ⌘ is held (`shortcutHint`): the
+    /// activity bar's views and Settings, New thread beside the Inbox's
+    /// search, and the composer's Stop while its thread runs with nothing
+    /// typed. The GPUI app's dump says the same.
+    @MainActor
+    static func keyHints(_ app: AppModel) -> [String] {
+        guard ShortcutHints.shared.showing else { return [] }
+        var out: [String] = []
+        func add(_ title: String, _ command: ShortcutCommand) {
+            if let key = AppShortcuts.shared.display(command) { out.append("\(title) \(key)") }
+        }
+        add("Threads", .showInbox)
+        if app.schedulesSupported { add("Scheduled", .showScheduled) }
+        if app.projectsSupported {
+            add("Projects", .showProjects)
+            add("Librarian", .showLibrarian)
+        }
+        add("Settings", .settings)
+        if app.sidebarMode == .inbox && app.threadsShowing { add("New thread", .newThread) }
+        if let thread = app.selectedThread, thread.status.isBusy {
+            let draft = app.drafts[thread.id]
+            if (draft?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, draft?.images.isEmpty ?? true { add("Stop", .stop) }
+        }
+        return out
+    }
+
+    /// What the page swipe's card says (`SwipeNavigationArrow`), as the
+    /// GPUI app's dump does.
+    @MainActor
+    static func pageSwipe(_ app: AppModel) -> PageSwipeInfo? {
+        let swipe = SwipeNavigation.shared.swipe
+        guard let direction = swipe.direction else { return nil }
+        let back = direction == .back
+        let destination = app.destination(back: back)
+        let empty = swipe.isEmpty || destination == nil
+        let place = destination ?? (back ? "Nothing to go back to" : "Nothing to go forward to", nil)
+        var lines: [String] = []
+        if !empty { lines.append(back ? "Back to" : "Forward to") }
+        lines.append(place.title)
+        if let detail = place.detail { lines.append(detail) }
+        return PageSwipeInfo(lines: lines, armed: swipe.armed, progress: swipe.progress)
+    }
+
+    /// Each thread in a panel of its own (ThreadPanels.swift), in the
+    /// layout's order: whether its tab's the one showing, and its transcript.
+    @MainActor
+    static func threadPanels(_ app: AppModel) -> [ThreadPanelInfo] {
+        app.dock.layout.panels.compactMap { panel in
+            guard let id = WindowDock.pinnedThread(panel) else { return nil }
+            return ThreadPanelInfo(id: id, title: WindowDock.title(of: panel, app: app), showing: app.dock.isShowing(panel),
+                                   transcript: app.panelTranscripts[id].flatMap(transcriptInfo))
+        }
+    }
+
     @MainActor
     static func make(app: AppModel, window: NSWindow?, instance: String?) -> AppDump {
         let now = Date()
@@ -798,28 +937,7 @@ struct AppDump: Encodable {
             }
         }
         let key = app.selection ?? "new"
-        var transcript: Transcript?
-        if let session = app.transcript.session {
-            let table = app.transcript.tableView
-            let visible = table.rows(in: table.visibleRect)
-            let rows = (0..<session.displayCount).map { index -> Row in
-                let row = session.displayRow(index)
-                return Row(id: row.id, kind: row.kind.rawValue, height: Int(table.rect(ofRow: index).height.rounded()),
-                           expanded: opens(row) ? app.transcript.isExpanded(row) : nil, inGroup: row.inGroup,
-                           onScreen: NSLocationInRange(index, visible), seq: row.seq, turn: row.turnId, text: RowDebug.excerpt(row),
-                           buttons: Self.buttons(row), drafts: Self.drafts(row), rich: Self.rich(row), shellBlocks: Self.shellBlocks(row, threadId: session.threadId),
-                           chips: Self.chips(row))
-            }
-            let state: String
-            switch session.state {
-            case .idle: state = "idle"
-            case .loading: state = "loading"
-            case .loaded: state = "loaded"
-            case .failed(let message): state = "failed: \(message)"
-            }
-            transcript = Transcript(threadId: session.threadId, state: state, hasMoreAbove: session.hasMoreAbove,
-                                    atBottom: app.transcript.isAtBottom, rows: rows)
-        }
+        let transcript = transcriptInfo(app.transcript)
         let appearance = window?.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? "dark" : "light"
         return AppDump(
             instance: instance,
@@ -828,6 +946,7 @@ struct AppDump: Encodable {
             banner: app.banner.map { BannerInfo(style: $0.style.rawValue, text: $0.text, detail: $0.detail) },
             limit: app.selectedThread.flatMap { limitInfo(app, thread: $0) },
             archivedNote: app.archivedNote?.threadId,
+            flight: ArchiveFlight.lastFlight,
             milestoneNote: app.milestoneNote.map { ThreadMilestones.title($0.tier) },
             error: app.errorMessage,
             window: window.map { Window(width: Int(contentSize($0).width), height: Int(contentSize($0).height), appearance: appearance) },
@@ -852,6 +971,7 @@ struct AppDump: Encodable {
                 return ProjectInfo(id: project.id, title: project.title,
                                    parent: project.parentId.flatMap { app.project($0)?.title },
                                    parts: (app.projectSections.parts[project.id] ?? []).map(\.project.title),
+                                   tab: app.projectDecisionsOn ? app.projectTab(project.id).rawValue : nil,
                                    folders: project.folders, threads: threads.map(\.id),
                                    patches: PatchGroups.patches(of: project, in: threads).map(\.patch.id), archived: project.archived)
             },
@@ -873,7 +993,19 @@ struct AppDump: Encodable {
                          rail: Pools.railSubtitle(pool, accounts: app.accounts), status: Pools.statusLine(pool, accounts: app.accounts, now: app.now))
             } : [],
             dock: app.dock.layout.summary.replacingOccurrences(of: "threadbear.", with: ""),
+            panelMotion: app.dock.motionFrom.map { from in
+                func rects(_ frames: [String: CGRect]) -> [String: PanelMotion.Rect] {
+                    Dictionary(frames.map { ($0.key.replacingOccurrences(of: "threadbear.", with: ""), PanelMotion.Rect(x: $0.value.minX.rounded(), y: $0.value.minY.rounded(), width: $0.value.width.rounded(), height: $0.value.height.rounded())) }, uniquingKeysWith: { a, _ in a })
+                }
+                return PanelMotion(from: rects(from), to: rects(app.dock.panelFrames))
+            },
             threadsShowing: app.threadsShowing,
+            threadPanels: threadPanels(app),
+            openElsewhere: app.selection.flatMap { id in
+                !app.showsHomePage && app.openProject == nil && app.dock.layout.contains(WindowDock.threadPanel(id)) ? id : nil
+            },
+            keyHints: keyHints(app),
+            pageSwipe: pageSwipe(app),
             zoom: TextZoom.shared.percent,
             inboxEndNote: app.inboxEndNote.map { $0.empty ? "empty" : "end" },
             rails: rails(app),
@@ -1242,6 +1374,11 @@ struct AppDump: Encodable {
                 if shows.hasPrefix("picture") {
                     pane.previewKind = "picture"
                     pane.previewText = String(shows.dropFirst("picture ".count))
+                } else if shows.hasPrefix("video") {
+                    // The film's size once its track has said it, as the
+                    // GPUI app's dump has it.
+                    pane.previewKind = "video"
+                    pane.previewText = shows == "video" ? nil : String(shows.dropFirst("video ".count))
                 } else {
                     pane.previewKind = shows
                 }
@@ -1553,7 +1690,8 @@ struct AppDump: Encodable {
                         pool: settings.pool, chip: ThreadSettings(app: app, thread: app.selectedThread).modelChipTitle,
                         chipBadge: badgeWords(ThreadSettings(app: app, thread: app.selectedThread).modelChipBadge),
                         runner: app.selectedThread.flatMap(app.runnerName(of:)) ?? (app.selectedThread == nil ? app.newThreadRunner?.name : nil),
-                        card: cardLines(app, key: key), cardRuns: cardRunLines(app, key: key), creating: key == "new" && app.creatingThread)
+                        card: cardLines(app, key: key), cardRuns: cardRunLines(app, key: key), creating: key == "new" && app.creatingThread,
+                        answers: answerLines(app, key: key))
     }
 
     /// LimitBanner's words and button, as it draws them.
@@ -1610,17 +1748,59 @@ struct AppDump: Encodable {
     }
 
     static func cardLines(_ card: AsksCard, collapsed: Bool) -> [String] {
+        var lines: [String]
         if card.isDone {
-            return ["Done"] + card.next.enumerated().map { i, text in
+            lines = ["Done"] + card.next.enumerated().map { i, text in
                 (card.pickedNext.contains(i) ? "[x] " : "[ ] ") + text + (card.explainNext.contains(i) ? " (?)" : "")
             }
+        } else {
+            lines = [collapsed ? "Needs you (collapsed)" : "Needs you"]
+            for (i, ask) in card.asks.enumerated() {
+                lines.append((card.picks[i] != nil ? "[x] " : "[ ] ") + "\(i + 1). \(ask.action)")
+                if let run = ask.run { lines.append("    $ " + run.command) }
+            }
         }
-        var lines = [collapsed ? "Needs you (collapsed)" : "Needs you"]
-        for (i, ask) in card.asks.enumerated() {
-            lines.append((card.picks[i] != nil ? "[x] " : "[ ] ") + "\(i + 1). \(ask.action)")
-            if let run = ask.run { lines.append("    $ " + run.command) }
+        // Another lab's review (RowRenderer.reviewText): its heading, then
+        // "  Fixed: <claim>" a finding, as the GPUI app's dump says them.
+        if let review = card.review {
+            lines.append(review.heading)
+            lines += review.findings.map { finding in
+                let word = switch finding.outcome {
+                case "fixed": "Fixed"
+                case "disputed": "Disputed"
+                case "left": "Left for you"
+                default: "No answer"
+                }
+                return "  \(word): \(finding.claim)"
+            }
         }
         return lines
+    }
+
+    /// The picks shown as chips over the box while the card's folded
+    /// (AnswerChips), as `composer.answers`: "1: done", "2: Just us". Nil
+    /// while the card's open above (its buttons show them) or a message is
+    /// being edited.
+    @MainActor
+    private static func answerLines(_ app: AppModel, key: String) -> [String]? {
+        guard let thread = app.threads[key], app.editing[key] == nil else { return nil }
+        let picks = app.picks(for: thread)
+        guard !picks.isEmpty, let row = app.sessions[key]?.openCard, case .asks(let card) = row.content, !card.isDone,
+              app.collapsedCards[key] == row.seq else { return nil }
+        let notes = app.notes(for: thread)
+        let lines = picks.keys.sorted().compactMap { index -> String? in
+            guard thread.asks.indices.contains(index), let pick = picks[index] else { return nil }
+            let ask = thread.asks[index]
+            if pick == Decisions.ownAnswer {
+                let note = notes[index] ?? AskNote()
+                let text = InlinePictures.words(note.text).trimmingCharacters(in: .whitespacesAndNewlines)
+                let shown = !text.isEmpty ? text : note.images.isEmpty ? "Your answer above" : note.images.count == 1 ? "1 picture" : "\(note.images.count) pictures"
+                return "\(index + 1): \(shown)"
+            }
+            let options = Decisions.choices(for: ask)
+            return options.indices.contains(pick) ? "\(index + 1): \(options[pick])" : nil
+        }
+        return lines.isEmpty ? nil : lines
     }
 
     /// Rows a click opens: work lines, groups and settled approvals that
