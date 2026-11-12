@@ -5,7 +5,7 @@ import path from 'node:path';
 import { tmpDir } from '../helpers/fakes.ts';
 import { DictationLearning, FluidVoiceClient, type DictionaryEntry, type DictationEvent } from '../../src/dictation-learning.ts';
 
-function setup() {
+function setup(normalizeLikeFluidVoice = false) {
   const home = tmpDir();
   const events: DictationEvent[] = [];
   const notes: string[] = [];
@@ -19,6 +19,10 @@ function setup() {
     if (body) {
       writes.push(body);
       const b = body as { mode: string; entries: DictionaryEntry[] };
+      if (normalizeLikeFluidVoice) for (const e of b.entries) {
+        if (/^[0-9a-f-]{36}$/i.test(e.id)) e.id = e.id.toUpperCase();
+        e.triggers = e.triggers.map(t => t.trim().toLowerCase());
+      }
       items = b.mode === 'replace' ? b.entries : [...b.entries, ...items.filter(x => !b.entries.some(e => e.replacement.toLowerCase() === x.replacement.toLowerCase()))];
     } else if (++reads === 2) concurrent?.();
     return { count: items.length, items: structuredClone(items) };
@@ -114,7 +118,7 @@ test('sync merges triggers without changing other entries, saves provenance and 
   const c = s.service.record('thread', { heard: 'Threadbare', replacement: 'Threadbear', sourceSeq: seq, confirmationSeq: seq });
   await s.service.sync();
   assert.equal(c.status, 'synced');
-  assert.deepEqual(s.items()[0].triggers, ['thread bear', 'Threadbare']);
+  assert.deepEqual(s.items()[0].triggers, ['thread bear', 'threadbare']);
   assert.equal(s.items()[0].id, 'existing');
   assert.equal(s.writes.length, 1);
   assert.equal((s.writes[0] as { mode: string }).mode, 'append');
@@ -125,6 +129,20 @@ test('sync merges triggers without changing other entries, saves provenance and 
   await s.service.decide(c.id, 'undo');
   assert.deepEqual(s.items()[0].triggers, ['thread bear']);
   assert.equal(c.status, 'undone');
+});
+
+test('new entries and triggers survive FluidVoice UUID and spelling normalization, including undo', async () => {
+  const s = setup(true);
+  const seq = s.user('I meant ChatGPT, not ChatGBT.');
+  const c = s.service.record('thread', {heard: 'ChatGBT', replacement: 'ChatGPT', sourceSeq: seq, confirmationSeq: seq});
+  await s.service.sync();
+  assert.equal(c.status, 'synced');
+  assert.equal(s.items()[0].triggers[0], 'chatgbt');
+  assert.equal(s.items()[0].id, s.items()[0].id.toUpperCase());
+  await s.service.decide(c.id, 'undo');
+  assert.equal(c.status, 'undone');
+  assert.equal(s.items().length, 1);
+  assert.equal(s.items()[0].replacement, 'Threadbear');
 });
 
 test('a concurrent edit aborts before write; undo refuses to overwrite later user changes', async () => {

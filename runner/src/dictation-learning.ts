@@ -273,7 +273,7 @@ export class DictationLearning {
         }
         const existing = matches[0];
         if (existing?.triggers.some(t => norm(t) === norm(c.heard))) { c.status = 'synced'; this.save(); continue; }
-        const entry = { ...existing, id: existing?.id ?? crypto.randomUUID(), replacement: existing?.replacement ?? c.replacement, triggers: [...(existing?.triggers ?? []), c.heard] };
+        const entry = { ...existing, id: existing?.id ?? crypto.randomUUID().toUpperCase(), replacement: existing?.replacement ?? c.replacement, triggers: [...(existing?.triggers ?? []), c.heard].map(t => t.trim().toLowerCase()) };
         const after = [entry, ...before.filter(e => e !== existing)];
         if (fingerprint(await this.client.entries()) !== fingerprint(before)) throw new Error('FluidVoice dictionary changed during sync. No write made; queued for retry.');
         if (!this.allowed(c.threadId)) break;

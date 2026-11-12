@@ -5004,6 +5004,8 @@ health and the supported dictionary shape before any write. Sync reads
 the current entries, retains existing triggers and IDs, refuses conflicting
 trigger ownership, takes a backup, checks again for concurrent edits, then
 posts one merged entry using `mode: "append"` and verifies the response.
+Outgoing triggers are trimmed and lowercased, and new UUIDs uppercased,
+matching FluidVoice's persistence format before verification.
 It never replaces the whole dictionary during forward sync. FluidVoice's
 API has no conditional-write transaction: a concurrent edit to the same
 word in the final read/write interval cannot be made atomic. Detected
