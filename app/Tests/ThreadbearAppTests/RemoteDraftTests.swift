@@ -239,7 +239,9 @@ final class RemoteRowActionTests: XCTestCase {
         let (app, local, away) = try await app()
         XCTAssertNil(app.client(for: "th_bruce"), "nothing of bruce's is open")
         app.archive("th_bruce")
-        try await until { app.threads["th_bruce"]?.isArchived == true }
+        // The row leaves optimistically, before its runner is connected.
+        // Wait for the request this test checks, as the swipe test does.
+        try await until { !away.params("threads.update").isEmpty }
         XCTAssertEqual(app.threads["th_bruce"]?.isArchived, true)
         XCTAssertEqual(away.params("threads.update").count, 1)
         XCTAssertTrue(local.params("threads.update").isEmpty, "it's bruce's thread")
