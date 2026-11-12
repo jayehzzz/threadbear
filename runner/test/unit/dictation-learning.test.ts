@@ -91,6 +91,23 @@ test('pending candidates survive restart and review does not skip messages arriv
   assert.equal(again.batch('thread')!.messages[0].seq, 2);
 });
 
+test('a chat still on a draining runner supplies independently fetched evidence', async () => {
+  const s = setup();
+  s.user('Open Threadbare');
+  s.user('I meant Threadbear, not Threadbare.');
+  const remote = new DictationLearning({home: tmpDir(), enabled: () => true, client: s.client, host: {
+    ...s.host,
+    events: () => { throw new Error('This chat is still on the old runner'); },
+    evidence: async () => structuredClone(s.events),
+  }});
+  remote.start();
+  const c = await remote.capture('thread', {heard: 'Threadbare', replacement: 'Threadbear', sourceSeq: 1, confirmationSeq: 2});
+  await remote.sync();
+  assert.equal(c.status, 'synced');
+  await assert.rejects(remote.capture('thread', {heard: 'Fabricated', replacement: 'Threadbear', sourceSeq: 1}), /source/i);
+  remote.stop();
+});
+
 test('sync merges triggers without changing other entries, saves provenance and is idempotent', async () => {
   const s = setup();
   const seq = s.user('I meant Threadbear, not Threadbare.');

@@ -4991,6 +4991,10 @@ dictionary through these RPC methods. Recording a suggestion through the
 agent tool is limited to that agent's own thread and follows its normal
 tool approval rules. A draining runner forwards agent records to the
 primary; it never runs a second dictionary writer.
+For a chat still on a draining runner, the primary obtains the evidence
+through its authenticated thread router before validating the correction.
+Its completion note waits for that chat to arrive; the local vocabulary
+report is available immediately.
 
 FluidVoice integration uses its opt-in loopback API at
 `http://127.0.0.1:47733`, never its preference files. It does not enable

@@ -180,6 +180,7 @@ async function main(): Promise<void> {
   // Set once this runner has handed over and is finishing its kept turns.
   let draining = false;
   let dictation: DictationLearning | undefined;
+  const dictationNotes = new Map<string, string[]>();
   const dictationRecord = (threadId: string) => !copyOfReal && experimentOn(cfg.home, 'dictationLearning') ? async (input: CorrectionInput): Promise<Correction> => {
     if (draining) {
       if (!primaryLink) throw new Error('Runner handover in progress. Try recording this correction next turn.');
@@ -187,7 +188,7 @@ async function main(): Promise<void> {
       return result.correction;
     }
     if (!dictation) throw new Error('Dictation learning has not started yet.');
-    const correction = dictation.record(threadId, input);
+    const correction = await dictation.capture(threadId, input);
     void dictation.sync();
     return correction;
   } : undefined;
@@ -378,6 +379,10 @@ async function main(): Promise<void> {
         runner.reconcileWaits();
         // Told now if the app restarted while it was over there.
         if (t) appRestarts?.adopted(threadId);
+        if (t) {
+          for (const text of dictationNotes.get(threadId) ?? []) runner.note(threadId, text);
+          dictationNotes.delete(threadId);
+        }
         return t;
       },
       // A thread here may be waiting on one deleted over there.
@@ -430,10 +435,19 @@ async function main(): Promise<void> {
   projects.start(runner);
   if (!copyOfReal) {
     dictation = new DictationLearning({ home: cfg.home, enabled: () => experimentOn(cfg.home, 'dictationLearning'), host: {
-      threads: () => runner.threadRecords(),
+      threads: () => [...runner.threadRecords(), ...peers.summaries(['inbox', 'snoozed', 'archived'])],
       events: (id, afterSeq, limit) => runner.events(id, { afterSeq, limit }).events,
+      evidence: async (id, input) => {
+        if (!peers.owns(id)) return undefined;
+        const source = await router().events(id, { afterSeq: input.sourceSeq - 1, limit: 1 });
+        const context = input.confirmationSeq ? await router().events(id, { afterSeq: Math.max(0, input.confirmationSeq - 80), limit: 80 }) : undefined;
+        return [...new Map([...source.events, ...(context?.events ?? [])].map(e => [e.seq, e])).values()].sort((a, b) => a.seq - b.seq);
+      },
       privateFolder: cwd => models.isPrivateFolder(cwd),
-      note: (id, text) => runner.note(id, text),
+      note: (id, text) => {
+        if (runner.has(id)) runner.note(id, text);
+        else if (peers.owns(id)) dictationNotes.set(id, [...(dictationNotes.get(id) ?? []), text]);
+      },
     } });
     try { dictation.start(); } catch (e) {
       log.error('dictation learning could not start', { error: String(e) });
@@ -758,9 +772,9 @@ async function main(): Promise<void> {
   runner.attachClis(updates);
   const methods = { ...restartMethods(restarter), ...scheduleMethods(scheduler), ...projectMethods(projects), ...drainProjectMethods(projects), ...librarianMethods(librarian), ...connectorsMethods(connectors), ...settingsMethods(settings), ...instructionsMethods(instructions), ...modelMethods(models), ...devicesMethods(sync), ...usageStatsMethods({ tally, history: usageHistory, clock: realClock }) };
   methods['dictation.status'] = () => dictation?.status() ?? { enabled: false, corrections: [] };
-  methods['dictation.record'] = p => {
+  methods['dictation.record'] = async p => {
     if (!dictation || typeof p.threadId !== 'string') throw new Error('Dictation learning is unavailable or threadId is missing.');
-    const correction = dictation.record(p.threadId, p as unknown as CorrectionInput);
+    const correction = await dictation.capture(p.threadId, p as unknown as CorrectionInput);
     void dictation.sync();
     return { correction };
   };

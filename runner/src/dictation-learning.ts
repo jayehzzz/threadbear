@@ -17,6 +17,7 @@ export type DictationBatch = { threadId: string; throughSeq: number; messages: {
 type Host = {
   threads(): { id: string; cwd: string; lastSeq: number; startedBy?: { kind: string } }[];
   events(id: string, after: number, limit: number): DictationEvent[];
+  evidence?(id: string, input: CorrectionInput): Promise<DictationEvent[] | undefined>;
   privateFolder(cwd: string): boolean;
   note(id: string, text: string): void;
 };
@@ -115,14 +116,14 @@ export class DictationLearning {
   status() {
     return { enabled: !this.stopped && this.enabled(), corrections: this.data.corrections.filter(c => this.allowed(c.threadId)).map(({ before: _b, after: _a, ...c }) => c), ...(this.syncError ? { syncError: this.syncError } : {}) };
   }
-  private event(id: string, seq: number): DictationEvent | undefined {
+  private event(id: string, seq: number, events = this.host.events): DictationEvent | undefined {
     if (!Number.isSafeInteger(seq) || seq < 1) return undefined;
-    return this.host.events(id, seq - 1, 1).find(e => e.seq === seq);
+    return events(id, seq - 1, 1).find(e => e.seq === seq);
   }
-  private confirmed(id: string, input: CorrectionInput): boolean {
+  private confirmed(id: string, input: CorrectionInput, events = this.host.events): boolean {
     if (!input.confirmationSeq || input.confirmationSeq < input.sourceSeq) return false;
     const confirmationSeq = input.confirmationSeq;
-    const e = this.event(id, input.confirmationSeq);
+    const e = this.event(id, input.confirmationSeq, events);
     if (!e || !human(e)) return false;
     const text = e.text!.trim();
     // Only direct correction utterances. Quotes, fenced examples and prose
@@ -132,19 +133,28 @@ export class DictationLearning {
     if (new RegExp(`^(?:please\\s+)?(?:replace|correct|change) ["“']?${source}["”']? (?:with|to) ["“']?${target}["”']?[.!]?$`, 'iu').test(text)) return true;
     if (new RegExp(`^["“']?${source}["”']?\\s*(?:→|->)\\s*["“']?${target}["”']?[.!]?$`, 'iu').test(text)) return true;
     // A direct answer to a question identifying this exact mapping.
-    const prior = this.host.events(id, Math.max(0, confirmationSeq - 80), 80).filter(x => x.seq < confirmationSeq && (x.type === 'assistant.text' || x.type === 'user.message')).at(-1);
+    const prior = events(id, Math.max(0, confirmationSeq - 80), 80).filter(x => x.seq < confirmationSeq && (x.type === 'assistant.text' || x.type === 'user.message')).at(-1);
     const question = new RegExp(`^(?:Should I|Do you want me to) (?:replace|correct|change) ["“']?${source}["”']? (?:with|to) ["“']?${target}["”']?\\?$`, 'iu');
     return !!prior && prior.type === 'assistant.text' && question.test(prior.text?.trim() ?? '') && /^(?:yes|correct|that['’]s right|use that)[.!]?$/i.test(text);
   }
   record(threadId: string, raw: CorrectionInput): Correction {
+    return this.recordChecked(threadId, raw);
+  }
+  async capture(threadId: string, raw: CorrectionInput): Promise<Correction> {
+    if (!this.allowed(threadId)) throw new Error('Dictation learning is off or this thread is private/unavailable.');
+    if (!Number.isSafeInteger(raw.sourceSeq) || raw.sourceSeq < 1 || (raw.confirmationSeq !== undefined && (!Number.isSafeInteger(raw.confirmationSeq) || raw.confirmationSeq < 1))) throw new Error('Use real user-message sequence numbers.');
+    const evidence = await this.host.evidence?.(threadId, raw);
+    return this.recordChecked(threadId, raw, evidence ? (_id, after, limit) => evidence.filter(e => e.seq > after).slice(0, limit) : this.host.events);
+  }
+  private recordChecked(threadId: string, raw: CorrectionInput, events = this.host.events): Correction {
     if (!this.allowed(threadId)) throw new Error('Dictation learning is off or this thread is private/unavailable.');
     const input = { ...raw, heard: word(raw.heard), replacement: word(raw.replacement) };
     if (input.confirmationSeq !== undefined && (!Number.isSafeInteger(input.confirmationSeq) || input.confirmationSeq < 1)) throw new Error('Use a real confirmation sequence number.');
     if (norm(input.heard) === norm(input.replacement)) throw new Error('The two spellings are the same.');
-    const source = this.event(threadId, input.sourceSeq);
+    const source = this.event(threadId, input.sourceSeq, events);
     const t = this.host.threads().find(t => t.id === threadId)!;
     if (!source || !human(source) || !has(source.text!, input.heard) || (source.seq === 1 && t.startedBy)) throw new Error('The source must be a real user message containing the misheard spelling.');
-    const confirmed = this.confirmed(threadId, input);
+    const confirmed = this.confirmed(threadId, input, events);
     if (input.confirmationSeq && !confirmed) throw new Error('Confirmation must be an explicit user correction of this spelling.');
     let c = this.data.corrections.find(c => c.threadId === threadId && norm(c.heard) === norm(input.heard) && norm(c.replacement) === norm(input.replacement));
     if (c) {
