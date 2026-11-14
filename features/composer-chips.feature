@@ -33,6 +33,15 @@ Feature: The chips under the message box
     Then the model chip says "Antigravity · Gemini Flash"
     And the "model" menu has a row "# [x] Antigravity"
 
+  # Return in the search picks the first model it lists (the Swift search's
+  # onSubmit). The Swift app does this, but its automation, frozen since 12
+  # Nov, can't type in the popover's search, so it's pending there.
+  @composer.modelpicker @swift-pending
+  Scenario: Return in the model picker's search picks the first match
+    When I open the model picker
+    And I search the model picker for "opus" and press Return
+    Then the model chip says "Claude · Opus 5.5"
+
   @composer.modelpicker
   Scenario: Picking an effort level changes the chip
     When I pick "High" from the "model" menu

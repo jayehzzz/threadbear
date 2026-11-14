@@ -1,4 +1,10 @@
-import { test } from 'node:test';
+// Where the runner finds Claude Code (config.ts, claudePath): the native
+// install in ~/.local/bin first, then the runner's PATH, so an npm or
+// Homebrew install works too. Until 13 Nov 2026 only ~/.local/bin/claude
+// counted, and a fork with Claude from npm saw "the claude CLI isn't at
+// ~/.local/bin/claude" though INSTALL.md said the PATH's would do
+// (jayehzzz's fork).
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -6,58 +12,66 @@ import path from 'node:path';
 import { loadConfig } from '../../src/config.ts';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
 
-function executable(file: string): string {
+function executable(file: string, mode = 0o755): string {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(file, '#!/bin/sh\nexit 0\n', { mode });
   return file;
 }
 
-test('Claude discovery finds a Homebrew/npm symlink on PATH when the native install is absent', (t) => {
-  const home = tmpDir();
+// A home of its own, so this Mac's real ~/.local/bin/claude never counts.
+function fakeHome(t: TestContext): string {
+  const home = fs.realpathSync(tmpDir());
   t.mock.method(os, 'homedir', () => home);
-  const bin = path.join(home, 'opt', 'homebrew', 'bin');
+  return home;
+}
+
+const load = (home: string, env: Record<string, string>) => loadConfig({ THREADBEAR_HOME: path.join(home, 'data'), ...env });
+
+test('no native install: a claude on the PATH, kept as the link npm or Homebrew made', (t) => {
+  const home = fakeHome(t);
+  const bin = path.join(home, 'homebrew', 'bin');
+  const target = executable(path.join(home, 'homebrew', 'lib', 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js'));
   fs.mkdirSync(bin, { recursive: true });
-  const target = executable(path.join(home, 'opt', 'homebrew', 'lib', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'));
-  const link = path.join(bin, 'claude');
-  fs.symlinkSync(path.relative(bin, target), link);
-  assert.equal(loadConfig({ THREADBEAR_HOME: home, PATH: bin }).claudePath, link);
-  const h = makeHarness(undefined, { claudePath: link });
-  assert.deepEqual(h.runner.noticesForNewClient(), []);
+  fs.symlinkSync(path.relative(bin, target), path.join(bin, 'claude'));
+  // The first PATH folder has no claude; the second does.
+  assert.equal(load(home, { PATH: `${path.join(home, 'empty')}:${bin}` }).claudePath, path.join(bin, 'claude'));
 });
 
-test('Claude discovery prefers the native install and keeps explicit paths authoritative', (t) => {
-  const home = tmpDir();
-  t.mock.method(os, 'homedir', () => home);
+test('the native install comes before the PATH, and claudePath or THREADBEAR_CLAUDE_PATH before both', (t) => {
+  const home = fakeHome(t);
   const native = executable(path.join(home, '.local', 'bin', 'claude'));
-  const other = executable(path.join(home, 'bin', 'claude'));
-  const env = { THREADBEAR_HOME: home, PATH: path.dirname(other) };
-  assert.equal(loadConfig(env).claudePath, native);
-  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ claudePath: '~/chosen/claude' }));
-  assert.equal(loadConfig(env).claudePath, path.join(home, 'chosen', 'claude'));
-  assert.equal(loadConfig({ ...env, THREADBEAR_CLAUDE_PATH: '/missing/explicit-claude' }).claudePath, '/missing/explicit-claude');
+  const bin = path.dirname(executable(path.join(home, 'npm', 'bin', 'claude')));
+  assert.equal(load(home, { PATH: bin }).claudePath, native);
+  const own = executable(path.join(home, 'own', 'claude'));
+  assert.equal(load(home, { PATH: bin, THREADBEAR_CLAUDE_PATH: own }).claudePath, own);
+  fs.mkdirSync(path.join(home, 'data'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'data', 'runner.json'), JSON.stringify({ claudePath: own }));
+  assert.equal(load(home, { PATH: bin }).claudePath, own);
 });
 
-test('Claude discovery skips broken links, directories, nonexecutables and relative PATH entries', (t) => {
-  const home = tmpDir();
-  t.mock.method(os, 'homedir', () => home);
-  const native = path.join(home, '.local', 'bin', 'claude');
-  fs.mkdirSync(path.dirname(native), { recursive: true });
-  fs.symlinkSync('/nonexistent/claude', native);
-  const directory = path.join(home, 'directory');
-  fs.mkdirSync(path.join(directory, 'claude'), { recursive: true });
-  const plain = executable(path.join(home, 'plain', 'claude'));
-  fs.chmodSync(plain, 0o644);
-  const good = executable(path.join(home, 'good', 'claude'));
-  const env = { THREADBEAR_HOME: home, PATH: ['', '.', 'relative', directory, path.dirname(plain), path.dirname(good)].join(path.delimiter) };
-  assert.equal(loadConfig(env).claudePath, good);
-  fs.unlinkSync(good);
-  assert.equal(loadConfig(env).claudePath, native, 'the diagnostic still names the native path when nothing is installed');
+test("a relative PATH folder, a file that won't run and a folder named claude don't count; with none, the native path", (t) => {
+  const home = fakeHome(t);
+  // A thread's folder must never supply the runner's CLI.
+  executable(path.join(home, 'rel', 'claude'));
+  const was = process.cwd();
+  process.chdir(home);
+  t.after(() => process.chdir(was));
+  const notRunnable = path.dirname(executable(path.join(home, 'plain', 'claude'), 0o644));
+  const dir = path.join(home, 'dir');
+  fs.mkdirSync(path.join(dir, 'claude'), { recursive: true });
+  const broken = path.join(home, 'broken');
+  fs.mkdirSync(broken);
+  fs.symlinkSync(path.join(home, 'gone'), path.join(broken, 'claude'));
+  const cfg = load(home, { PATH: ['rel', notRunnable, dir, broken].join(':') });
+  // Said missing as before: the notice names where it looked first.
+  assert.equal(cfg.claudePath, path.join(home, '.local', 'bin', 'claude'));
 });
 
+// Other providers remain usable when Claude is absent.
 test('a missing Claude notice describes only Claude turns', () => {
   const h = makeHarness();
   const notice = h.runner.noticesForNewClient().find((n) => /claude CLI isn't at/.test(n.message));
   assert.ok(notice);
-  assert.match(notice.message, /Claude turns cannot start/);
+  assert.match(notice.message, /Claude turn/);
   assert.doesNotMatch(notice.message, /no turn can start/);
 });

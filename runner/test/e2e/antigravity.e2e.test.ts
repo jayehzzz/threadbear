@@ -42,7 +42,7 @@ test('official Antigravity: streamed reply, MCP, denied edit, approved edit and 
     async requestQuestion() { return { answers: null }; },
     exited(e) { if (e) pending?.reject(e); },
   };
-  const adapter = new AcpAdapter({ agent, binary: () => binary, on: () => true, registry, log: nullLogger,
+  const adapter = new AcpAdapter({ agent, binary: () => binary, registry, log: nullLogger,
     toolsFor: () => [...toolbox, { name: 'integration_check', description: 'Check the Threadbear connection. Returns a verification word.', inputSchema: { value: z.string() }, annotations: { readOnlyHint: true }, handler: async () => { mcpCalls++; return { content: [{ type: 'text', text: 'THREADBEAR_CONNECTED' }] }; } }],
   });
   const account = { id: 'antigravity-main', provider: 'antigravity' as const, title: 'Antigravity', configDir: profile };

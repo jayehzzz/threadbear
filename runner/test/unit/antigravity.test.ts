@@ -4,19 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ACP_AGENTS, acpAccounts, antigravitySchema } from '../../src/adapters/acp/agents.ts';
-import { activeProviders, providerInfo } from '../../src/providers.ts';
+import { providersForHello, providerInfo } from '../../src/providers.ts';
 import { loadConfig } from '../../src/config.ts';
 
 test('Antigravity is an ACP provider with its own official login command', () => {
   assert.equal(providerInfo('antigravity').name, 'Antigravity');
   assert.equal(providerInfo('antigravity').loginCommand, 'agy acp --login');
   assert.equal(providerInfo('antigravity').smallJobs, false);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-agy-'));
-  try {
-    assert.ok(!activeProviders(root).includes('antigravity'));
-    fs.writeFileSync(path.join(root, 'runner.json'), JSON.stringify({ experiments: { acpAgents: true } }));
-    assert.ok(activeProviders(root).includes('antigravity'));
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  assert.ok(providersForHello().some(p => p.id === 'antigravity'));
 });
 
 test('Antigravity MCP declarations omit dictionary keywords without removing named arguments', () => {
