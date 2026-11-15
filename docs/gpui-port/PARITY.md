@@ -5025,3 +5025,8 @@ was verified on Jayden's Mac on 15 November (see the migration check below).
 - The 75 focused runner tests for Antigravity, review fallbacks, Codex small
   jobs and dictation learning passed. All UI checks used mock or temporary
   data, leaving the installed Swift app and primary runner running.
+- Recorded the Antigravity and Codex fork commits as ported after checking
+  their existing GPUI behavior. The remaining fork-only Swift commit changes
+  only a test's wait for a remote archive request, so it has no app behavior
+  to port. Accounted for it too, avoiding first-launch offers to rebuild
+  changes that already work or affect only the frozen Swift test harness.
