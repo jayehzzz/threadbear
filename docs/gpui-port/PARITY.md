@@ -148,7 +148,7 @@ Scenarios passing: Swift: 207 of 225, Mac: 214 of 225, Windows: 192 of 225, Linu
 | `composer.dropanywhere` Drop anywhere on thread | pass | pass | pass | pass |
 | `composer.runner` Runner chip | pass | pass | pass | pass |
 | `composer.modelpicker` Model picker | pass | pass | pass | pass |
-| `composer.antigravity` Antigravity agents | pass | pending | pending | pending |
+| `composer.antigravity` Antigravity agents | pass | pass | pending | pending |
 | `composer.permission` Permission chip | pass | pass | pass | pass |
 | `composer.contextring` Context ring | pass | partly | partly | partly |
 | `composer.send` Send and Stop | pass | pass | pass | pass |
@@ -4869,7 +4869,7 @@ provider instead of saying every job uses Claude. Older runners keep their
 previous capabilities. The new pool-availability scenario passed on the Swift
 Mac app. Real calls through the dev runner's Codex pool generated a title and
 extracted a project with a nullable owner. GPUI source is updated; its build
-was not run on Jayden's Mac, which has no Rust toolchain or check host.
+was verified on Jayden's Mac on 15 November (see the migration check below).
 ### 2026-11-13 Other Macs and the audit's smaller leftovers
 
 - A move keeps the sidebar row as the destination Mac's until its first
@@ -5009,3 +5009,19 @@ was not run on Jayden's Mac, which has no Rust toolchain or check host.
   systems keep the file symbol.
 - Native regression tests synthesize their own film and PDF, including path
   replacement, size/output caps, version mismatch and delayed callbacks.
+
+### 2026-11-15 Fork migration check (`composer.antigravity`, `settings.models`, `system.swiftimport`)
+
+- Built the GPUI automation app locally on an Apple silicon Mac from the
+  fork's merged 14 November release, with two Cargo jobs at background priority.
+- All four focused scenarios passed (43 steps), including Antigravity's pool
+  and Gemini Flash model, the Codex small-jobs pool, and the one-time import
+  of zoom, Inbox order and an unsent draft from temporary Swift settings.
+- Also checked the rendered Antigravity picker through scripted pointer
+  events: selecting its column and Gemini Flash changes the draft to its
+  account and pool, with no effort choices for that agent.
+- Removed Antigravity's stale GPUI pending tag. No app-code migration gap
+  was found. Windows and Linux have not been checked for this scenario.
+- The 75 focused runner tests for Antigravity, review fallbacks, Codex small
+  jobs and dictation learning passed. All UI checks used mock or temporary
+  data, leaving the installed Swift app and primary runner running.
