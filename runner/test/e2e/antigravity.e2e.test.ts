@@ -21,7 +21,7 @@ test('official Antigravity: streamed reply, MCP, denied edit, approved edit and 
   const base = ACP_AGENTS.antigravity;
   const profileName = path.basename(root);
   const profile = path.join(os.homedir(), '.gemini', profileName);
-  const agent = { ...base, args: base.args.map((v) => v === 'threadbear-acp' ? profileName : v), prepare() { fs.mkdirSync(profile, { recursive: true }); fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({ toolPermission: 'strict', agentMode: '', permissions: { allow: ['write_file(*)', 'command(*)'] } }), { mode: 0o600 }); } };
+  const agent = { ...base, args: () => base.args().map((v) => v === 'threadbear-acp' ? profileName : v), prepare() { fs.mkdirSync(profile, { recursive: true }); fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({ toolPermission: 'strict', agentMode: '', permissions: { allow: ['write_file(*)', 'command(*)'] } }), { mode: 0o600 }); } };
   const binary = base.findBinary({ home: os.homedir(), pathEnv: process.env.PATH ?? '' });
   assert.ok(binary, 'install the official agy CLI first');
   const registry = new ProcessRegistry(path.join(root, 'run'), nullLogger);

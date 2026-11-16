@@ -22,6 +22,8 @@ const HOSTS: Record<Provider, string> = {
   // Its free models; a login's own provider may be elsewhere.
   opencode: 'opencode.ai',
   antigravity: 'daily-cloudcode-pa.googleapis.com',
+  // Its CLI's requests go through Grok's own chat proxy.
+  grok: 'cli-chat-proxy.grok.com',
 };
 
 // How long a probe may take in all, whatever arrives meanwhile: a proxy

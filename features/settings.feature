@@ -55,3 +55,10 @@ Feature: Settings
     When I open Settings on "models"
     Then Settings offers the small jobs pool "Codex"
     And Settings offers the small jobs pool "Claude"
+
+  @settings.general @swift-pending
+  Scenario: A reviewer can be taken off the list of who reviews code
+    When I open Settings
+    Then Settings lists the reviewers "codex, claude"
+    When I press "Take Codex off the list" in Settings
+    Then Settings lists the reviewers "claude"

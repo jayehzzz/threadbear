@@ -32,6 +32,8 @@ bare() {
 # config and info/attributes naming a driver (Codex's third look).
 bare init -q --bare --template= "--object-format=$format" "$tmp/r"
 printf '%s\n' "$objects" > "$tmp/r/objects/info/alternates"
+shallow=$(cd "$top" && git rev-parse --path-format=absolute --git-path shallow)
+[ -f "$shallow" ] && cp "$shallow" "$tmp/r/shallow"
 clean() {
   bare -C "$tmp/r" -c core.attributesFile=/dev/null -c merge.default=text "$@"
 }

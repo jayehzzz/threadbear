@@ -8,6 +8,7 @@ import { atomicWriteFileSync } from './fsutil.ts';
 import { RELEASE } from './release.ts';
 import { gatewayBase, gatewayUrlFrom } from './connectors.ts';
 import { credentialUrlProblem } from './secure-url.ts';
+import { parseLabReviewers, type LabReviewer } from './lab-reviewers.ts';
 import { findGatewayClient } from './notion-tasks.ts';
 import { onPath } from './adapters/acp/agents.ts';
 import { CLI_POLICIES, isEffortLevel, isProvider, type CliPolicy, type EffortLevel, type PermissionMode, type Provider } from './protocol.ts';
@@ -40,6 +41,7 @@ export type CliUpdatesConfig = {
   cursor?: CliPolicy;
   opencode?: CliPolicy;
   antigravity?: CliPolicy;
+  grok?: CliPolicy;
   checkMinutes: number;
   keepCodexVersions: number; // Codex copies kept under <home>/tools/codex
   // Other CLIs' update commands, run daily (updates/extra.ts). None by default.
@@ -99,6 +101,7 @@ export type Config = {
   cursorPath?: string;
   opencodePath?: string;
   antigravityPath?: string;
+  grokPath?: string;
   codexArgs: string[]; // extra `codex app-server` arguments
   codexMainDir: string; // codex-main's CODEX_HOME
   tokenStatsLimitsFile: string; // Token Stats' limits.json, read only
@@ -130,6 +133,11 @@ export type Config = {
   // done. On unless runner.json has `labReview: false` (Settings > General);
   // an experiment from 6 Nov until Mike made it standard on 10 Nov 2026.
   labReview: boolean;
+  // Who reviews, in Mike's order (runner.json `labReviewers`, Settings >
+  // General > Code review): the first of another lab with a login that has room does it,
+  // on its model and effort if it names them. Unset is Codex then Claude,
+  // which is the other provider for either (lab-review.ts, reviewLogin).
+  labReviewers?: LabReviewer[];
   // Keep the Mac out of idle sleep while threads work (keep-awake.ts). On
   // unless runner.json says `keepAwake: false` (Settings > General).
   keepAwake: boolean;
@@ -184,6 +192,7 @@ export type RunnerJson = {
   cursorPath?: string;
   opencodePath?: string;
   antigravityPath?: string;
+  grokPath?: string;
   codexArgs?: string[];
   cliUpdates?: Partial<CliUpdatesConfig>;
   accountNotes?: Record<string, string>;
@@ -214,6 +223,7 @@ export type RunnerJson = {
   bulletReplies?: boolean;
   oneReply?: boolean;
   labReview?: boolean;
+  labReviewers?: unknown;
   keepAwake?: boolean;
   // bringIn: how often a fork's runner starts a thread to bring in Mike's
   // releases (bring-in.ts): every so many days, 'important' or 'off'.
@@ -244,6 +254,11 @@ export type RunnerJson = {
 // to approve a plan, so a thread nobody's watching (a schedule, one from
 // the phone) would only sit there.
 export type DefaultMode = Exclude<PermissionMode, 'plan'>;
+function labReviewersFrom(v: unknown): { labReviewers?: LabReviewer[] } {
+  const list = parseLabReviewers(v);
+  return list ? { labReviewers: list } : {};
+}
+
 export function defaultModeOf(v: unknown): DefaultMode | undefined {
   return v === 'full' || v === 'ask' || v === 'auto' ? v : undefined;
 }
@@ -447,6 +462,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { readOnl
     // balance, and it's no longer in Settings).
     oneReply: json.oneReply !== false,
     labReview: json.labReview !== false,
+    ...labReviewersFrom(json.labReviewers),
     // On for everyone since 10 Nov 2026, after a few days as an experiment
     // on Mike's Mac; Settings turns it off for anyone who'd rather.
     keepAwake: json.keepAwake !== false,
@@ -456,6 +472,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, opts: { readOnl
     ...(nonEmpty(json.cursorPath) ? { cursorPath: expand(nonEmpty(json.cursorPath)!) } : {}),
     ...(nonEmpty(json.opencodePath) ? { opencodePath: expand(nonEmpty(json.opencodePath)!) } : {}),
     ...(nonEmpty(json.antigravityPath) ? { antigravityPath: expand(nonEmpty(json.antigravityPath)!) } : {}),
+    ...(nonEmpty(json.grokPath) ? { grokPath: expand(nonEmpty(json.grokPath)!) } : {}),
     codexArgs: Array.isArray(json.codexArgs) ? json.codexArgs.filter((a): a is string => typeof a === 'string') : [],
     codexMainDir: expand(env.THREADBEAR_CODEX_MAIN_DIR || '~/.codex'),
     tokenStatsLimitsFile: expand(

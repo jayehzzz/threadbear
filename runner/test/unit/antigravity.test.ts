@@ -32,8 +32,8 @@ test('Antigravity uses a strict separate profile without changing terminal setti
     assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { toolPermission: 'strict', agentMode: '' });
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
     assert.equal(fs.readFileSync(terminal, 'utf8'), '{"toolPermission":"always-proceed"}');
-    assert.ok(agent.args.includes('--process-per-session'), 'client HTTP MCP tools require a worker');
-    assert.ok(!agent.args.includes('--dangerously-skip-permissions'));
+    assert.ok(agent.args().includes('--process-per-session'), 'client HTTP MCP tools require a worker');
+    assert.ok(!agent.args().includes('--dangerously-skip-permissions'));
     assert.equal(agent.modeFor('full'), 'default');
     assert.equal(agent.modeFor('ask'), 'default');
     assert.equal(agent.modeFor('auto'), 'default');
